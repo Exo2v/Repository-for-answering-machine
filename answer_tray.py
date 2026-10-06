@@ -44,6 +44,46 @@ FADE_STEPS = FADE_DURATION_MS // FADE_INTERVAL_MS
 MAX_SCREEN_PIXELS = 24_000_000
 MAX_PNG_BYTES = 12 * 1024 * 1024
 MAX_API_RESPONSE_BYTES = 2 * 1024 * 1024
+PORTABLE_CONFIG_NAME = "screen_answer_config.json"
+
+
+def portable_config_path() -> str:
+    """Return the config sidecar path beside the script or packaged executable."""
+    if getattr(sys, "frozen", False):
+        app_directory = os.path.dirname(os.path.abspath(sys.executable))
+    else:
+        app_directory = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(app_directory, PORTABLE_CONFIG_NAME)
+
+
+def load_portable_config(path: Optional[str] = None) -> Dict[str, str]:
+    """Load the optional user-managed sidecar config; invalid files are ignored."""
+    config_path = path or portable_config_path()
+    try:
+        with open(config_path, "r", encoding="utf-8") as config_file:
+            raw_config = json.load(config_file)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw_config, dict):
+        return {}
+    config: Dict[str, str] = {}
+    api_key = raw_config.get("api_key")
+    model = raw_config.get("model")
+    if isinstance(api_key, str) and api_key.strip():
+        config["api_key"] = api_key.strip()
+    if isinstance(model, str) and model.strip():
+        config["model"] = model.strip()
+    return config
+
+
+def save_portable_config(api_key: str, model: str, path: Optional[str] = None) -> str:
+    """Write the opt-in portable config sidecar and return its path."""
+    config_path = path or portable_config_path()
+    with open(config_path, "w", encoding="utf-8") as config_file:
+        json.dump({"api_key": api_key, "model": model}, config_file, indent=2)
+        config_file.write("\n")
+    return config_path
+
 
 SYSTEM_INSTRUCTION = (
     "You are a study assistant reading a user-provided desktop screenshot. "
@@ -873,12 +913,15 @@ class ScreenAnswerApp:
         self.root = root
         self.root.withdraw()
         self.root.title(APP_NAME)
-        self.root.resizable(False, False)
+        self.root.resizable(True, True)
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
 
         self.events: "queue.Queue[Tuple[Any, ...]]" = queue.Queue()
-        self.api_key = os.environ.get("GEMINI_API_KEY", "").strip()
-        self.model = DEFAULT_MODEL
+        self.config_path = portable_config_path()
+        self.portable_config = load_portable_config(self.config_path)
+        self._config_has_key = bool(self.portable_config.get("api_key"))
+        self.api_key = os.environ.get("GEMINI_API_KEY", "").strip() or self.portable_config.get("api_key", "")
+        self.model = self.portable_config.get("model", DEFAULT_MODEL)
         self.privacy_acknowledged = False
         self.busy = False
         self._result_generation = 0
@@ -892,7 +935,6 @@ class ScreenAnswerApp:
     def _build_window(self) -> None:
         import tkinter as tk
 
-        self.root.geometry("470x355")
         outer = tk.Frame(self.root, padx=18, pady=16)
         outer.pack(fill="both", expand=True)
 
@@ -913,10 +955,21 @@ class ScreenAnswerApp:
             anchor="w",
         ).pack(fill="x", pady=(6, 12))
 
-        tk.Label(outer, text="Gemini API key (kept in memory for this run):", anchor="w").pack(fill="x")
+        tk.Label(outer, text="Gemini API key:", anchor="w").pack(fill="x")
         self.api_key_var = tk.StringVar(value=self.api_key)
         self.api_entry = tk.Entry(outer, textvariable=self.api_key_var, show="*", width=60)
-        self.api_entry.pack(fill="x", pady=(3, 10))
+        self.api_entry.pack(fill="x", pady=(3, 3))
+        self.portable_var = tk.BooleanVar(value=self._config_has_key)
+        tk.Checkbutton(
+            outer,
+            text=(
+                "Keep the key in a portable config beside the app (plain text; keep it private)."
+            ),
+            variable=self.portable_var,
+            wraplength=430,
+            justify="left",
+            anchor="w",
+        ).pack(fill="x", pady=(0, 8))
 
         tk.Label(outer, text="Model:", anchor="w").pack(fill="x")
         self.model_var = tk.StringVar(value=self.model)
@@ -946,7 +999,7 @@ class ScreenAnswerApp:
 
         buttons = tk.Frame(outer)
         buttons.pack(fill="x")
-        tk.Button(buttons, text="Save for this run", command=self.save_settings).pack(side="left")
+        tk.Button(buttons, text="Save settings", command=self.save_settings).pack(side="left")
         tk.Button(
             buttons,
             text="Capture & ask now",
@@ -965,6 +1018,18 @@ class ScreenAnswerApp:
             wraplength=430,
             anchor="w",
         ).pack(fill="x", pady=(12, 0))
+
+        # Fit the full form instead of letting the Save/Capture controls get
+        # clipped on smaller Windows displays. The user can still resize it.
+        self.root.update_idletasks()
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        max_width = max(420, screen_width - 40)
+        max_height = max(400, screen_height - 80)
+        width = min(max(520, outer.winfo_reqwidth() + 36), max_width)
+        height = min(max(500, outer.winfo_reqheight() + 32), max_height)
+        self.root.geometry("%dx%d" % (width, height))
+        self.root.minsize(min(500, width), min(450, height))
 
     def _privacy_changed(self) -> None:
         # Unchecking the notice revokes consent immediately; a new Save action is
@@ -999,10 +1064,32 @@ class ScreenAnswerApp:
             self.show_window()
             self._show_error("Enter a valid Gemini model name, such as " + DEFAULT_MODEL + ".")
             return False
+        if self.portable_var.get():
+            try:
+                save_portable_config(key, model, self.config_path)
+            except OSError as exc:
+                self.show_window()
+                self._show_error("Could not save the portable config file: %s" % exc)
+                return False
+            self._config_has_key = True
+            save_message = "Settings saved beside the app for portable use."
+        else:
+            if self._config_has_key:
+                try:
+                    os.remove(self.config_path)
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    self.show_window()
+                    self._show_error("Could not remove the saved portable config: %s" % exc)
+                    return False
+                self._config_has_key = False
+            save_message = "Settings saved in memory for this run only."
+
         self.api_key = key
         self.model = model
         self.privacy_acknowledged = True
-        self.status_var.set("Settings saved in memory for this run. Press Ctrl+Alt+S to capture.")
+        self.status_var.set(save_message + " Press Ctrl+Alt+S to capture.")
         self.tray.set_state(NEUTRAL_RGB, "Screen Answer — ready; Ctrl+Alt+S to capture")
         self.hide_window()
         return True

@@ -7,14 +7,15 @@ A small, user-triggered Windows study helper. It uses only Python's standard lib
 - The app has a **visible notification-area (system tray) icon**. It is not a stealth/hidden process and it does not install itself to Windows startup.
 - A screenshot is taken only after the user presses **Ctrl+Alt+S**, clicks **Capture & ask now**, or selects **Capture and ask** from the tray menu.
 - Every capture includes the **entire virtual desktop / all monitors**. The app shows a tray notification and sends that image over HTTPS to Google Gemini for an AI-only response. **Live web search / Google Search grounding is disabled.** The image is held in memory and is not written to a screenshot file.
-- The user enters their own Gemini API key. The key is kept in memory for that run only; it is not saved in a config file. `GEMINI_API_KEY` may also be set in the environment, but the app still requires acknowledging the upload notice in its window.
+- The user supplies their own Gemini API key. By default it stays in memory for that run. An optional checkbox saves it, along with the model, in `screen_answer_config.json` beside the app so the EXE and sidecar can be copied to another device. That sidecar is **plain text** and is not included in the release; keep it private and never upload it to GitHub or share it. `GEMINI_API_KEY` may also be set in the environment. The app still requires acknowledging the upload notice on each run.
 - Use this only with screen content you are allowed to share with Google and where AI assistance is permitted. Gemini can be wrong; the tray color is a suggestion, not a guarantee.
 - There is no self-destruct or file-deletion hotkey. **Ctrl+Alt+Q** and the tray menu's **Exit** command close the app normally. Remove the downloaded `.exe` or source folder yourself if you want to uninstall it.
 
 ## Use
 
 1. Run `answer_tray.py` (or the packaged `ScreenAnswer.exe`). A grey icon appears in the Windows notification area. Windows may place it in the tray overflow/hidden-icons menu; you can pin it in taskbar notification-area settings.
-2. Double-click the tray icon to open settings. Enter a Gemini API key, confirm the full-screen upload notice, and click **Save for this run**. The key is not persisted.
+2. Double-click the tray icon to open settings. Enter a Gemini API key, confirm the full-screen upload notice, and click **Save settings**. Leave the portable-config checkbox clear to keep the key in memory only, or check it to write `screen_answer_config.json` beside the app. For portable mode, keep the app in a writable folder (such as Downloads or a USB drive), not a protected Program Files folder.
+   To move to a laptop, copy both `ScreenAnswer.exe` and `screen_answer_config.json`. The sidecar preloads the key, so you don't need to sign in to Google in a browser on the laptop; the laptop still needs internet access and the key's Gemini quota must be available. Treat the sidecar like a password—it is plain text and must stay private.
 3. Press **Ctrl+Alt+S** to capture and ask Gemini, or use **Capture & ask now**. The tray icon changes to the returned option:
    - Red: option 1
    - Yellow: option 2

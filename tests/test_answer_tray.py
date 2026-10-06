@@ -1,11 +1,20 @@
 import base64
 import json
+import os
 import struct
+import tempfile
 import unittest
 import zlib
 from unittest.mock import patch
 
-from answer_tray import _encode_rgb_png, _extract_gemini_text, ask_gemini, parse_option
+from answer_tray import (
+    _encode_rgb_png,
+    _extract_gemini_text,
+    ask_gemini,
+    load_portable_config,
+    parse_option,
+    save_portable_config,
+)
 
 
 class ParseOptionTests(unittest.TestCase):
@@ -69,6 +78,25 @@ class GeminiRequestTests(unittest.TestCase):
         self.assertNotIn("tools", captured["body"])
         parts = captured["body"]["contents"][0]["parts"]
         self.assertEqual(parts[1]["inlineData"]["data"], base64.b64encode(image_bytes).decode("ascii"))
+
+
+class PortableConfigTests(unittest.TestCase):
+    def test_saves_and_loads_key_and_model(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "screen_answer_config.json")
+            save_portable_config("example-key", "gemini-3.8-flash", path)
+            self.assertEqual(
+                load_portable_config(path),
+                {"api_key": "example-key", "model": "gemini-3.8-flash"},
+            )
+
+    def test_missing_or_invalid_config_falls_back_to_empty(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "missing.json")
+            self.assertEqual(load_portable_config(path), {})
+            with open(path, "w", encoding="utf-8") as config_file:
+                config_file.write("not json")
+            self.assertEqual(load_portable_config(path), {})
 
 
 class PngEncodingTests(unittest.TestCase):
