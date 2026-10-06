@@ -12,7 +12,8 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  build-standard:
+    name: Build legacy-compatible Windows executables
     runs-on: windows-2022
     steps:
       - name: Check out source
@@ -27,13 +28,13 @@ jobs:
       - name: Test
         run: python -m unittest discover -s tests -v
 
-      - name: Package standalone executables
+      - name: Package standard standalone executables
         run: |
           python -m pip install pyinstaller==5.13.2
           pyinstaller --noconfirm --clean --onefile --windowed --name ScreenAnswer answer_tray.py
           pyinstaller --noconfirm --clean --onefile --windowed --name ScreenAnswer-Diagnostic answer_tray.py
 
-      - name: Upload standalone executables
+      - name: Upload standard standalone executables
         uses: actions/upload-artifact@v4
         with:
           name: ScreenAnswer-Windows-32bit
@@ -43,11 +44,93 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Attach executable to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
+  build-pix2text:
+    name: Build experimental Pix2Text executable (Windows x64)
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up 64-bit Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: "x64"
+
+      - name: Install CPU-only PyTorch
+        run: >-
+          python -m pip install --extra-index-url https://download.pytorch.org/whl/cpu
+          "torch==2.5.1+cpu" "torchvision==0.20.1+cpu"
+
+      - name: Install Pix2Text runtime
+        run: python -m pip install -r requirements-pix2text.txt
+
+      - name: Install PyInstaller
+        run: python -m pip install pyinstaller==6.22.3
+
+      - name: Test
+        run: python -m unittest discover -s tests -v
+
+      - name: Package experimental standalone executable
+        run: >-
+          pyinstaller --noconfirm --clean --onefile --windowed
+          --name ScreenAnswer-Pix2Text
+          --collect-all pix2text
+          --collect-all cnocr
+          --collect-all cnstd
+          --collect-all doclayout_yolo
+          --collect-all rapidocr
+          --collect-all onnxruntime
+          --collect-all optimum
+          --collect-all transformers
+          --collect-all tokenizers
+          --collect-all torch
+          --collect-all torchvision
+          --collect-all cv2
+          --collect-all PIL
+          --collect-all fitz
+          --collect-all spellchecker
+          answer_tray.py
+
+      - name: Smoke-test bundled Pix2Text imports
+        run: .\dist\ScreenAnswer-Pix2Text.exe --check-pix2text
+
+      - name: Upload experimental standalone executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: ScreenAnswer-Pix2Text-Windows-x64
+          path: dist/ScreenAnswer-Pix2Text.exe
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Publish Windows release assets
+    if: startsWith(github.ref, 'refs/tags/')
+    needs:
+      - build-standard
+      - build-pix2text
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download standard executables
+        uses: actions/download-artifact@v4
+        with:
+          name: ScreenAnswer-Windows-32bit
+          path: release-assets
+
+      - name: Download experimental Pix2Text executable
+        uses: actions/download-artifact@v4
+        with:
+          name: ScreenAnswer-Pix2Text-Windows-x64
+          path: release-assets
+
+      - name: Attach executables to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
+          prerelease: ${{ contains(github.ref, '-experimental') }}
           files: |
-            dist/ScreenAnswer.exe
-            dist/ScreenAnswer-Diagnostic.exe
+            release-assets/ScreenAnswer.exe
+            release-assets/ScreenAnswer-Diagnostic.exe
+            release-assets/ScreenAnswer-Pix2Text.exe

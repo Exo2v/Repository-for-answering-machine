@@ -23,6 +23,7 @@ from answer_tray import (
     diagnostics_mode_enabled,
     load_portable_config,
     parse_option,
+    pix2text_bundle_importable,
     run_pix2text_ocr,
     save_portable_config,
 )
@@ -62,6 +63,24 @@ class Pix2TextOCRTests(unittest.TestCase):
         self.assertTrue(any(markdown in line for line in diagnostics))
         self.assertTrue(any("finished in" in line for line in diagnostics))
         rgb_image.close.assert_called_once_with()
+
+    def test_bundle_import_check_detects_the_pix2text_api_without_loading_weights(self):
+        class FakePix2Text:
+            @staticmethod
+            def from_config(**kwargs):
+                return None
+
+            @staticmethod
+            def recognize_text_formula(*args, **kwargs):
+                return ""
+
+        pix2text_module = types.ModuleType("pix2text")
+        pix2text_module.Pix2Text = FakePix2Text
+        with patch.dict("sys.modules", {"pix2text": pix2text_module}):
+            self.assertTrue(pix2text_bundle_importable())
+
+        with patch.dict("sys.modules", {"pix2text": None}):
+            self.assertFalse(pix2text_bundle_importable())
 
 
 class ParseOptionTests(unittest.TestCase):

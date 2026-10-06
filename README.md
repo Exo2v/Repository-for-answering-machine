@@ -1,6 +1,6 @@
 # Screen Answer
 
-A small, user-triggered Windows study helper. The default app uses Python's standard library (including Tkinter from the official Python installer) and Windows APIs through `ctypes`; no `pip` runtime dependencies are required. An optional experimental Pix2Text local OCR mode requires separately installed machine-learning packages and model files.
+A small, user-triggered Windows study helper. The default app uses Python's standard library (including Tkinter from the official Python installer) and Windows APIs through `ctypes`; no `pip` runtime dependencies are required. The experimental Pix2Text build bundles its Python runtime and OCR dependencies, but downloads model weights on first use.
 
 ## Privacy and behavior
 
@@ -14,8 +14,8 @@ A small, user-triggered Windows study helper. The default app uses Python's stan
 
 ## Use
 
-1. Run `answer_tray.py` or the packaged `ScreenAnswer.exe`. A grey tray icon appears; Windows may place it in the tray overflow/hidden-icons menu.
-2. Double-click the tray icon to open Settings. Choose **Google Gemini** or **Mistral**, select an OCR backend, enter that provider's API key, acknowledge the matching upload notice, and click **Save settings**. **Provider default** preserves the existing behavior; **Pix2Text (local, experimental)** is available when running from source with its optional package installed. The defaults are `gemini-3.8-flash` for Gemini and `mistral-medium-latest` for Mistral; the model names can be changed. The Mistral model uses high reasoning effort when supported. Existing configs using the previous default `ministral-14b-2512` are upgraded to `mistral-medium-latest`; other custom model names are retained. Create a separate Mistral key in [Mistral Studio](https://console.mistral.ai/).
+1. Run `answer_tray.py`, the packaged `ScreenAnswer.exe`, or the experimental `ScreenAnswer-Pix2Text.exe`. A grey tray icon appears; Windows may place it in the tray overflow/hidden-icons menu.
+2. Double-click the tray icon to open Settings. Choose **Google Gemini** or **Mistral**, select an OCR backend, enter that provider's API key, acknowledge the matching upload notice, and click **Save settings**. **Provider default** preserves existing behavior; **Pix2Text (local, experimental)** is available when running from source with its optional package installed. The experimental Pix2Text EXE selects local Pix2Text OCR by default. The defaults are `gemini-3.8-flash` for Gemini and `mistral-medium-latest` for Mistral; the model names can be changed. The Mistral model uses high reasoning effort when supported. Existing configs using the previous default `ministral-14b-2512` are upgraded to `mistral-medium-latest`; other custom model names are retained. Create a separate Mistral key in [Mistral Studio](https://console.mistral.ai/).
 3. Press **Ctrl+Alt+S** or click **Capture & ask now**. The tray icon reports the returned option:
    - Red: option 1
    - Yellow: option 2
@@ -26,7 +26,7 @@ A small, user-triggered Windows study helper. The default app uses Python's stan
 
 Leave the portable-config checkbox clear to keep settings in memory for that run only, or check it to store keys/models beside the app. If enabled, the sidecar can retain settings for **both** providers. Copy the EXE and sidecar together to another device. A browser login is not needed to use an already-created API key, but the device needs internet access and the selected account's model access/usage limits must permit requests. With **Provider default** OCR, the Mistral flow makes a separate OCR API call before chat; OCR may have separate charges or access requirements. If that OCR is unavailable, the app logs it in Diagnostic mode and falls back to sending the original screenshot to Mistral chat. Transient Mistral HTTP 429 responses are retried up to the app's bounded limit, honoring a short `Retry-After` header when provided; persistent rate limits or exhausted monthly quotas still require waiting or checking the Studio usage limits.
 
-When **Pix2Text (local, experimental)** is selected, the app runs OCR on-device and skips Mistral's OCR API request. The screenshot and OCR transcript are still sent to the selected AI solver, so this is not fully offline and does not bypass that provider's chat quota. Pix2Text's package and model weights are not bundled in the current standalone EXEs; first use can download model files. To try it from source, see the optional setup below. If local OCR fails or returns no text, the app continues with the original screenshot and provider vision.
+When **Pix2Text (local, experimental)** is selected, the app runs OCR on-device and skips Mistral's OCR API request. The screenshot and OCR transcript are still sent to the selected AI solver, so this is not fully offline and does not bypass that provider's chat quota. `ScreenAnswer-Pix2Text.exe` is a separate 64-bit Windows 10+ standalone build that bundles Pix2Text and its Python dependencies, but not model weights. Its first OCR use downloads model files to the user profile, so it needs internet access and extra disk space. The standard 32-bit EXEs remain the Windows 7-compatible/provider-default versions. If local OCR fails or returns no text, the app continues with the original screenshot and provider vision.
 
 API model names, availability, free access, quotas, and pricing can change; check the selected provider's account and documentation for current terms.
 
@@ -38,7 +38,7 @@ This is the real app, **not a simulation**. After consent and an explicit captur
 
 The diagnostics window opens automatically in the test build; right-click its tray icon and choose **Show diagnostics** to reopen it. Use **Open settings** there to choose a provider and configure its key. If using a portable config, keep the diagnostic EXE beside `screen_answer_config.json`.
 
-From source, run `python answer_tray.py --diagnostics`. Keep `ScreenAnswer.exe` for normal use; the diagnostic EXE is separate.
+From source, run `python answer_tray.py --diagnostics`. The experimental `ScreenAnswer-Pix2Text.exe` also accepts `--diagnostics` to open the diagnostics window; the separate `ScreenAnswer-Diagnostic.exe` is for the standard build.
 
 ## Run from source
 
@@ -70,7 +70,7 @@ python answer_tray.py
 
 Open Settings, choose **Pix2Text (local, experimental)**, acknowledge the updated upload notice, then save and capture. On first use, Pix2Text may download model files to the user profile and take several minutes. Later runs reuse its local model cache. The installed Pix2Text release supports text/formula recognition through its Python API; see the [official repository](https://github.com/breezedeus/Pix2Text) and [usage guide](https://pix2text.readthedocs.io/zh-cn/stable/usage/).
 
-This optional dependency stack is much larger than Screen Answer and may not work with the existing 32-bit Windows 7/10 standalone build. **Pix2Text is not bundled in the current EXEs**; this prototype requires a compatible Python environment (try 64-bit Windows 10 first). The normal standalone EXE continues to use provider-default OCR. If Pix2Text fails or returns no text, the app falls back to sending the original screenshot to the AI solver without OCR text. Verify transcription and answers; this experimental mode does not guarantee higher JEE accuracy.
+This optional dependency stack is much larger than Screen Answer and is not included in the 32-bit Windows 7/10 standard EXEs. The experimental `ScreenAnswer-Pix2Text.exe` bundles the Python/OCR runtime for 64-bit Windows 10+, while downloading model weights on first use. To build a custom Pix2Text-enabled executable, use a compatible 64-bit Python environment and the packaging steps in the GitHub workflow. If Pix2Text fails or returns no text, the app falls back to sending the original screenshot to the AI solver without OCR text. Verify transcription and answers; this experimental mode does not guarantee higher JEE accuracy.
 
 ## Build standalone Windows executables
 
@@ -84,4 +84,4 @@ pyinstaller --noconfirm --onefile --windowed --name ScreenAnswer-Diagnostic answ
 
 The results are `dist/ScreenAnswer.exe` and `dist/ScreenAnswer-Diagnostic.exe`. For the best chance of Windows 7 compatibility, build with 32-bit Python 3.8.10 and test on Windows 7 SP1.
 
-The GitHub Actions workflow in `.github/workflows/windows-release.yml` builds both 32-bit executables and attaches them to version-tag releases.
+The GitHub Actions workflow in `.github/workflows/windows-release.yml` builds the standard 32-bit executables on each branch update. On a version tag, it additionally builds and attaches the experimental x64 `ScreenAnswer-Pix2Text.exe`, which includes its Python/OCR dependencies but downloads model weights on first use. That build targets Windows 10+ x64; the standard executables remain the Windows 7-compatible option.

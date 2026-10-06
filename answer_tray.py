@@ -29,13 +29,14 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Optional, Tuple
 
 APP_NAME = "Screen Answer"
-APP_VERSION = "1.3.0-dev"
+APP_VERSION = "1.3.0-experimental"
 DEFAULT_MODEL = "gemini-3.8-flash"
 DEFAULT_MISTRAL_MODEL = "mistral-medium-latest"
 LEGACY_MISTRAL_MODEL = "ministral-14b-2512"
 MISTRAL_OCR_MODEL = "mistral-ocr-latest"
 DEFAULT_PROVIDER = "gemini"
-DEFAULT_OCR_BACKEND = "provider"
+_DEFAULT_EXE_NAME = os.path.splitext(os.path.basename(sys.executable))[0].lower()
+DEFAULT_OCR_BACKEND = "pix2text" if "pix2text" in _DEFAULT_EXE_NAME else "provider"
 PROVIDER_LABELS = {"gemini": "Google Gemini", "mistral": "Mistral"}
 PROVIDER_BY_LABEL = {label: provider for provider, label in PROVIDER_LABELS.items()}
 OCR_BACKEND_LABELS = {
@@ -950,10 +951,25 @@ def _extract_mistral_ocr_markdown(response_data: Dict[str, Any]) -> str:
 
 
 def pix2text_installed() -> bool:
-    """Check for the optional Pix2Text module without importing model dependencies."""
+    """Check for Pix2Text in source Python or the dedicated experimental EXE."""
+    if getattr(sys, "frozen", False):
+        executable_name = os.path.basename(sys.executable).lower()
+        return "pix2text" in executable_name
     try:
         return importlib.util.find_spec("pix2text") is not None
     except (ImportError, ValueError):
+        return False
+
+
+def pix2text_bundle_importable() -> bool:
+    """Import the OCR API for a build-time smoke test without downloading models."""
+    try:
+        from pix2text import Pix2Text
+
+        return callable(getattr(Pix2Text, "from_config", None)) and callable(
+            getattr(Pix2Text, "recognize_text_formula", None)
+        )
+    except Exception:
         return False
 
 
@@ -2776,6 +2792,8 @@ class ScreenAnswerApp:
 
 
 def main() -> int:
+    if "--check-pix2text" in sys.argv[1:]:
+        return 0 if pix2text_bundle_importable() else 1
     if os.name != "nt":
         print("Screen Answer runs on Windows 7/10 and later.", file=sys.stderr)
         return 1
