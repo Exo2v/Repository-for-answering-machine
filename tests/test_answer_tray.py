@@ -83,7 +83,7 @@ class Lasso1ModeTests(unittest.TestCase):
         self.assertFalse(diagnostics_mode_enabled(("--diagnostics",), "Lasso1.exe"))
         self.assertFalse(diagnostics_mode_enabled(("--diagnostics",), "LassV7.exe"))
 
-    def test_first_run_config_uses_variant_folder_and_has_no_prefilled_values(self):
+    def test_first_run_config_uses_variant_folder_with_blank_key_and_default_model(self):
         with tempfile.TemporaryDirectory() as directory:
             path = lasso1_config_path(directory)
             self.assertEqual(path, os.path.join(directory, "Lasso1", "config.json"))
@@ -98,7 +98,9 @@ class Lasso1ModeTests(unittest.TestCase):
             self.assertEqual(config, lasso1_config_template())
             self.assertEqual(config["provider"], "openrouter")
             self.assertEqual(config["api_keys"], {"openrouter": ""})
-            self.assertEqual(config["models"], {"openrouter": ""})
+            self.assertEqual(
+                config["models"], {"openrouter": DEFAULT_OPENROUTER_MODEL}
+            )
             self.assertIs(config["allow_screenshot_uploads"], False)
             self.assertNotIn("_instructions", config)
 
@@ -109,38 +111,42 @@ class Lasso1ModeTests(unittest.TestCase):
             with open(path, "r", encoding="utf-8") as config_file:
                 self.assertIs(json.load(config_file)["allow_screenshot_uploads"], True)
 
-    def test_migrates_only_the_old_untouched_prefilled_model_template(self):
+    def test_prefills_missing_model_default_without_replacing_saved_values(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "Lasso1", "config.json")
             os.makedirs(os.path.dirname(path))
-            old_template = {
+            blank_config = {
                 "provider": "openrouter",
                 "api_keys": {"openrouter": ""},
-                "models": {"openrouter": DEFAULT_OPENROUTER_MODEL},
+                "models": {"openrouter": ""},
                 "allow_screenshot_uploads": False,
-                "_instructions": (
-                    "Paste a newly rotated OpenRouter API key into api_keys.openrouter. "
-                    "This is the old first-run template."
-                ),
             }
             with open(path, "w", encoding="utf-8") as config_file:
-                json.dump(old_template, config_file)
+                json.dump(blank_config, config_file)
 
             self.assertFalse(ensure_lasso1_config(path))
             with open(path, "r", encoding="utf-8") as config_file:
                 migrated = json.load(config_file)
-            self.assertEqual(migrated["models"], {"openrouter": ""})
-            self.assertNotIn("_instructions", migrated)
+            self.assertEqual(
+                migrated["models"], {"openrouter": DEFAULT_OPENROUTER_MODEL}
+            )
+            self.assertEqual(migrated["api_keys"], {"openrouter": ""})
+            self.assertIs(migrated["allow_screenshot_uploads"], False)
 
-            saved_config = dict(old_template)
-            saved_config["api_keys"] = {"openrouter": "saved-key"}
+            saved_config = {
+                "provider": "openrouter",
+                "api_keys": {"openrouter": "saved-key"},
+                "models": {"openrouter": "custom/vision-model"},
+                "allow_screenshot_uploads": True,
+            }
             with open(path, "w", encoding="utf-8") as config_file:
                 json.dump(saved_config, config_file)
             self.assertFalse(ensure_lasso1_config(path))
             with open(path, "r", encoding="utf-8") as config_file:
                 preserved = json.load(config_file)
-            self.assertEqual(preserved["models"]["openrouter"], DEFAULT_OPENROUTER_MODEL)
+            self.assertEqual(preserved["models"]["openrouter"], "custom/vision-model")
             self.assertEqual(preserved["api_keys"]["openrouter"], "saved-key")
+            self.assertIs(preserved["allow_screenshot_uploads"], True)
 
     def test_config_loader_keeps_only_openrouter_and_requires_boolean_consent(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -265,7 +271,7 @@ class Lasso1ModeTests(unittest.TestCase):
         self.assertEqual(app.provider, "openrouter")
         self.assertEqual(app.api_key, "")
         self.assertEqual(app.api_key_source, "not configured")
-        self.assertEqual(app.model, "")
+        self.assertEqual(app.model, DEFAULT_OPENROUTER_MODEL)
         self.assertFalse(app.privacy_acknowledged)
         self.assertFalse(app.diagnostics_enabled)
         lasso_window.assert_called_once_with()

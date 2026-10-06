@@ -34,7 +34,7 @@ API model names, availability, free access, quotas, and pricing can change; chec
 
 The separate [Lasso1 Windows release](https://github.com/Exo2v/Repository-for-answering-machine/releases/tag/lasso1) is tray-only and OpenRouter-only; the standard Screen Answer releases above keep their existing providers. The same release provides `Lasso1.exe` and a dedicated 32-bit `LassV7.exe` build for Windows 7, packaged with Python 3.8.10 and PyInstaller 5.13.2. CI builds and smoke-checks both executables. Neither opens a GUI at startup: right-click the tray and choose **Open** to show Settings; **Save** writes the config and closes the window. **Ctrl+Alt+S** captures, and the tray icon plus a colored Windows notification reports the answer. Live web search and tool execution are disabled.
 
-Each executable has its own per-user config: `Lasso1.exe` uses `%APPDATA%\Lasso1\config.json`, while `LassV7.exe` uses `%APPDATA%\LassV7\config.json`. On a fresh install, the API-key and model fields are empty; no key or model is bundled or prefilled. Enter both in the **Open** settings window. To edit the JSON directly, right-click and choose **Open Lasso1 config file** or **Open LassV7 config file**, depending on the executable; restart that app after direct edits so it reloads the file. The JSON is plain text, so keep it private and do not upload or share it.
+Each executable has its own per-user config: `Lasso1.exe` uses `%APPDATA%\Lasso1\config.json`, while `LassV7.exe` uses `%APPDATA%\LassV7\config.json`. The API-key field starts empty and no key is bundled. The OpenRouter model is prefilled with `google/gemini-3.8-flash` and can be changed in the **Open** settings window. To edit the JSON directly, right-click and choose **Open Lasso1 config file** or **Open LassV7 config file**, depending on the executable; restart that app after direct edits so it reloads the file. The JSON is plain text, so keep it private and do not upload or share it.
 
 The upload-consent checkbox starts unchecked. Saving without enabling it keeps screenshot capture blocked; check it only if you consent to uploading the full desktop to OpenRouter. The tray menu also offers the matching config-folder action and a confirmed self-destruct action. Self-destruct deletes only the running executable and its matching `config.json`; the folder is removed only if empty, and unexpected files are left untouched. If cleanup cannot be scheduled, the app stays open and deletes nothing.
 
@@ -47,13 +47,13 @@ Screenshot upload is **off by default**. Each app sends the full virtual desktop
     "openrouter": ""
   },
   "models": {
-    "openrouter": ""
+    "openrouter": "google/gemini-3.8-flash"
   },
   "allow_screenshot_uploads": false
 }
 ```
 
-Enter an OpenRouter model and key in Settings; enable upload consent only if you agree to send screenshots. If an older untouched first-run config has the previous example model prefilled, the updated app clears that placeholder but preserves saved keys, custom models, and consent. The `lasso1` tag builds and publishes both `Lasso1.exe` and `LassV7.exe` in the same release.
+Enter an OpenRouter API key in Settings; the model field starts at `google/gemini-3.8-flash` and remains editable. Enable upload consent only if you agree to send screenshots. If an existing config has a blank/missing model, the updated app fills in that default while preserving saved keys, custom models, and consent. The `lasso1` tag builds and publishes both `Lasso1.exe` and `LassV7.exe` in the same release.
 
 ## Diagnostic test build
 

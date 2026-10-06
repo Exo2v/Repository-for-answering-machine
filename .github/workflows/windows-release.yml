@@ -192,7 +192,7 @@ jobs:
           body: |
             Lasso1 and LassV7 are tray-only, OpenRouter-only Windows builds. LassV7.exe is the dedicated 32-bit Windows 7-compatible build packaged with Python 3.8.10 and PyInstaller 5.13.2.
 
-            On first run, Lasso1 creates `%APPDATA%\Lasso1\config.json`; LassV7 creates `%APPDATA%\LassV7\config.json`. API-key and model values are blank and are not bundled in either executable. Right-click the tray and choose Open to enter values; Save writes the matching config and closes the GUI. Screenshot-upload consent is off by default.
+            On first run, Lasso1 creates `%APPDATA%\Lasso1\config.json`; LassV7 creates `%APPDATA%\LassV7\config.json`. The API-key value is blank and no key is bundled; the OpenRouter model defaults to `google/gemini-3.8-flash` and is editable. Right-click the tray and choose Open to enter a key; Save writes the matching config and closes the GUI. Screenshot-upload consent is off by default.
 
             Capture uses Ctrl+Alt+S; the full virtual desktop is sent to OpenRouter only after explicit config-file consent. Web search and tool execution are disabled.
 

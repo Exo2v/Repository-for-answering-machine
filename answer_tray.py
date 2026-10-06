@@ -214,11 +214,11 @@ def portable_config_path() -> str:
 
 
 def lasso1_config_template() -> Dict[str, Any]:
-    """Return a value-free OpenRouter-only config with screenshot upload disabled."""
+    """Return a key-free OpenRouter config with a model preset and uploads disabled."""
     return {
         "provider": "openrouter",
         "api_keys": {"openrouter": ""},
-        "models": {"openrouter": ""},
+        "models": {"openrouter": DEFAULT_OPENROUTER_MODEL},
         "allow_screenshot_uploads": False,
     }
 
@@ -271,8 +271,8 @@ def save_lasso1_config(
     return config_path
 
 
-def _clear_old_generated_model_default(config_path: str) -> bool:
-    """Blank the old bundled model only in untouched, key-free first-run configs."""
+def _prefill_lasso_model_if_missing(config_path: str) -> bool:
+    """Restore the default model in older configs without replacing user values."""
     try:
         with open(config_path, "r", encoding="utf-8") as config_file:
             config = json.load(config_file)
@@ -280,35 +280,33 @@ def _clear_old_generated_model_default(config_path: str) -> bool:
         return False
     if not isinstance(config, dict):
         return False
-    if not str(config.get("_instructions", "")).startswith(
-        "Paste a newly rotated OpenRouter API key"
-    ):
-        return False
-    stored_keys = config.get("api_keys")
-    stored_key = stored_keys.get("openrouter", "") if isinstance(stored_keys, dict) else ""
-    legacy_key = config.get("api_key", "")
-    if (isinstance(stored_key, str) and stored_key.strip()) or (
-        isinstance(legacy_key, str) and legacy_key.strip()
-    ):
-        return False
-    if config.get("allow_screenshot_uploads") is True:
-        return False
+
     stored_models = config.get("models")
     if not isinstance(stored_models, dict):
-        return False
-    if stored_models.get("openrouter") != DEFAULT_OPENROUTER_MODEL:
+        stored_models = {}
+    model = stored_models.get("openrouter")
+    model_is_set = isinstance(model, str) and bool(model.strip())
+    changed = False
+    if not model_is_set:
+        stored_models = dict(stored_models)
+        stored_models["openrouter"] = DEFAULT_OPENROUTER_MODEL
+        config["models"] = stored_models
+        changed = True
+    if "_instructions" in config:
+        config.pop("_instructions", None)
+        changed = True
+    if not changed:
         return False
 
-    stored_models = dict(stored_models)
-    stored_models["openrouter"] = ""
-    config["models"] = stored_models
-    config.pop("_instructions", None)
-    _write_lasso1_json_atomically(config_path, config)
+    try:
+        _write_lasso1_json_atomically(config_path, config)
+    except OSError:
+        return False
     return True
 
 
 def ensure_lasso1_config(path: Optional[str] = None) -> bool:
-    """Create Lasso's AppData config; migrate only the previous untouched template."""
+    """Create Lasso's AppData config and restore only missing model defaults."""
     config_path = path or lasso1_config_path()
     directory = os.path.dirname(os.path.abspath(config_path))
     if directory:
@@ -318,7 +316,7 @@ def ensure_lasso1_config(path: Optional[str] = None) -> bool:
             json.dump(lasso1_config_template(), config_file, indent=2)
             config_file.write("\n")
     except FileExistsError:
-        _clear_old_generated_model_default(config_path)
+        _prefill_lasso_model_if_missing(config_path)
         return False
     return True
 
@@ -3053,10 +3051,7 @@ class ScreenAnswerApp:
                 stored_keys,
                 lasso1_mode=self.lasso1_mode,
             )
-            self.models[provider] = stored_models.get(
-                provider,
-                "" if self.lasso1_mode else DEFAULT_MODELS[provider],
-            )
+            self.models[provider] = stored_models.get(provider, DEFAULT_MODELS[provider])
 
         if self.lasso1_mode:
             self.provider = "openrouter"
@@ -3339,11 +3334,7 @@ class ScreenAnswerApp:
             anchor="w",
         ).pack(fill="x", pady=(0, 10))
 
-        tk.Label(
-            outer,
-            text="OpenRouter model (required; not prefilled):",
-            anchor="w",
-        ).pack(fill="x")
+        tk.Label(outer, text="OpenRouter model:", anchor="w").pack(fill="x")
         self.model_var = tk.StringVar(value=self.model)
         tk.Entry(outer, textvariable=self.model_var, width=50).pack(fill="x", pady=(3, 10))
 
