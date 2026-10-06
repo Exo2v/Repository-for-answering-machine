@@ -905,7 +905,7 @@ class ScreenAnswerApp:
         tk.Label(
             outer,
             text=(
-                "A user-triggered study helper. Ctrl+Alt+S captures all monitors and "
+                "AI chat only — no live web search. Ctrl+Alt+S captures all monitors and "
                 "sends the screenshot to Google Gemini over HTTPS."
             ),
             justify="left",
