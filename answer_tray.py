@@ -16,6 +16,7 @@ import re
 import struct
 import sys
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -44,6 +45,8 @@ FADE_STEPS = FADE_DURATION_MS // FADE_INTERVAL_MS
 MAX_SCREEN_PIXELS = 24_000_000
 MAX_PNG_BYTES = 12 * 1024 * 1024
 MAX_API_RESPONSE_BYTES = 2 * 1024 * 1024
+MAX_GEMINI_ATTEMPTS = 3
+RETRYABLE_HTTP_STATUSES = (500, 502, 503, 504)
 PORTABLE_CONFIG_NAME = "screen_answer_config.json"
 
 
@@ -367,23 +370,37 @@ def ask_gemini(api_key: str, model: str, png_image: bytes) -> Tuple[Optional[int
         },
         method="POST",
     )
-    try:
-        with urllib.request.urlopen(request, timeout=45) as response:
-            response_bytes = response.read(MAX_API_RESPONSE_BYTES + 1)
-    except urllib.error.HTTPError as exc:
-        status = exc.code
-        # Do not include response bodies or request headers in the UI/logs. They
-        # are not needed to troubleshoot common authentication/quota failures.
-        if status in (401, 403):
-            raise RuntimeError("Gemini rejected the API key or account permissions (HTTP %d)." % status)
-        if status == 429:
-            raise RuntimeError("Gemini's quota or rate limit was reached (HTTP 429).")
-        raise RuntimeError("Gemini returned an HTTP error (%d)." % status)
-    except urllib.error.URLError as exc:
-        reason = getattr(exc, "reason", None)
-        if isinstance(reason, (TimeoutError,)):
-            raise RuntimeError("The Gemini request timed out. Please try again.")
-        raise RuntimeError("Could not reach Gemini. Check the internet connection and try again.")
+    response_bytes = None
+    for attempt in range(MAX_GEMINI_ATTEMPTS):
+        try:
+            with urllib.request.urlopen(request, timeout=45) as response:
+                response_bytes = response.read(MAX_API_RESPONSE_BYTES + 1)
+            break
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            exc.close()
+            if status in RETRYABLE_HTTP_STATUSES and attempt < MAX_GEMINI_ATTEMPTS - 1:
+                # Temporary overloads (notably HTTP 503) often clear quickly.
+                # Retry in the worker thread so the tray UI remains responsive.
+                time.sleep(2 ** attempt)
+                continue
+            if status in (401, 403):
+                raise RuntimeError(
+                    "Gemini rejected the API key or account permissions (HTTP %d)." % status
+                )
+            if status == 429:
+                raise RuntimeError("Gemini's quota or rate limit was reached (HTTP 429).")
+            if status in RETRYABLE_HTTP_STATUSES:
+                raise RuntimeError(
+                    "Gemini is temporarily unavailable or overloaded (HTTP %d). "
+                    "The request was retried; wait a moment and try again." % status
+                )
+            raise RuntimeError("Gemini returned an HTTP error (%d)." % status)
+        except urllib.error.URLError as exc:
+            reason = getattr(exc, "reason", None)
+            if isinstance(reason, TimeoutError):
+                raise RuntimeError("The Gemini request timed out. Please try again.")
+            raise RuntimeError("Could not reach Gemini. Check the internet connection and try again.")
     if len(response_bytes) > MAX_API_RESPONSE_BYTES:
         raise RuntimeError("Gemini returned an unexpectedly large response.")
     try:

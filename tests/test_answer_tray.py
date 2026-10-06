@@ -4,6 +4,7 @@ import os
 import struct
 import tempfile
 import unittest
+import urllib.error
 import zlib
 from unittest.mock import patch
 
@@ -78,6 +79,39 @@ class GeminiRequestTests(unittest.TestCase):
         self.assertNotIn("tools", captured["body"])
         parts = captured["body"]["contents"][0]["parts"]
         self.assertEqual(parts[1]["inlineData"]["data"], base64.b64encode(image_bytes).decode("ascii"))
+
+    def test_retries_temporary_503_then_succeeds(self):
+        response_payload = {
+            "candidates": [{"content": {"parts": [{"text": "1"}]}}]
+        }
+        call_count = [0]
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+            def read(self, limit=-1):
+                data = json.dumps(response_payload).encode("utf-8")
+                return data if limit < 0 else data[:limit]
+
+        def fake_urlopen(request, timeout):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise urllib.error.HTTPError(
+                    request.full_url, 503, "Service Unavailable", None, None
+                )
+            return FakeResponse()
+
+        with patch("answer_tray.urllib.request.urlopen", side_effect=fake_urlopen):
+            with patch("answer_tray.time.sleep") as sleep:
+                option, _ = ask_gemini("test-key", "gemini-3.8-flash", b"image")
+
+        self.assertEqual(option, 1)
+        self.assertEqual(call_count[0], 2)
+        sleep.assert_called_once_with(1)
 
 
 class PortableConfigTests(unittest.TestCase):
