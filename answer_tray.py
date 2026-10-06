@@ -8,6 +8,7 @@ from __future__ import annotations
 import base64
 import binascii
 import ctypes
+import email.utils
 import json
 import math
 import os
@@ -21,10 +22,11 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zlib
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Optional, Tuple
 
 APP_NAME = "Screen Answer"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 DEFAULT_MODEL = "gemini-3.8-flash"
 DEFAULT_MISTRAL_MODEL = "mistral-medium-latest"
 LEGACY_MISTRAL_MODEL = "ministral-14b-2512"
@@ -59,6 +61,7 @@ MAX_SCREEN_PIXELS = 24_000_000
 MAX_PNG_BYTES = 12 * 1024 * 1024
 MAX_API_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_API_ATTEMPTS = 3
+MAX_RETRY_AFTER_SECONDS = 30
 MAX_GEMINI_OUTPUT_TOKENS = 2048
 MAX_MISTRAL_OUTPUT_TOKENS = 4096
 MAX_OCR_CONTEXT_CHARS = 48_000
@@ -909,6 +912,63 @@ def _extract_mistral_ocr_markdown(response_data: Dict[str, Any]) -> str:
     return markdown.strip() if isinstance(markdown, str) else ""
 
 
+def _mistral_retry_delay(headers: Any, attempt: int) -> Optional[float]:
+    """Use Retry-After when provided; otherwise apply bounded exponential backoff."""
+    retry_after = None
+    if headers is not None:
+        try:
+            retry_after = headers.get("Retry-After")
+            if retry_after is None:
+                retry_after = headers.get("retry-after")
+        except AttributeError:
+            retry_after = None
+    if retry_after is not None:
+        seconds = None
+        try:
+            seconds = float(str(retry_after).strip())
+        except (TypeError, ValueError):
+            try:
+                retry_date = email.utils.parsedate_to_datetime(str(retry_after))
+                if retry_date.tzinfo is None:
+                    retry_date = retry_date.replace(tzinfo=timezone.utc)
+                seconds = (retry_date - datetime.now(timezone.utc)).total_seconds()
+            except (TypeError, ValueError, OverflowError):
+                seconds = None
+        if seconds is not None:
+            if seconds > MAX_RETRY_AFTER_SECONDS:
+                return None
+            if seconds >= 0:
+                return seconds
+    return min(float(2 ** attempt), float(MAX_RETRY_AFTER_SECONDS))
+
+
+def _report_mistral_rate_headers(
+    headers: Any,
+    stage: str,
+    report: Callable[[str], None],
+) -> None:
+    if headers is None:
+        return
+    values = []
+    for name in (
+        "X-RateLimit-Limit",
+        "X-RateLimit-Remaining",
+        "X-RateLimit-Reset",
+        "Retry-After",
+    ):
+        try:
+            value = headers.get(name)
+            if value is None:
+                value = headers.get(name.lower())
+        except AttributeError:
+            value = None
+        if value is not None:
+            value = str(value).replace("\r", " ").replace("\n", " ")[:100]
+            values.append("%s=%s" % (name, value))
+    if values:
+        report("%s rate-limit headers: %s." % (stage, "; ".join(values)))
+
+
 def _mistral_post_json(
     endpoint: str,
     api_key: str,
@@ -937,10 +997,12 @@ def _mistral_post_json(
         try:
             with urllib.request.urlopen(request, timeout=60) as response:
                 response_bytes = response.read(MAX_API_RESPONSE_BYTES + 1)
+                response_headers = getattr(response, "headers", None)
                 status = getattr(response, "status", None)
                 if status is None:
                     getcode = getattr(response, "getcode", None)
                     status = getcode() if getcode is not None else "unknown"
+            _report_mistral_rate_headers(response_headers, stage, report)
             report(
                 "%s HTTP attempt %d/%d received status %s and %d response bytes in %.2f seconds."
                 % (
@@ -955,6 +1017,7 @@ def _mistral_post_json(
             break
         except urllib.error.HTTPError as exc:
             status = exc.code
+            error_headers = getattr(exc, "headers", None)
             provider_message = ""
             try:
                 error_bytes = exc.read(4096)
@@ -971,6 +1034,7 @@ def _mistral_post_json(
                 pass
             finally:
                 exc.close()
+            _report_mistral_rate_headers(error_headers, stage, report)
             report(
                 "%s HTTP attempt %d/%d failed with status %d after %.2f seconds."
                 % (
@@ -983,6 +1047,21 @@ def _mistral_post_json(
             )
             if provider_message:
                 report("%s error detail: %s" % (stage, provider_message))
+            if status == 429 and attempt < MAX_API_ATTEMPTS - 1:
+                delay = _mistral_retry_delay(error_headers, attempt)
+                if delay is None:
+                    report(
+                        "%s rate limit requested a wait longer than the %d-second automatic "
+                        "retry limit; stopping retries."
+                        % (stage, MAX_RETRY_AFTER_SECONDS)
+                    )
+                else:
+                    report(
+                        "%s was rate-limited (HTTP 429); retrying in %.1f second(s)."
+                        % (stage, delay)
+                    )
+                    time.sleep(delay)
+                    continue
             if status in RETRYABLE_HTTP_STATUSES and attempt < MAX_API_ATTEMPTS - 1:
                 delay = 2 ** attempt
                 report(
@@ -1004,7 +1083,11 @@ def _mistral_post_json(
                     "Mistral requires an active API plan or available credits (HTTP 402)."
                 )
             if status == 429:
-                raise RuntimeError("Mistral's rate limit or quota was reached (HTTP 429).")
+                raise RuntimeError(
+                    "%s was rate-limited or reached its usage quota (HTTP 429). "
+                    "Wait and retry; check Mistral Studio Admin Panel > API > Limits "
+                    "and Usage and limits if it continues." % stage
+                )
             if status in RETRYABLE_HTTP_STATUSES:
                 raise RuntimeError(
                     "Mistral is temporarily unavailable during %s (HTTP %d). "

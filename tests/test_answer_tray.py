@@ -570,6 +570,108 @@ class MistralRequestTests(unittest.TestCase):
         self.assertTrue(any("recognized option position 4" in line for line in diagnostics))
 
 
+    def test_retries_mistral_429_using_retry_after_header(self):
+        calls = []
+        chat_attempts = [0]
+        diagnostics = []
+        ocr_payload = {"pages": [{"markdown": "one question"}]}
+        chat_payload = {
+            "choices": [{"message": {"role": "assistant", "content": "ANSWER: C"}}]
+        }
+
+        class FakeResponse:
+            status = 200
+
+            def __init__(self, payload):
+                self.payload = payload
+                self.headers = {"X-RateLimit-Remaining": "5"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+            def read(self, limit=-1):
+                data = json.dumps(self.payload).encode("utf-8")
+                return data if limit < 0 else data[:limit]
+
+        def fake_urlopen(request, timeout):
+            calls.append(request.full_url)
+            if request.full_url == MISTRAL_OCR_ENDPOINT:
+                return FakeResponse(ocr_payload)
+            chat_attempts[0] += 1
+            if chat_attempts[0] == 1:
+                raise urllib.error.HTTPError(
+                    request.full_url,
+                    429,
+                    "Too Many Requests",
+                    {"Retry-After": "3", "X-RateLimit-Remaining": "0"},
+                    io.BytesIO(b'{"message":"rate limit exceeded"}'),
+                )
+            return FakeResponse(chat_payload)
+
+        with patch("answer_tray.urllib.request.urlopen", side_effect=fake_urlopen):
+            with patch("answer_tray.time.sleep") as sleep:
+                option, _ = ask_mistral(
+                    "key", DEFAULT_MISTRAL_MODEL, b"image", diagnostic=diagnostics.append
+                )
+
+        self.assertEqual(option, 3)
+        self.assertEqual(chat_attempts[0], 2)
+        sleep.assert_called_once_with(3.0)
+        self.assertTrue(any("Retry-After=3" in line for line in diagnostics))
+        self.assertTrue(any("retrying in 3.0 second(s)" in line for line in diagnostics))
+        self.assertEqual(len(calls), 3)
+
+    def test_does_not_retry_before_a_long_retry_after_window(self):
+        calls = []
+        diagnostics = []
+        ocr_payload = {"pages": [{"markdown": "one question"}]}
+
+        class FakeResponse:
+            status = 200
+
+            def __init__(self, payload):
+                self.payload = payload
+                self.headers = {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+            def read(self, limit=-1):
+                data = json.dumps(self.payload).encode("utf-8")
+                return data if limit < 0 else data[:limit]
+
+        def fake_urlopen(request, timeout):
+            calls.append(request.full_url)
+            if request.full_url == MISTRAL_OCR_ENDPOINT:
+                return FakeResponse(ocr_payload)
+            raise urllib.error.HTTPError(
+                request.full_url,
+                429,
+                "Too Many Requests",
+                {"Retry-After": "60"},
+                io.BytesIO(b'{"message":"rate limit exceeded"}'),
+            )
+
+        with patch("answer_tray.urllib.request.urlopen", side_effect=fake_urlopen):
+            with patch("answer_tray.time.sleep") as sleep:
+                with self.assertRaisesRegex(RuntimeError, "rate-limited or reached its usage quota"):
+                    ask_mistral(
+                        "key", DEFAULT_MISTRAL_MODEL, b"image", diagnostic=diagnostics.append
+                    )
+
+        self.assertEqual(len(calls), 2)
+        sleep.assert_not_called()
+        self.assertTrue(
+            any("longer than the 30-second automatic retry limit" in line for line in diagnostics)
+        )
+
+
 class PortableConfigTests(unittest.TestCase):
     def test_saves_and_loads_key_and_model(self):
         with tempfile.TemporaryDirectory() as directory:
