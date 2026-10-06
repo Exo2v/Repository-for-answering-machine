@@ -1,7 +1,7 @@
 """Screen Answer: a transparent, user-triggered Windows tray utility.
 
 No third-party Python packages are required. The screenshot is captured in memory
-and sent to the Gemini API only after the user triggers a capture.
+and sent to the selected vision API only after the user triggers a capture.
 """
 from __future__ import annotations
 
@@ -24,11 +24,20 @@ import zlib
 from typing import Any, Callable, Dict, Optional, Tuple
 
 APP_NAME = "Screen Answer"
-APP_VERSION = "1.0.4"
+APP_VERSION = "1.1.0"
 DEFAULT_MODEL = "gemini-3.8-flash"
+DEFAULT_MISTRAL_MODEL = "ministral-14b-2512"
+DEFAULT_PROVIDER = "gemini"
+PROVIDER_LABELS = {"gemini": "Google Gemini", "mistral": "Mistral"}
+PROVIDER_BY_LABEL = {label: provider for provider, label in PROVIDER_LABELS.items()}
+DEFAULT_MODELS = {
+    "gemini": DEFAULT_MODEL,
+    "mistral": DEFAULT_MISTRAL_MODEL,
+}
 CAPTURE_HOTKEY_TEXT = "Ctrl+Alt+S"
 EXIT_HOTKEY_TEXT = "Ctrl+Alt+Q"
 GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+MISTRAL_ENDPOINT = "https://api.mistral.ai/v1/chat/completions"
 
 # The grey state means ready, busy, no answer, or a completed fade.
 NEUTRAL_RGB = (128, 128, 128)
@@ -46,7 +55,7 @@ FADE_STEPS = FADE_DURATION_MS // FADE_INTERVAL_MS
 MAX_SCREEN_PIXELS = 24_000_000
 MAX_PNG_BYTES = 12 * 1024 * 1024
 MAX_API_RESPONSE_BYTES = 2 * 1024 * 1024
-MAX_GEMINI_ATTEMPTS = 3
+MAX_API_ATTEMPTS = 3
 RETRYABLE_HTTP_STATUSES = (500, 502, 503, 504)
 PORTABLE_CONFIG_NAME = "screen_answer_config.json"
 
@@ -81,34 +90,106 @@ def portable_config_path() -> str:
     return os.path.join(app_directory, PORTABLE_CONFIG_NAME)
 
 
-def load_portable_config(path: Optional[str] = None) -> Dict[str, str]:
-    """Load the optional user-managed sidecar config; invalid files are ignored."""
+def load_portable_config(path: Optional[str] = None) -> Dict[str, Any]:
+    """Load provider-specific keys/models, migrating the original Gemini format."""
     config_path = path or portable_config_path()
     try:
         with open(config_path, "r", encoding="utf-8") as config_file:
             raw_config = json.load(config_file)
     except (OSError, ValueError):
-        return {}
+        return {"provider": DEFAULT_PROVIDER, "api_keys": {}, "models": {}}
     if not isinstance(raw_config, dict):
-        return {}
-    config: Dict[str, str] = {}
-    api_key = raw_config.get("api_key")
-    model = raw_config.get("model")
-    if isinstance(api_key, str) and api_key.strip():
-        config["api_key"] = api_key.strip()
-    if isinstance(model, str) and model.strip():
-        config["model"] = model.strip()
-    return config
+        return {"provider": DEFAULT_PROVIDER, "api_keys": {}, "models": {}}
+
+    provider = raw_config.get("provider", DEFAULT_PROVIDER)
+    if not isinstance(provider, str) or provider.lower() not in PROVIDER_LABELS:
+        provider = DEFAULT_PROVIDER
+    else:
+        provider = provider.lower()
+
+    api_keys: Dict[str, str] = {}
+    stored_keys = raw_config.get("api_keys")
+    if isinstance(stored_keys, dict):
+        for key_provider, key_value in stored_keys.items():
+            if (
+                isinstance(key_provider, str)
+                and key_provider.lower() in PROVIDER_LABELS
+                and isinstance(key_value, str)
+                and key_value.strip()
+            ):
+                api_keys[key_provider.lower()] = key_value.strip()
+    legacy_key = raw_config.get("api_key")
+    if isinstance(legacy_key, str) and legacy_key.strip():
+        api_keys.setdefault(provider, legacy_key.strip())
+
+    models: Dict[str, str] = {}
+    stored_models = raw_config.get("models")
+    if isinstance(stored_models, dict):
+        for model_provider, model_value in stored_models.items():
+            if (
+                isinstance(model_provider, str)
+                and model_provider.lower() in PROVIDER_LABELS
+                and isinstance(model_value, str)
+                and model_value.strip()
+            ):
+                models[model_provider.lower()] = model_value.strip()
+    legacy_model = raw_config.get("model")
+    if isinstance(legacy_model, str) and legacy_model.strip():
+        models.setdefault(provider, legacy_model.strip())
+
+    return {"provider": provider, "api_keys": api_keys, "models": models}
 
 
-def save_portable_config(api_key: str, model: str, path: Optional[str] = None) -> str:
-    """Write the opt-in portable config sidecar and return its path."""
+def save_portable_config(
+    api_key: str = "",
+    model: str = "",
+    path: Optional[str] = None,
+    provider: str = DEFAULT_PROVIDER,
+    api_keys: Optional[Dict[str, str]] = None,
+    models: Optional[Dict[str, str]] = None,
+) -> str:
+    """Write the opt-in provider config sidecar; API keys are stored in plaintext."""
     config_path = path or portable_config_path()
+    selected_provider = provider.lower() if isinstance(provider, str) else DEFAULT_PROVIDER
+    if selected_provider not in PROVIDER_LABELS:
+        selected_provider = DEFAULT_PROVIDER
+
+    saved_keys: Dict[str, str] = {}
+    for key_provider, key_value in (api_keys or {}).items():
+        if (
+            isinstance(key_provider, str)
+            and key_provider.lower() in PROVIDER_LABELS
+            and isinstance(key_value, str)
+            and key_value.strip()
+        ):
+            saved_keys[key_provider.lower()] = key_value.strip()
+    if api_key.strip():
+        saved_keys[selected_provider] = api_key.strip()
+
+    saved_models: Dict[str, str] = {}
+    for model_provider, model_value in (models or {}).items():
+        if (
+            isinstance(model_provider, str)
+            and model_provider.lower() in PROVIDER_LABELS
+            and isinstance(model_value, str)
+            and model_value.strip()
+        ):
+            saved_models[model_provider.lower()] = model_value.strip()
+    if model.strip():
+        saved_models[selected_provider] = model.strip()
+
     with open(config_path, "w", encoding="utf-8") as config_file:
-        json.dump({"api_key": api_key, "model": model}, config_file, indent=2)
+        json.dump(
+            {
+                "provider": selected_provider,
+                "api_keys": saved_keys,
+                "models": saved_models,
+            },
+            config_file,
+            indent=2,
+        )
         config_file.write("\n")
     return config_path
-
 
 SYSTEM_INSTRUCTION = (
     "You are a study assistant reading a user-provided desktop screenshot. "
@@ -132,8 +213,8 @@ USER_PROMPT = (
 def parse_option(response_text: str) -> Optional[int]:
     """Return an unambiguous option number (1-4), or None for neutral.
 
-    Gemini is instructed to emit one digit. A couple of short, obvious variants
-    are accepted, but explanatory or conflicting output is deliberately rejected.
+    The selected model is instructed to emit one digit. A couple of short,
+    obvious variants are accepted, but explanatory or conflicting output is rejected.
     """
     if not response_text:
         return None
@@ -185,7 +266,7 @@ def _encode_rgb_png(width: int, height: int, bgr_pixels: bytes, stride: int) -> 
     png.extend(_png_chunk(b"IEND", b""))
     if len(png) > MAX_PNG_BYTES:
         raise RuntimeError(
-            "The screenshot is too large to send in one Gemini request. "
+            "The screenshot is too large to send in one vision API request. "
             "Try reducing the desktop resolution or disconnecting an extra monitor."
         )
     return bytes(png)
@@ -511,11 +592,11 @@ def ask_gemini(
         method="POST",
     )
     response_bytes = None
-    for attempt in range(MAX_GEMINI_ATTEMPTS):
+    for attempt in range(MAX_API_ATTEMPTS):
         attempt_started = time.monotonic()
         report(
             "HTTP attempt %d/%d started (request body %d bytes; API key and image content omitted)."
-            % (attempt + 1, MAX_GEMINI_ATTEMPTS, len(encoded_body))
+            % (attempt + 1, MAX_API_ATTEMPTS, len(encoded_body))
         )
         try:
             with urllib.request.urlopen(request, timeout=45) as response:
@@ -528,7 +609,7 @@ def ask_gemini(
                 "HTTP attempt %d/%d received status %s and %d response bytes in %.2f seconds."
                 % (
                     attempt + 1,
-                    MAX_GEMINI_ATTEMPTS,
+                    MAX_API_ATTEMPTS,
                     status,
                     len(response_bytes),
                     time.monotonic() - attempt_started,
@@ -558,7 +639,7 @@ def ask_gemini(
                 "HTTP attempt %d/%d failed with status %d after %.2f seconds."
                 % (
                     attempt + 1,
-                    MAX_GEMINI_ATTEMPTS,
+                    MAX_API_ATTEMPTS,
                     status,
                     time.monotonic() - attempt_started,
                 )
@@ -567,7 +648,7 @@ def ask_gemini(
                 report("Gemini error category: %s." % provider_reason)
             if provider_message:
                 report("Gemini error detail: %s" % provider_message)
-            if status in RETRYABLE_HTTP_STATUSES and attempt < MAX_GEMINI_ATTEMPTS - 1:
+            if status in RETRYABLE_HTTP_STATUSES and attempt < MAX_API_ATTEMPTS - 1:
                 # Temporary overloads (notably HTTP 503) often clear quickly.
                 # Retry in the worker thread so the tray UI remains responsive.
                 delay = 2 ** attempt
@@ -625,6 +706,248 @@ def ask_gemini(
         report("Response parsing recognized option %d; raw text omitted." % option)
     return option, text
 
+
+
+def _extract_mistral_text(response_data: Dict[str, Any]) -> str:
+    """Return text from the first Mistral chat-completion choice."""
+    if not isinstance(response_data, dict):
+        return ""
+    choices = response_data.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        return ""
+    message = choices[0].get("message")
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        return "".join(
+            part.get("text", "")
+            for part in content
+            if isinstance(part, dict) and isinstance(part.get("text", ""), str)
+        ).strip()
+    return ""
+
+
+def _log_mistral_response_metadata(
+    response_data: Dict[str, Any],
+    report: Callable[[str], None],
+) -> None:
+    """Log choice/finish/usage metadata without the generated answer text."""
+    if not isinstance(response_data, dict):
+        report("Mistral response metadata: top-level JSON value was not an object.")
+        return
+    choices_value = response_data.get("choices")
+    choices = choices_value if isinstance(choices_value, list) else []
+    model = response_data.get("model")
+    response_id = response_data.get("id")
+    if not isinstance(model, str):
+        model = "not provided"
+    if not isinstance(response_id, str):
+        response_id = "not provided"
+    model = model.replace("\r", " ").replace("\n", " ")[:100]
+    response_id = response_id.replace("\r", " ").replace("\n", " ")[:100]
+    report(
+        "Mistral response metadata: choice_count=%d; model=%s; response_id=%s."
+        % (len(choices), model, response_id)
+    )
+    usage = response_data.get("usage")
+    if isinstance(usage, dict):
+        counts = []
+        for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            count = usage.get(field)
+            if isinstance(count, int) and not isinstance(count, bool):
+                counts.append("%s=%d" % (field, count))
+        if counts:
+            report("Mistral token usage: %s." % ", ".join(counts))
+    if choices_value is not None and not isinstance(choices_value, list):
+        report("Mistral response metadata: choices field had type %s." % type(choices_value).__name__)
+    for index, choice in enumerate(choices[:3]):
+        if not isinstance(choice, dict):
+            continue
+        finish_reason = choice.get("finish_reason", "not provided")
+        if not isinstance(finish_reason, str):
+            finish_reason = "not provided"
+        message = choice.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, str):
+            text_characters = len(content)
+        elif isinstance(content, list):
+            text_characters = sum(
+                len(part.get("text", ""))
+                for part in content
+                if isinstance(part, dict) and isinstance(part.get("text", ""), str)
+            )
+        else:
+            text_characters = 0
+        report(
+            "Mistral choice %d: finish_reason=%s; text_characters=%d."
+            % (index, finish_reason[:100], text_characters)
+        )
+
+
+def ask_mistral(
+    api_key: str,
+    model: str,
+    png_image: bytes,
+    diagnostic: Optional[Callable[[str], None]] = None,
+) -> Tuple[Optional[int], str]:
+    """Send one user-triggered screenshot to Mistral's vision chat API only."""
+    def report(message: str) -> None:
+        if diagnostic is not None:
+            safe_message = str(message)
+            if api_key:
+                safe_message = safe_message.replace(api_key, "[REDACTED API KEY]")
+            diagnostic(safe_message)
+
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,100}", model):
+        raise RuntimeError("The Mistral model name contains unsupported characters.")
+    report("Preparing Mistral request for model %s." % model)
+    image_b64 = base64.b64encode(png_image).decode("ascii")
+    request_body = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SYSTEM_INSTRUCTION},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": USER_PROMPT},
+                    {
+                        "type": "image_url",
+                        "image_url": "data:image/png;base64," + image_b64,
+                    },
+                ],
+            },
+        ],
+        "temperature": 0,
+        "max_tokens": 8,
+    }
+    encoded_body = json.dumps(request_body, separators=(",", ":")).encode("utf-8")
+    request = urllib.request.Request(
+        MISTRAL_ENDPOINT,
+        data=encoded_body,
+        headers={
+            "Content-Type": "application/json; charset=utf-8",
+            "Authorization": "Bearer " + api_key,
+        },
+        method="POST",
+    )
+    response_bytes = None
+    for attempt in range(MAX_API_ATTEMPTS):
+        attempt_started = time.monotonic()
+        report(
+            "Mistral HTTP attempt %d/%d started (request body %d bytes; API key and image content omitted)."
+            % (attempt + 1, MAX_API_ATTEMPTS, len(encoded_body))
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=45) as response:
+                response_bytes = response.read(MAX_API_RESPONSE_BYTES + 1)
+                status = getattr(response, "status", None)
+                if status is None:
+                    getcode = getattr(response, "getcode", None)
+                    status = getcode() if getcode is not None else "unknown"
+            report(
+                "Mistral HTTP attempt %d/%d received status %s and %d response bytes in %.2f seconds."
+                % (
+                    attempt + 1,
+                    MAX_API_ATTEMPTS,
+                    status,
+                    len(response_bytes),
+                    time.monotonic() - attempt_started,
+                )
+            )
+            break
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            provider_message = ""
+            try:
+                error_bytes = exc.read(4096)
+                error_payload = json.loads(error_bytes.decode("utf-8")) if error_bytes else {}
+                if isinstance(error_payload, dict):
+                    error_value = error_payload.get("error")
+                    if isinstance(error_value, dict):
+                        error_value = error_value.get("message") or error_value.get("detail")
+                    if not isinstance(error_value, str):
+                        error_value = error_payload.get("message") or error_payload.get("detail")
+                    if isinstance(error_value, str):
+                        provider_message = error_value.replace("\r", " ").replace("\n", " ")[:400]
+            except (AttributeError, UnicodeDecodeError, ValueError):
+                pass
+            finally:
+                exc.close()
+            report(
+                "Mistral HTTP attempt %d/%d failed with status %d after %.2f seconds."
+                % (
+                    attempt + 1,
+                    MAX_API_ATTEMPTS,
+                    status,
+                    time.monotonic() - attempt_started,
+                )
+            )
+            if provider_message:
+                report("Mistral error detail: %s" % provider_message)
+            if status in RETRYABLE_HTTP_STATUSES and attempt < MAX_API_ATTEMPTS - 1:
+                delay = 2 ** attempt
+                report("Temporary Mistral service error; retrying in %d second(s)." % delay)
+                time.sleep(delay)
+                continue
+            if status in (401, 403):
+                report("Mistral rejected the API key or workspace permissions.")
+                raise RuntimeError(
+                    "Mistral rejected the API key or workspace permissions (HTTP %d)." % status
+                )
+            if status == 402:
+                report("Mistral reported a billing or credit issue (HTTP 402).")
+                raise RuntimeError(
+                    "Mistral requires an active API plan or available credits (HTTP 402)."
+                )
+            if status == 429:
+                report("Mistral reported a rate limit or quota issue (HTTP 429).")
+                raise RuntimeError("Mistral's rate limit or quota was reached (HTTP 429).")
+            if status in RETRYABLE_HTTP_STATUSES:
+                report("Mistral retry limit reached; the service is still unavailable.")
+                raise RuntimeError(
+                    "Mistral is temporarily unavailable or overloaded (HTTP %d). "
+                    "The request was retried; wait a moment and try again." % status
+                )
+            report("Mistral returned a non-retryable HTTP error (status %d)." % status)
+            raise RuntimeError("Mistral returned an HTTP error (%d)." % status)
+        except urllib.error.URLError as exc:
+            reason = getattr(exc, "reason", None)
+            if isinstance(reason, TimeoutError):
+                report(
+                    "Mistral request timed out after %.2f seconds."
+                    % (time.monotonic() - attempt_started)
+                )
+                raise RuntimeError("The Mistral request timed out. Please try again.")
+            reason_name = type(reason).__name__ if reason is not None else type(exc).__name__
+            report(
+                "Could not reach Mistral after %.2f seconds; network error type: %s."
+                % (time.monotonic() - attempt_started, reason_name)
+            )
+            raise RuntimeError("Could not reach Mistral. Check the internet connection and try again.")
+    if len(response_bytes) > MAX_API_RESPONSE_BYTES:
+        report("Mistral response exceeded the %d-byte safety limit." % MAX_API_RESPONSE_BYTES)
+        raise RuntimeError("Mistral returned an unexpectedly large response.")
+    try:
+        response_data = json.loads(response_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        report("Mistral response was received but could not be decoded as JSON.")
+        raise RuntimeError("Mistral returned a response that could not be read.")
+    if diagnostic is not None:
+        _log_mistral_response_metadata(response_data, report)
+    text = _extract_mistral_text(response_data)
+    option = parse_option(text)
+    if option is None:
+        report(
+            "Mistral response parsing found no reliable option "
+            "(response length %d characters; raw text omitted)."
+            % len(text)
+        )
+    else:
+        report("Mistral response parsing recognized option %d; raw text omitted." % option)
+    return option, text
 
 class WindowsTray:
     """Small ctypes-based notification-area icon and global-hotkey host."""
@@ -1213,16 +1536,32 @@ class ScreenAnswerApp:
 
         self.config_path = portable_config_path()
         self.portable_config = load_portable_config(self.config_path)
-        self._config_has_key = bool(self.portable_config.get("api_key"))
-        environment_key = os.environ.get("GEMINI_API_KEY", "").strip()
-        self.api_key = environment_key or self.portable_config.get("api_key", "")
-        if environment_key:
-            self.api_key_source = "environment variable"
-        elif self.api_key:
-            self.api_key_source = "portable config sidecar"
-        else:
-            self.api_key_source = "not configured"
-        self.model = self.portable_config.get("model", DEFAULT_MODEL)
+        stored_keys = self.portable_config.get("api_keys", {})
+        stored_models = self.portable_config.get("models", {})
+        self._config_has_key = any(stored_keys.values())
+        self.api_keys: Dict[str, str] = {}
+        self.models: Dict[str, str] = {}
+        self.api_key_sources: Dict[str, str] = {}
+        environment_variables = {"gemini": "GEMINI_API_KEY", "mistral": "MISTRAL_API_KEY"}
+        for provider in PROVIDER_LABELS:
+            environment_key = os.environ.get(environment_variables[provider], "").strip()
+            saved_key = stored_keys.get(provider, "")
+            self.api_keys[provider] = environment_key or saved_key
+            if environment_key:
+                self.api_key_sources[provider] = "environment variable"
+            elif saved_key:
+                self.api_key_sources[provider] = "portable config sidecar"
+            else:
+                self.api_key_sources[provider] = "not configured"
+            self.models[provider] = stored_models.get(provider, DEFAULT_MODELS[provider])
+
+        self.provider = self.portable_config.get("provider", DEFAULT_PROVIDER)
+        if self.provider not in PROVIDER_LABELS:
+            self.provider = DEFAULT_PROVIDER
+        self.form_provider = self.provider
+        self.api_key = self.api_keys[self.provider]
+        self.api_key_source = self.api_key_sources[self.provider]
+        self.model = self.models[self.provider]
         self.privacy_acknowledged = False
         self.busy = False
         self._result_generation = 0
@@ -1236,7 +1575,10 @@ class ScreenAnswerApp:
             "Runtime: Python %s, %d-bit process."
             % (sys.version.split()[0], struct.calcsize("P") * 8)
         )
-        self._log_diagnostic("API key source: %s; key value is never logged." % self.api_key_source)
+        self._log_diagnostic(
+            "Selected provider: %s; API key source: %s; key value is never logged."
+            % (PROVIDER_LABELS[self.provider], self.api_key_source)
+        )
         self._log_diagnostic(
             "Upload consent is not yet active; captures remain blocked until acknowledged in Settings."
         )
@@ -1253,10 +1595,11 @@ class ScreenAnswerApp:
         if not self.diagnostics_enabled:
             return
         text = str(message)
-        secrets = (
-            self.api_key,
-            self.portable_config.get("api_key", ""),
-            os.environ.get("GEMINI_API_KEY", "").strip(),
+        secrets = list(self.api_keys.values())
+        secrets.extend(self.portable_config.get("api_keys", {}).values())
+        secrets.extend(
+            os.environ.get(variable, "").strip()
+            for variable in ("GEMINI_API_KEY", "MISTRAL_API_KEY")
         )
         for secret in secrets:
             if secret:
@@ -1304,8 +1647,8 @@ class ScreenAnswerApp:
         tk.Label(
             outer,
             text=(
-                "Live trace of startup, hotkeys, capture, network attempts, and answer parsing. "
-                "The log omits API keys, screenshot pixels, and raw Gemini response text."
+                "Live trace of startup, hotkeys, capture, provider requests, and answer parsing. "
+                "The log omits API keys, screenshot pixels, and raw model response text."
             ),
             justify="left",
             anchor="w",
@@ -1420,15 +1763,30 @@ class ScreenAnswerApp:
         tk.Label(
             outer,
             text=(
-                "AI chat only — no live web search. Ctrl+Alt+S captures all monitors and "
-                "sends the screenshot to Google Gemini over HTTPS."
+                "AI only — no live web search. Ctrl+Alt+S captures all monitors and sends "
+                "the screenshot to the selected vision provider over HTTPS."
             ),
             justify="left",
             wraplength=430,
             anchor="w",
         ).pack(fill="x", pady=(6, 12))
 
-        tk.Label(outer, text="Gemini API key:", anchor="w").pack(fill="x")
+        tk.Label(outer, text="AI provider:", anchor="w").pack(fill="x")
+        self.provider_var = tk.StringVar(value=PROVIDER_LABELS[self.form_provider])
+        self.provider_menu = tk.OptionMenu(
+            outer,
+            self.provider_var,
+            *PROVIDER_LABELS.values(),
+            command=self._provider_changed,
+        )
+        self.provider_menu.pack(fill="x", pady=(3, 8))
+
+        self.api_key_label = tk.Label(
+            outer,
+            text=self._api_key_label_text(self.form_provider),
+            anchor="w",
+        )
+        self.api_key_label.pack(fill="x")
         self.api_key_var = tk.StringVar(value=self.api_key)
         self.api_entry = tk.Entry(outer, textvariable=self.api_key_var, show="*", width=60)
         self.api_entry.pack(fill="x", pady=(3, 3))
@@ -1449,17 +1807,16 @@ class ScreenAnswerApp:
         tk.Entry(outer, textvariable=self.model_var, width=40).pack(fill="x", pady=(3, 9))
 
         self.privacy_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(
+        self.privacy_checkbutton = tk.Checkbutton(
             outer,
-            text=(
-                "I understand each capture uploads the full desktop screenshot to Google Gemini."
-            ),
+            text=self._consent_text(self.form_provider),
             variable=self.privacy_var,
             wraplength=430,
             justify="left",
             anchor="w",
             command=self._privacy_changed,
-        ).pack(fill="x", pady=(1, 8))
+        )
+        self.privacy_checkbutton.pack(fill="x", pady=(1, 8))
 
         self.status_var = tk.StringVar(value="Ready — the tray icon is grey.")
         tk.Label(
@@ -1483,8 +1840,8 @@ class ScreenAnswerApp:
         tk.Label(
             outer,
             text=(
-                "The screenshot is not saved to disk. Google API usage limits may apply. "
-                "Use only where AI assistance is permitted."
+                "The screenshot is not saved to disk. The selected provider may apply API "
+                "usage limits or charges. Use only where AI assistance is permitted."
             ),
             fg="#555555",
             justify="left",
@@ -1503,6 +1860,37 @@ class ScreenAnswerApp:
         height = min(max(500, outer.winfo_reqheight() + 32), max_height)
         self.root.geometry("%dx%d" % (width, height))
         self.root.minsize(min(500, width), min(450, height))
+
+    def _api_key_label_text(self, provider: str) -> str:
+        return "%s API key:" % PROVIDER_LABELS.get(provider, "Selected provider")
+
+    def _consent_text(self, provider: str) -> str:
+        return "I understand each capture uploads the full desktop screenshot to %s." % (
+            PROVIDER_LABELS.get(provider, "the selected provider")
+        )
+
+    def _remember_form_settings(self) -> None:
+        provider = self.form_provider
+        self.api_keys[provider] = self.api_key_var.get().strip()
+        self.models[provider] = self.model_var.get().strip()
+
+    def _provider_changed(self, selected_label: str) -> None:
+        provider = PROVIDER_BY_LABEL.get(selected_label)
+        if provider is None or provider == self.form_provider:
+            return
+        self._remember_form_settings()
+        self.form_provider = provider
+        self.api_key_label.configure(text=self._api_key_label_text(provider))
+        self.api_key_var.set(self.api_keys.get(provider, ""))
+        self.model_var.set(self.models.get(provider, DEFAULT_MODELS[provider]))
+        self.privacy_var.set(False)
+        self.privacy_acknowledged = False
+        self.privacy_checkbutton.configure(text=self._consent_text(provider))
+        self._log_diagnostic(
+            "Settings provider changed to %s; a provider-specific API key and new "
+            "upload consent are required."
+            % PROVIDER_LABELS[provider]
+        )
 
     def _privacy_changed(self) -> None:
         # Unchecking the notice revokes consent immediately; a new Save action is
@@ -1526,12 +1914,15 @@ class ScreenAnswerApp:
         self.root.withdraw()
 
     def save_settings(self) -> bool:
-        key = self.api_key_var.get().strip()
-        model = self.model_var.get().strip()
+        self._remember_form_settings()
+        provider = self.form_provider
+        provider_label = PROVIDER_LABELS[provider]
+        key = self.api_keys.get(provider, "").strip()
+        model = self.models.get(provider, "").strip()
         if not key:
-            self._log_diagnostic("Settings save blocked: no API key was entered.")
+            self._log_diagnostic("Settings save blocked: no %s API key was entered." % provider_label)
             self.show_window()
-            self._show_error("Enter a Gemini API key before using capture.")
+            self._show_error("Enter a %s API key before using capture." % provider_label)
             return False
         if not self.privacy_var.get():
             self._log_diagnostic("Settings save blocked: full-screen upload notice was not acknowledged.")
@@ -1541,17 +1932,25 @@ class ScreenAnswerApp:
         if not re.fullmatch(r"[A-Za-z0-9._-]{1,100}", model):
             self._log_diagnostic("Settings save blocked: model name contains unsupported characters.")
             self.show_window()
-            self._show_error("Enter a valid Gemini model name, such as " + DEFAULT_MODEL + ".")
+            self._show_error(
+                "Enter a valid %s model name, such as %s."
+                % (provider_label, DEFAULT_MODELS[provider])
+            )
             return False
         if self.portable_var.get():
             try:
-                save_portable_config(key, model, self.config_path)
+                save_portable_config(
+                    path=self.config_path,
+                    provider=provider,
+                    api_keys=self.api_keys,
+                    models=self.models,
+                )
             except OSError as exc:
                 self._log_diagnostic("Could not save portable config (%s)." % type(exc).__name__)
                 self.show_window()
                 self._show_error("Could not save the portable config file: %s" % exc)
                 return False
-            self._config_has_key = True
+            self._config_has_key = any(self.api_keys.values())
             save_message = "Settings saved beside the app for portable use."
         else:
             if self._config_has_key:
@@ -1560,25 +1959,29 @@ class ScreenAnswerApp:
                 except FileNotFoundError:
                     pass
                 except OSError as exc:
+                    self._log_diagnostic("Could not remove portable config (%s)." % type(exc).__name__)
                     self.show_window()
                     self._show_error("Could not remove the saved portable config: %s" % exc)
                     return False
                 self._config_has_key = False
             save_message = "Settings saved in memory for this run only."
 
+        self.api_keys[provider] = key
+        self.models[provider] = model
+        self.provider = provider
         self.api_key = key
-        self.api_key_source = "portable config sidecar" if self.portable_var.get() else "in-memory settings"
         self.model = model
+        self.api_key_source = "portable config sidecar" if self.portable_var.get() else "in-memory settings"
+        self.api_key_sources[provider] = self.api_key_source
         self.privacy_acknowledged = True
         self._log_diagnostic(
-            "Settings saved (model=%s; API key source=%s; upload consent acknowledged)."
-            % (model, self.api_key_source)
+            "Settings saved (provider=%s; model=%s; API key source=%s; upload consent acknowledged)."
+            % (provider_label, model, self.api_key_source)
         )
         self.status_var.set(save_message + " Press Ctrl+Alt+S to capture.")
         self.tray.set_state(NEUTRAL_RGB, "Screen Answer — ready; Ctrl+Alt+S to capture")
         self.hide_window()
         return True
-
     def save_and_capture(self) -> None:
         if self.save_settings():
             self._start_capture("settings button")
@@ -1590,7 +1993,9 @@ class ScreenAnswerApp:
             self.tray.show_balloon(APP_NAME, "A screenshot request is already in progress.")
             return
         if not self.api_key:
-            self._log_diagnostic("Capture blocked: no API key is configured.")
+            self._log_diagnostic(
+                "Capture blocked: no %s API key is configured." % PROVIDER_LABELS[self.provider]
+            )
             self.privacy_acknowledged = False
             self.status_var.set("Set an API key and acknowledge the upload notice before capturing.")
             self.show_window()
@@ -1610,11 +2015,16 @@ class ScreenAnswerApp:
             except Exception:
                 pass
             self._fade_job = None
-        self.status_var.set("Capturing the full desktop and sending it to Gemini…")
+        provider = self.provider
+        provider_label = PROVIDER_LABELS[provider]
+        self.status_var.set("Capturing the full desktop and sending it to %s…" % provider_label)
         # The tooltip changes immediately. The balloon is shown only after the
         # screenshot is captured so it cannot cover part of the user's screen.
-        self.tray.set_state(NEUTRAL_RGB, "Screen Answer — capturing desktop for Gemini")
-        self._log_diagnostic("Background worker starting; capture includes all connected monitors.")
+        self.tray.set_state(NEUTRAL_RGB, "Screen Answer — capturing desktop for %s" % provider_label)
+        self._log_diagnostic(
+            "Background worker starting; capture includes all connected monitors; provider=%s."
+            % provider_label
+        )
 
         api_key = self.api_key
         model = self.model
@@ -1631,16 +2041,19 @@ class ScreenAnswerApp:
                     "Desktop capture succeeded: %d x %d pixels, %d PNG bytes, %.2f seconds."
                     % (width, height, len(image), time.monotonic() - capture_started)
                 )
-                self.events.put(("captured",))
+                self.events.put(("captured", provider))
 
-                stage = "Gemini request"
-                option, response_text = ask_gemini(
+                stage = "%s request" % provider_label
+                ask_provider = ask_mistral if provider == "mistral" else ask_gemini
+                option, response_text = ask_provider(
                     api_key,
                     model,
                     image,
                     diagnostic=self._log_diagnostic,
                 )
-                self._log_diagnostic("Background request completed; applying the tray result.")
+                self._log_diagnostic(
+                    "%s request completed; applying the tray result." % provider_label
+                )
                 self.events.put(("answer", option, response_text))
             except Exception as exc:
                 self._log_diagnostic(
@@ -1651,7 +2064,11 @@ class ScreenAnswerApp:
                 # Avoid retaining the screenshot after the request completes.
                 image = None
 
-        threading.Thread(target=worker, name="GeminiRequest", daemon=True).start()
+        threading.Thread(
+            target=worker,
+            name="%sRequest" % provider.replace(" ", ""),
+            daemon=True,
+        ).start()
 
     def _set_result(self, option: Optional[int], response_text: str = "") -> None:
         self.busy = False
@@ -1718,9 +2135,11 @@ class ScreenAnswerApp:
                     trigger = event[1] if len(event) > 1 else "keyboard shortcut"
                     self._start_capture(trigger)
                 elif kind == "captured":
+                    captured_provider = event[1] if len(event) > 1 else self.provider
+                    provider_label = PROVIDER_LABELS.get(captured_provider, "the selected provider")
                     self.tray.show_balloon(
                         APP_NAME,
-                        "Screenshot captured; sending it to Google Gemini over HTTPS.",
+                        "Screenshot captured; sending it to %s over HTTPS." % provider_label,
                     )
                 elif kind == "open":
                     self._log_diagnostic("Settings window requested from the tray.")
