@@ -1,7 +1,8 @@
 """Screen Answer: a transparent, user-triggered Windows tray utility.
 
-No third-party Python packages are required. The screenshot is captured in memory
-and sent to the selected vision API only after the user triggers a capture.
+The default app requires no third-party Python packages. The optional Pix2Text
+OCR mode uses additional packages and model files. Screenshots stay in memory and
+are sent to the selected vision API only after the user triggers a capture.
 """
 from __future__ import annotations
 
@@ -9,6 +10,8 @@ import base64
 import binascii
 import ctypes
 import email.utils
+import importlib.util
+import io
 import json
 import math
 import os
@@ -26,14 +29,20 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Optional, Tuple
 
 APP_NAME = "Screen Answer"
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.3.0-dev"
 DEFAULT_MODEL = "gemini-3.8-flash"
 DEFAULT_MISTRAL_MODEL = "mistral-medium-latest"
 LEGACY_MISTRAL_MODEL = "ministral-14b-2512"
 MISTRAL_OCR_MODEL = "mistral-ocr-latest"
 DEFAULT_PROVIDER = "gemini"
+DEFAULT_OCR_BACKEND = "provider"
 PROVIDER_LABELS = {"gemini": "Google Gemini", "mistral": "Mistral"}
 PROVIDER_BY_LABEL = {label: provider for provider, label in PROVIDER_LABELS.items()}
+OCR_BACKEND_LABELS = {
+    "provider": "Provider default",
+    "pix2text": "Pix2Text (local, experimental)",
+}
+OCR_BACKEND_BY_LABEL = {label: backend for backend, label in OCR_BACKEND_LABELS.items()}
 DEFAULT_MODELS = {
     "gemini": DEFAULT_MODEL,
     "mistral": DEFAULT_MISTRAL_MODEL,
@@ -68,6 +77,8 @@ MAX_OCR_CONTEXT_CHARS = 48_000
 MAX_DIAGNOSTIC_TEXT_CHARS = 16_000
 RETRYABLE_HTTP_STATUSES = (500, 502, 503, 504)
 PORTABLE_CONFIG_NAME = "screen_answer_config.json"
+_PIX2TEXT_ENGINE: Any = None
+_PIX2TEXT_ENGINE_LOCK = threading.RLock()
 
 
 def diagnostics_mode_enabled(
@@ -101,15 +112,25 @@ def portable_config_path() -> str:
 
 
 def load_portable_config(path: Optional[str] = None) -> Dict[str, Any]:
-    """Load provider-specific keys/models, migrating the original Gemini format."""
+    """Load provider keys/models and OCR choice, migrating the original Gemini format."""
     config_path = path or portable_config_path()
     try:
         with open(config_path, "r", encoding="utf-8") as config_file:
             raw_config = json.load(config_file)
     except (OSError, ValueError):
-        return {"provider": DEFAULT_PROVIDER, "api_keys": {}, "models": {}}
+        return {
+            "provider": DEFAULT_PROVIDER,
+            "api_keys": {},
+            "models": {},
+            "ocr_backend": DEFAULT_OCR_BACKEND,
+        }
     if not isinstance(raw_config, dict):
-        return {"provider": DEFAULT_PROVIDER, "api_keys": {}, "models": {}}
+        return {
+            "provider": DEFAULT_PROVIDER,
+            "api_keys": {},
+            "models": {},
+            "ocr_backend": DEFAULT_OCR_BACKEND,
+        }
 
     provider = raw_config.get("provider", DEFAULT_PROVIDER)
     if not isinstance(provider, str) or provider.lower() not in PROVIDER_LABELS:
@@ -151,7 +172,16 @@ def load_portable_config(path: Optional[str] = None) -> Dict[str, Any]:
     if models.get("mistral") == LEGACY_MISTRAL_MODEL:
         models["mistral"] = DEFAULT_MISTRAL_MODEL
 
-    return {"provider": provider, "api_keys": api_keys, "models": models}
+    ocr_backend = raw_config.get("ocr_backend", DEFAULT_OCR_BACKEND)
+    if not isinstance(ocr_backend, str) or ocr_backend not in OCR_BACKEND_LABELS:
+        ocr_backend = DEFAULT_OCR_BACKEND
+
+    return {
+        "provider": provider,
+        "api_keys": api_keys,
+        "models": models,
+        "ocr_backend": ocr_backend,
+    }
 
 
 def save_portable_config(
@@ -161,12 +191,17 @@ def save_portable_config(
     provider: str = DEFAULT_PROVIDER,
     api_keys: Optional[Dict[str, str]] = None,
     models: Optional[Dict[str, str]] = None,
+    ocr_backend: str = DEFAULT_OCR_BACKEND,
 ) -> str:
     """Write the opt-in provider config sidecar; API keys are stored in plaintext."""
     config_path = path or portable_config_path()
     selected_provider = provider.lower() if isinstance(provider, str) else DEFAULT_PROVIDER
     if selected_provider not in PROVIDER_LABELS:
         selected_provider = DEFAULT_PROVIDER
+    selected_ocr_backend = (
+        ocr_backend if isinstance(ocr_backend, str) and ocr_backend in OCR_BACKEND_LABELS
+        else DEFAULT_OCR_BACKEND
+    )
 
     saved_keys: Dict[str, str] = {}
     for key_provider, key_value in (api_keys or {}).items():
@@ -198,6 +233,7 @@ def save_portable_config(
                 "provider": selected_provider,
                 "api_keys": saved_keys,
                 "models": saved_models,
+                "ocr_backend": selected_ocr_backend,
             },
             config_file,
             indent=2,
@@ -641,6 +677,7 @@ def ask_gemini(
     model: str,
     png_image: bytes,
     diagnostic: Optional[Callable[[str], None]] = None,
+    ocr_markdown: str = "",
 ) -> Tuple[Optional[int], str]:
     """Send one user-triggered screenshot to Gemini without live web search."""
 
@@ -661,7 +698,7 @@ def ask_gemini(
             {
                 "role": "user",
                 "parts": [
-                    {"text": USER_PROMPT},
+                    {"text": _append_ocr_context(USER_PROMPT, ocr_markdown)},
                     {
                         "inlineData": {
                             "mimeType": "image/png",
@@ -912,6 +949,120 @@ def _extract_mistral_ocr_markdown(response_data: Dict[str, Any]) -> str:
     return markdown.strip() if isinstance(markdown, str) else ""
 
 
+def pix2text_installed() -> bool:
+    """Check for the optional Pix2Text module without importing model dependencies."""
+    try:
+        return importlib.util.find_spec("pix2text") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def _get_pix2text_engine(report: Callable[[str], None]) -> Any:
+    """Lazily load one CPU Pix2Text engine and reuse it across captures."""
+    global _PIX2TEXT_ENGINE
+    with _PIX2TEXT_ENGINE_LOCK:
+        if _PIX2TEXT_ENGINE is not None:
+            return _PIX2TEXT_ENGINE
+        try:
+            from pix2text import Pix2Text
+        except (ImportError, OSError) as exc:
+            raise RuntimeError(
+                "Pix2Text is not installed in this Python environment. See the optional "
+                "installation instructions in README.md."
+            ) from exc
+        report(
+            "Loading Pix2Text on CPU; first use may download model files and take several minutes."
+        )
+        try:
+            _PIX2TEXT_ENGINE = Pix2Text.from_config(device="cpu")
+        except Exception as exc:
+            report("Pix2Text initialization failed (%s)." % type(exc).__name__)
+            raise RuntimeError(
+                "Pix2Text could not initialize. Check its dependencies and first-run model downloads."
+            ) from exc
+        return _PIX2TEXT_ENGINE
+
+
+def _report_pix2text_markdown(
+    markdown: str,
+    report: Callable[[str], None],
+) -> None:
+    excerpt = markdown[:MAX_DIAGNOSTIC_TEXT_CHARS]
+    suffix = ""
+    if len(markdown) > len(excerpt):
+        suffix = "\n[truncated; %d additional characters omitted]" % (
+            len(markdown) - len(excerpt)
+        )
+    report(
+        "Pix2Text OCR Markdown (diagnostic-only; may contain screen text; review before sharing):\n"
+        "%s%s" % (excerpt, suffix)
+    )
+
+
+def run_pix2text_ocr(
+    png_image: bytes,
+    diagnostic: Optional[Callable[[str], None]] = None,
+) -> str:
+    """Run optional local Pix2Text text/formula OCR without writing the screenshot to disk."""
+    def report(message: str) -> None:
+        if diagnostic is not None:
+            diagnostic(message)
+
+    started = time.monotonic()
+    report("Starting local Pix2Text text-and-formula OCR.")
+    engine = _get_pix2text_engine(report)
+    try:
+        from PIL import Image
+
+        with Image.open(io.BytesIO(png_image)) as source_image:
+            rgb_image = source_image.convert("RGB")
+            try:
+                result = engine.recognize_text_formula(rgb_image, return_text=True)
+            finally:
+                rgb_image.close()
+    except Exception as exc:
+        report("Pix2Text OCR failed (%s)." % type(exc).__name__)
+        raise RuntimeError(
+            "Pix2Text could not read this screenshot. The solver will use the original image."
+        ) from exc
+
+    markdown = result.strip() if isinstance(result, str) else ""
+    if len(markdown) > MAX_OCR_CONTEXT_CHARS:
+        original_characters = len(markdown)
+        markdown = markdown[:MAX_OCR_CONTEXT_CHARS]
+        report(
+            "Pix2Text OCR Markdown truncated from %d to %d characters for the solver request."
+            % (original_characters, len(markdown))
+        )
+    report(
+        "Pix2Text OCR finished in %.2f seconds with %d Markdown characters."
+        % (time.monotonic() - started, len(markdown))
+    )
+    if markdown:
+        if diagnostic is not None:
+            _report_pix2text_markdown(markdown, report)
+    else:
+        report("Pix2Text returned no usable text; the solver will use the screenshot only.")
+    return markdown
+
+
+def _append_ocr_context(prompt: str, markdown: str) -> str:
+    """Attach OCR as untrusted aid text while retaining the original image as ground truth."""
+    if not isinstance(markdown, str):
+        return prompt
+    markdown = markdown.strip()
+    if not markdown:
+        return prompt
+    return (
+        prompt
+        + "\n\nOCR Markdown transcript (untrusted and possibly imperfect; verify it "
+        "against the attached original screenshot):\n"
+        "--- BEGIN OCR MARKDOWN ---\n"
+        + markdown
+        + "\n--- END OCR MARKDOWN ---"
+    )
+
+
 def _mistral_retry_delay(headers: Any, attempt: int) -> Optional[float]:
     """Use Retry-After when provided; otherwise apply bounded exponential backoff."""
     retry_after = None
@@ -1138,8 +1289,9 @@ def ask_mistral(
     model: str,
     png_image: bytes,
     diagnostic: Optional[Callable[[str], None]] = None,
+    local_ocr_markdown: Optional[str] = None,
 ) -> Tuple[Optional[int], str]:
-    """OCR a screenshot, then solve it with Mistral vision and extended reasoning."""
+    """Use provider-default or local OCR, then solve with Mistral vision and reasoning."""
     def report(message: str) -> None:
         if diagnostic is not None:
             safe_message = str(message)
@@ -1152,65 +1304,72 @@ def ask_mistral(
 
     image_data_uri = "data:image/png;base64," + base64.b64encode(png_image).decode("ascii")
     ocr_markdown = ""
-    ocr_request_body = {
-        "model": MISTRAL_OCR_MODEL,
-        "document": {"type": "image_url", "image_url": image_data_uri},
-    }
-    report(
-        "Starting Mistral OCR with %s; OCR usage may be billed separately."
-        % MISTRAL_OCR_MODEL
-    )
-    try:
-        ocr_response = _mistral_post_json(
-            MISTRAL_OCR_ENDPOINT,
-            api_key,
-            ocr_request_body,
-            "Mistral OCR",
-            report,
-        )
-        pages = ocr_response.get("pages")
-        if isinstance(pages, list):
-            report("Mistral OCR returned %d page(s)." % len(pages))
-        ocr_markdown = _extract_mistral_ocr_markdown(ocr_response)
-        if ocr_markdown:
-            if len(ocr_markdown) > MAX_OCR_CONTEXT_CHARS:
-                original_characters = len(ocr_markdown)
-                ocr_markdown = ocr_markdown[:MAX_OCR_CONTEXT_CHARS]
-                report(
-                    "OCR Markdown truncated from %d to %d characters for the solver request."
-                    % (original_characters, len(ocr_markdown))
-                )
-            report("Mistral OCR extracted %d Markdown characters." % len(ocr_markdown))
-            if diagnostic is not None:
-                excerpt = ocr_markdown[:MAX_DIAGNOSTIC_TEXT_CHARS]
-                suffix = ""
-                if len(ocr_markdown) > len(excerpt):
-                    suffix = "\n[truncated; %d additional characters omitted]" % (
-                        len(ocr_markdown) - len(excerpt)
-                    )
-                report(
-                    "Mistral OCR pages[0].markdown (diagnostic-only; may include screen text; "
-                    "review before sharing):\n%s%s" % (excerpt, suffix)
-                )
-        else:
-            report("Mistral OCR returned no usable Markdown; solver will use the screenshot only.")
-    except RuntimeError as exc:
-        # OCR entitlement, transient OCR service, or parse failures should not
-        # prevent using the selected vision chat model on the original screenshot.
+    if local_ocr_markdown is None:
+        ocr_request_body = {
+            "model": MISTRAL_OCR_MODEL,
+            "document": {"type": "image_url", "image_url": image_data_uri},
+        }
         report(
-            "Mistral OCR failed; continuing with direct screenshot vision input. Detail: %s"
-            % exc
+            "Starting Mistral OCR with %s; OCR usage may be billed separately."
+            % MISTRAL_OCR_MODEL
         )
+        try:
+            ocr_response = _mistral_post_json(
+                MISTRAL_OCR_ENDPOINT,
+                api_key,
+                ocr_request_body,
+                "Mistral OCR",
+                report,
+            )
+            pages = ocr_response.get("pages")
+            if isinstance(pages, list):
+                report("Mistral OCR returned %d page(s)." % len(pages))
+            ocr_markdown = _extract_mistral_ocr_markdown(ocr_response)
+            if ocr_markdown:
+                if len(ocr_markdown) > MAX_OCR_CONTEXT_CHARS:
+                    original_characters = len(ocr_markdown)
+                    ocr_markdown = ocr_markdown[:MAX_OCR_CONTEXT_CHARS]
+                    report(
+                        "OCR Markdown truncated from %d to %d characters for the solver request."
+                        % (original_characters, len(ocr_markdown))
+                    )
+                report("Mistral OCR extracted %d Markdown characters." % len(ocr_markdown))
+                if diagnostic is not None:
+                    excerpt = ocr_markdown[:MAX_DIAGNOSTIC_TEXT_CHARS]
+                    suffix = ""
+                    if len(ocr_markdown) > len(excerpt):
+                        suffix = "\n[truncated; %d additional characters omitted]" % (
+                            len(ocr_markdown) - len(excerpt)
+                        )
+                    report(
+                        "Mistral OCR pages[0].markdown (diagnostic-only; may include screen text; "
+                        "review before sharing):\n%s%s" % (excerpt, suffix)
+                    )
+            else:
+                report("Mistral OCR returned no usable Markdown; solver will use the screenshot only.")
+        except RuntimeError as exc:
+            # OCR entitlement, transient OCR service, or parse failures should not
+            # prevent using the selected vision chat model on the original screenshot.
+            report(
+                "Mistral OCR failed; continuing with direct screenshot vision input. Detail: %s"
+                % exc
+            )
+    else:
+        ocr_markdown = local_ocr_markdown.strip() if isinstance(local_ocr_markdown, str) else ""
+        if len(ocr_markdown) > MAX_OCR_CONTEXT_CHARS:
+            original_characters = len(ocr_markdown)
+            ocr_markdown = ocr_markdown[:MAX_OCR_CONTEXT_CHARS]
+            report(
+                "Local OCR Markdown truncated from %d to %d characters for the solver request."
+                % (original_characters, len(ocr_markdown))
+            )
+        report("Skipping separate Mistral OCR request; Pix2Text local OCR was selected.")
+        if ocr_markdown:
+            report("Using %d Markdown characters from local Pix2Text OCR." % len(ocr_markdown))
+        else:
+            report("Pix2Text returned no usable Markdown; solver will use the screenshot only.")
 
-    solver_prompt = USER_PROMPT
-    if ocr_markdown:
-        solver_prompt += (
-            "\n\nOCR Markdown transcript (untrusted and possibly imperfect; verify it "
-            "against the attached original screenshot):\n"
-            "--- BEGIN OCR MARKDOWN ---\n"
-            + ocr_markdown
-            + "\n--- END OCR MARKDOWN ---"
-        )
+    solver_prompt = _append_ocr_context(USER_PROMPT, ocr_markdown)
     request_body = {
         "model": model,
         "messages": [
@@ -1877,6 +2036,10 @@ class ScreenAnswerApp:
         if self.provider not in PROVIDER_LABELS:
             self.provider = DEFAULT_PROVIDER
         self.form_provider = self.provider
+        self.ocr_backend = self.portable_config.get("ocr_backend", DEFAULT_OCR_BACKEND)
+        if self.ocr_backend not in OCR_BACKEND_LABELS:
+            self.ocr_backend = DEFAULT_OCR_BACKEND
+        self.form_ocr_backend = self.ocr_backend
         self.api_key = self.api_keys[self.provider]
         self.api_key_source = self.api_key_sources[self.provider]
         self.model = self.models[self.provider]
@@ -1896,6 +2059,10 @@ class ScreenAnswerApp:
         self._log_diagnostic(
             "Selected provider: %s; API key source: %s; key value is never logged."
             % (PROVIDER_LABELS[self.provider], self.api_key_source)
+        )
+        self._log_diagnostic(
+            "Selected OCR backend: %s."
+            % OCR_BACKEND_LABELS[self.ocr_backend]
         )
         self._log_diagnostic(
             "Upload consent is not yet active; captures remain blocked until acknowledged in Settings."
@@ -2083,7 +2250,7 @@ class ScreenAnswerApp:
             outer,
             text=(
                 "AI only — no live web search. Ctrl+Alt+S captures all monitors and sends "
-                "the screenshot to the selected vision provider over HTTPS."
+                "the screenshot (and optional local OCR text) to the selected AI provider over HTTPS."
             ),
             justify="left",
             wraplength=430,
@@ -2099,6 +2266,27 @@ class ScreenAnswerApp:
             command=self._provider_changed,
         )
         self.provider_menu.pack(fill="x", pady=(3, 8))
+
+        tk.Label(outer, text="OCR backend:", anchor="w").pack(fill="x")
+        self.ocr_backend_var = tk.StringVar(value=OCR_BACKEND_LABELS[self.form_ocr_backend])
+        self.ocr_backend_menu = tk.OptionMenu(
+            outer,
+            self.ocr_backend_var,
+            *OCR_BACKEND_LABELS.values(),
+            command=self._ocr_backend_changed,
+        )
+        self.ocr_backend_menu.pack(fill="x", pady=(3, 5))
+        tk.Label(
+            outer,
+            text=(
+                "Pix2Text runs locally but needs a separate install and model download. "
+                "The screenshot and OCR text are still sent to the selected AI provider."
+            ),
+            justify="left",
+            wraplength=430,
+            anchor="w",
+            fg="#555555",
+        ).pack(fill="x", pady=(0, 8))
 
         self.api_key_label = tk.Label(
             outer,
@@ -2159,9 +2347,10 @@ class ScreenAnswerApp:
         tk.Label(
             outer,
             text=(
-                "The screenshot is not saved to disk. Mistral uses separate OCR and chat "
-                "requests, which may incur separate charges. Verify answers and use only "
-                "where AI assistance is permitted."
+                "The screenshot is not saved to disk. Provider-default Mistral uses separate "
+                "OCR and chat requests; local Pix2Text OCR skips that OCR API call but still "
+                "uploads the screenshot for solving. Verify answers and use only where AI "
+                "assistance is permitted."
             ),
             fg="#555555",
             justify="left",
@@ -2185,14 +2374,18 @@ class ScreenAnswerApp:
         return "%s API key:" % PROVIDER_LABELS.get(provider, "Selected provider")
 
     def _consent_text(self, provider: str) -> str:
+        provider_label = PROVIDER_LABELS.get(provider, "the selected provider")
+        if self.form_ocr_backend == "pix2text":
+            return (
+                "I understand Pix2Text reads the screenshot locally, then the full screenshot "
+                "and OCR text are uploaded to %s for AI solving."
+            ) % provider_label
         if provider == "mistral":
             return (
                 "I understand each capture uploads the full desktop screenshot to Mistral "
                 "OCR and chat APIs for transcription and solving."
             )
-        return "I understand each capture uploads the full desktop screenshot to %s." % (
-            PROVIDER_LABELS.get(provider, "the selected provider")
-        )
+        return "I understand each capture uploads the full desktop screenshot to %s." % provider_label
 
     def _remember_form_settings(self) -> None:
         provider = self.form_provider
@@ -2215,6 +2408,19 @@ class ScreenAnswerApp:
             "Settings provider changed to %s; a provider-specific API key and new "
             "upload consent are required."
             % PROVIDER_LABELS[provider]
+        )
+
+    def _ocr_backend_changed(self, selected_label: str) -> None:
+        backend = OCR_BACKEND_BY_LABEL.get(selected_label)
+        if backend is None or backend == self.form_ocr_backend:
+            return
+        self.form_ocr_backend = backend
+        self.privacy_var.set(False)
+        self.privacy_acknowledged = False
+        self.privacy_checkbutton.configure(text=self._consent_text(self.form_provider))
+        self._log_diagnostic(
+            "OCR backend changed to %s; new upload consent is required."
+            % OCR_BACKEND_LABELS[backend]
         )
 
     def _privacy_changed(self) -> None:
@@ -2262,6 +2468,23 @@ class ScreenAnswerApp:
                 % (provider_label, DEFAULT_MODELS[provider])
             )
             return False
+        ocr_backend = self.form_ocr_backend
+        if ocr_backend == "pix2text" and not pix2text_installed():
+            self._log_diagnostic("Settings save blocked: Pix2Text package is not available.")
+            self.show_window()
+            if getattr(sys, "frozen", False):
+                message = (
+                    "Pix2Text is not bundled in this standalone EXE. Keep Provider default, "
+                    "or run the source version with the optional Pix2Text package installed "
+                    "(see README.md)."
+                )
+            else:
+                message = (
+                    "Pix2Text is not installed in this Python environment. Install the "
+                    "optional dependencies listed in requirements-pix2text.txt and restart."
+                )
+            self._show_error(message)
+            return False
         if self.portable_var.get():
             try:
                 save_portable_config(
@@ -2269,6 +2492,7 @@ class ScreenAnswerApp:
                     provider=provider,
                     api_keys=self.api_keys,
                     models=self.models,
+                    ocr_backend=ocr_backend,
                 )
             except OSError as exc:
                 self._log_diagnostic("Could not save portable config (%s)." % type(exc).__name__)
@@ -2294,14 +2518,16 @@ class ScreenAnswerApp:
         self.api_keys[provider] = key
         self.models[provider] = model
         self.provider = provider
+        self.ocr_backend = ocr_backend
         self.api_key = key
         self.model = model
         self.api_key_source = "portable config sidecar" if self.portable_var.get() else "in-memory settings"
         self.api_key_sources[provider] = self.api_key_source
         self.privacy_acknowledged = True
         self._log_diagnostic(
-            "Settings saved (provider=%s; model=%s; API key source=%s; upload consent acknowledged)."
-            % (provider_label, model, self.api_key_source)
+            "Settings saved (provider=%s; model=%s; OCR backend=%s; API key source=%s; "
+            "upload consent acknowledged)."
+            % (provider_label, model, OCR_BACKEND_LABELS[ocr_backend], self.api_key_source)
         )
         self.status_var.set(save_message + " Press Ctrl+Alt+S to capture.")
         self.tray.set_state(NEUTRAL_RGB, "Screen Answer — ready; Ctrl+Alt+S to capture")
@@ -2342,13 +2568,15 @@ class ScreenAnswerApp:
             self._fade_job = None
         provider = self.provider
         provider_label = PROVIDER_LABELS[provider]
+        ocr_backend = self.ocr_backend
         self.status_var.set("Capturing the full desktop and sending it to %s…" % provider_label)
         # The tooltip changes immediately. The balloon is shown only after the
         # screenshot is captured so it cannot cover part of the user's screen.
         self.tray.set_state(NEUTRAL_RGB, "Screen Answer — capturing desktop for %s" % provider_label)
         self._log_diagnostic(
-            "Background worker starting; capture includes all connected monitors; provider=%s."
-            % provider_label
+            "Background worker starting; capture includes all connected monitors; provider=%s; "
+            "OCR backend=%s."
+            % (provider_label, OCR_BACKEND_LABELS[ocr_backend])
         )
 
         api_key = self.api_key
@@ -2369,14 +2597,52 @@ class ScreenAnswerApp:
                 )
                 self.events.put(("captured", provider))
 
+                local_ocr_markdown: Optional[str] = None
+                if ocr_backend == "pix2text":
+                    stage = "Pix2Text local OCR"
+                    try:
+                        local_ocr_markdown = run_pix2text_ocr(
+                            image,
+                            diagnostic=diagnostic_callback,
+                        )
+                        if not local_ocr_markdown and diagnostic_callback is None:
+                            self.events.put(
+                                (
+                                    "notice",
+                                    "Pix2Text found no text; continuing with screenshot-only AI.",
+                                )
+                            )
+                    except Exception as exc:
+                        self._log_diagnostic(
+                            "Pix2Text local OCR failed (%s); continuing with original-image vision."
+                            % type(exc).__name__
+                        )
+                        local_ocr_markdown = ""
+                        if diagnostic_callback is None:
+                            self.events.put(
+                                (
+                                    "notice",
+                                    "Local Pix2Text OCR failed; continuing with screenshot-only AI.",
+                                )
+                            )
+
                 stage = "%s request" % provider_label
-                ask_provider = ask_mistral if provider == "mistral" else ask_gemini
-                option, response_text = ask_provider(
-                    api_key,
-                    model,
-                    image,
-                    diagnostic=diagnostic_callback,
-                )
+                if provider == "mistral":
+                    option, response_text = ask_mistral(
+                        api_key,
+                        model,
+                        image,
+                        diagnostic=diagnostic_callback,
+                        local_ocr_markdown=local_ocr_markdown,
+                    )
+                else:
+                    option, response_text = ask_gemini(
+                        api_key,
+                        model,
+                        image,
+                        diagnostic=diagnostic_callback,
+                        ocr_markdown=local_ocr_markdown or "",
+                    )
                 self._log_diagnostic(
                     "%s request completed; applying the tray result." % provider_label
                 )
@@ -2478,6 +2744,8 @@ class ScreenAnswerApp:
                     return
                 elif kind == "answer":
                     self._set_result(event[1], event[2])
+                elif kind == "notice":
+                    self.tray.show_balloon(APP_NAME, event[1][:200])
                 elif kind == "failure":
                     self._log_diagnostic("Request failed: %s" % event[1])
                     self.busy = False

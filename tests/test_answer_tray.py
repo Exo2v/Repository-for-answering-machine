@@ -4,10 +4,11 @@ import json
 import os
 import struct
 import tempfile
+import types
 import unittest
 import urllib.error
 import zlib
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from answer_tray import (
     _encode_rgb_png,
@@ -22,6 +23,7 @@ from answer_tray import (
     diagnostics_mode_enabled,
     load_portable_config,
     parse_option,
+    run_pix2text_ocr,
     save_portable_config,
 )
 
@@ -33,6 +35,33 @@ class DiagnosticsModeTests(unittest.TestCase):
         )
         self.assertTrue(diagnostics_mode_enabled(("--diagnostics",), "python.exe"))
         self.assertFalse(diagnostics_mode_enabled((), "ScreenAnswer.exe"))
+
+
+class Pix2TextOCRTests(unittest.TestCase):
+    def test_recognizes_text_formula_from_in_memory_png_and_logs_only_when_enabled(self):
+        source_image = MagicMock()
+        source_image.__enter__.return_value = source_image
+        rgb_image = MagicMock()
+        source_image.convert.return_value = rgb_image
+        engine = MagicMock()
+        markdown = "Question: $x^2 + 1 = 0$\nA. 1\nB. 2"
+        engine.recognize_text_formula.return_value = markdown
+        pillow_module = types.ModuleType("PIL")
+        pillow_module.Image = types.SimpleNamespace(open=MagicMock(return_value=source_image))
+        diagnostics = []
+        png = b"private screenshot bytes"
+
+        with patch.dict("sys.modules", {"PIL": pillow_module}):
+            with patch("answer_tray._get_pix2text_engine", return_value=engine):
+                result = run_pix2text_ocr(png, diagnostic=diagnostics.append)
+
+        self.assertEqual(result, markdown)
+        engine.recognize_text_formula.assert_called_once_with(rgb_image, return_text=True)
+        self.assertEqual(pillow_module.Image.open.call_args.args[0].getvalue(), png)
+        self.assertTrue(any("Pix2Text OCR Markdown (diagnostic-only" in line for line in diagnostics))
+        self.assertTrue(any(markdown in line for line in diagnostics))
+        self.assertTrue(any("finished in" in line for line in diagnostics))
+        rgb_image.close.assert_called_once_with()
 
 
 class ParseOptionTests(unittest.TestCase):
@@ -147,6 +176,43 @@ class GeminiRequestTests(unittest.TestCase):
         self.assertEqual(captured["body"]["generationConfig"]["maxOutputTokens"], 2048)
         parts = captured["body"]["contents"][0]["parts"]
         self.assertEqual(parts[1]["inlineData"]["data"], base64.b64encode(image_bytes).decode("ascii"))
+
+    def test_attaches_local_ocr_transcript_and_original_image(self):
+        captured = {}
+        response_payload = {
+            "candidates": [{"content": {"parts": [{"text": "ANSWER: B"}]}}]
+        }
+        markdown = "Calculate $2 + 2$.\nA. 3\nB. 4"
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+            def read(self, limit=-1):
+                data = json.dumps(response_payload).encode("utf-8")
+                return data if limit < 0 else data[:limit]
+
+        def fake_urlopen(request, timeout):
+            captured["body"] = json.loads(request.data.decode("utf-8"))
+            return FakeResponse()
+
+        image_bytes = b"original screenshot"
+        with patch("answer_tray.urllib.request.urlopen", side_effect=fake_urlopen):
+            option, _ = ask_gemini(
+                "key", "gemini-3.8-flash", image_bytes, ocr_markdown=markdown
+            )
+
+        parts = captured["body"]["contents"][0]["parts"]
+        self.assertEqual(option, 2)
+        self.assertIn(markdown, parts[0]["text"])
+        self.assertIn("verify it against the attached original screenshot", parts[0]["text"])
+        self.assertEqual(
+            parts[1]["inlineData"]["data"],
+            base64.b64encode(image_bytes).decode("ascii"),
+        )
 
     def test_diagnostic_callback_shows_final_model_text_but_redacts_key(self):
         private_response = (
@@ -407,6 +473,53 @@ class MistralRequestTests(unittest.TestCase):
             content[1]["image_url"],
             "data:image/png;base64," + base64.b64encode(image_bytes).decode("ascii"),
         )
+
+    def test_local_pix2text_transcript_skips_mistral_ocr_request(self):
+        calls = []
+        captured_chat = {}
+        markdown = "Question: $\\int_0^1 x^2 dx$\nA. 1/2\nB. 1/3"
+        response_payload = {
+            "choices": [{"message": {"role": "assistant", "content": "ANSWER: B"}}]
+        }
+
+        class FakeResponse:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+            def read(self, limit=-1):
+                data = json.dumps(response_payload).encode("utf-8")
+                return data if limit < 0 else data[:limit]
+
+        def fake_urlopen(request, timeout):
+            calls.append(request.full_url)
+            captured_chat["body"] = json.loads(request.data.decode("utf-8"))
+            return FakeResponse()
+
+        image_bytes = b"original screenshot"
+        diagnostics = []
+        with patch("answer_tray.urllib.request.urlopen", side_effect=fake_urlopen):
+            option, _ = ask_mistral(
+                "key",
+                DEFAULT_MISTRAL_MODEL,
+                image_bytes,
+                diagnostic=diagnostics.append,
+                local_ocr_markdown=markdown,
+            )
+
+        self.assertEqual(option, 2)
+        self.assertEqual(calls, ["https://api.mistral.ai/v1/chat/completions"])
+        content = captured_chat["body"]["messages"][1]["content"]
+        self.assertIn(markdown, content[0]["text"])
+        self.assertEqual(
+            content[1]["image_url"],
+            "data:image/png;base64," + base64.b64encode(image_bytes).decode("ascii"),
+        )
+        self.assertTrue(any("Skipping separate Mistral OCR request" in line for line in diagnostics))
 
     def test_ocr_extractor_returns_first_page_markdown(self):
         payload = {
@@ -683,6 +796,7 @@ class PortableConfigTests(unittest.TestCase):
                     "provider": "gemini",
                     "api_keys": {"gemini": "example-key"},
                     "models": {"gemini": "gemini-3.8-flash"},
+                    "ocr_backend": "provider",
                 },
             )
 
@@ -694,6 +808,7 @@ class PortableConfigTests(unittest.TestCase):
                 provider="mistral",
                 api_keys={"gemini": "gemini-key", "mistral": "mistral-key"},
                 models={"gemini": "gemini-3.8-flash", "mistral": "ministral-14b-2512"},
+                ocr_backend="pix2text",
             )
             self.assertEqual(
                 load_portable_config(path),
@@ -701,6 +816,7 @@ class PortableConfigTests(unittest.TestCase):
                     "provider": "mistral",
                     "api_keys": {"gemini": "gemini-key", "mistral": "mistral-key"},
                     "models": {"gemini": "gemini-3.8-flash", "mistral": "mistral-medium-latest"},
+                    "ocr_backend": "pix2text",
                 },
             )
             with open(path, "w", encoding="utf-8") as config_file:
@@ -711,11 +827,17 @@ class PortableConfigTests(unittest.TestCase):
                     "provider": "gemini",
                     "api_keys": {"gemini": "legacy-key"},
                     "models": {"gemini": "gemini-3.8-flash"},
+                    "ocr_backend": "provider",
                 },
             )
 
     def test_missing_or_invalid_config_falls_back_to_empty(self):
-        empty_config = {"provider": "gemini", "api_keys": {}, "models": {}}
+        empty_config = {
+            "provider": "gemini",
+            "api_keys": {},
+            "models": {},
+            "ocr_backend": "provider",
+        }
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "missing.json")
             self.assertEqual(load_portable_config(path), empty_config)
