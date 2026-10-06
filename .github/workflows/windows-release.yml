@@ -27,16 +27,19 @@ jobs:
       - name: Test
         run: python -m unittest discover -s tests -v
 
-      - name: Package standalone executable
+      - name: Package standalone executables
         run: |
           python -m pip install pyinstaller==5.13.2
           pyinstaller --noconfirm --clean --onefile --windowed --name ScreenAnswer answer_tray.py
+          pyinstaller --noconfirm --clean --onefile --windowed --name ScreenAnswer-Diagnostic answer_tray.py
 
-      - name: Upload executable artifact
+      - name: Upload standalone executables
         uses: actions/upload-artifact@v4
         with:
           name: ScreenAnswer-Windows-32bit
-          path: dist/ScreenAnswer.exe
+          path: |
+            dist/ScreenAnswer.exe
+            dist/ScreenAnswer-Diagnostic.exe
           if-no-files-found: error
           retention-days: 30
 
@@ -45,4 +48,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: dist/ScreenAnswer.exe
+          files: |
+            dist/ScreenAnswer.exe
+            dist/ScreenAnswer-Diagnostic.exe

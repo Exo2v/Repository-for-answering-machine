@@ -13,10 +13,20 @@ from answer_tray import (
     _encode_rgb_png,
     _extract_gemini_text,
     ask_gemini,
+    diagnostics_mode_enabled,
     load_portable_config,
     parse_option,
     save_portable_config,
 )
+
+
+class DiagnosticsModeTests(unittest.TestCase):
+    def test_diagnostic_mode_is_enabled_by_exe_name_or_flag(self):
+        self.assertTrue(
+            diagnostics_mode_enabled((), "ScreenAnswer-Diagnostic.exe")
+        )
+        self.assertTrue(diagnostics_mode_enabled(("--diagnostics",), "python.exe"))
+        self.assertFalse(diagnostics_mode_enabled((), "ScreenAnswer.exe"))
 
 
 class ParseOptionTests(unittest.TestCase):
@@ -81,6 +91,39 @@ class GeminiRequestTests(unittest.TestCase):
         parts = captured["body"]["contents"][0]["parts"]
         self.assertEqual(parts[1]["inlineData"]["data"], base64.b64encode(image_bytes).decode("ascii"))
 
+    def test_diagnostic_callback_omits_raw_model_response(self):
+        private_response = "question text from the screenshot"
+        response_payload = {
+            "candidates": [
+                {"content": {"parts": [{"text": private_response}]}}
+            ]
+        }
+        diagnostic_lines = []
+
+        class FakeResponse:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+            def read(self, limit=-1):
+                data = json.dumps(response_payload).encode("utf-8")
+                return data if limit < 0 else data[:limit]
+
+        with patch("answer_tray.urllib.request.urlopen", return_value=FakeResponse()):
+            option, response_text = ask_gemini(
+                "test-key", "gemini-3.8-flash", b"image", diagnostic=diagnostic_lines.append
+            )
+
+        self.assertIsNone(option)
+        self.assertEqual(response_text, private_response)
+        self.assertFalse(any(private_response in line for line in diagnostic_lines))
+        self.assertFalse(any("test-key" in line for line in diagnostic_lines))
+        self.assertTrue(any("raw text omitted" in line for line in diagnostic_lines))
+
     def test_retries_temporary_503_then_succeeds(self):
         response_payload = {
             "candidates": [{"content": {"parts": [{"text": "1"}]}}]
@@ -106,13 +149,57 @@ class GeminiRequestTests(unittest.TestCase):
                 )
             return FakeResponse()
 
+        diagnostic_lines = []
         with patch("answer_tray.urllib.request.urlopen", side_effect=fake_urlopen):
             with patch("answer_tray.time.sleep") as sleep:
-                option, _ = ask_gemini("test-key", "gemini-3.8-flash", b"image")
+                option, _ = ask_gemini(
+                    "test-key",
+                    "gemini-3.8-flash",
+                    b"image",
+                    diagnostic=diagnostic_lines.append,
+                )
 
         self.assertEqual(option, 1)
         self.assertEqual(call_count[0], 2)
         sleep.assert_called_once_with(1)
+        self.assertTrue(any("failed with status 503" in line for line in diagnostic_lines))
+        self.assertTrue(any("retrying in 1 second" in line for line in diagnostic_lines))
+        self.assertTrue(any("recognized option 1" in line for line in diagnostic_lines))
+        self.assertFalse(any("test-key" in line for line in diagnostic_lines))
+
+    def test_final_503_diagnostic_includes_provider_reason_without_key(self):
+        provider_message = "temporary service failure test-key"
+        diagnostic_lines = []
+        call_count = [0]
+
+        def fake_urlopen(request, timeout):
+            call_count[0] += 1
+            body = json.dumps(
+                {"error": {"status": "UNAVAILABLE", "message": provider_message}}
+            ).encode("utf-8")
+            raise urllib.error.HTTPError(
+                request.full_url, 503, "Service Unavailable", None, io.BytesIO(body)
+            )
+
+        with patch("answer_tray.urllib.request.urlopen", side_effect=fake_urlopen):
+            with patch("answer_tray.time.sleep"):
+                with self.assertRaisesRegex(RuntimeError, "HTTP 503"):
+                    ask_gemini(
+                        "test-key",
+                        "gemini-3.8-flash",
+                        b"image",
+                        diagnostic=diagnostic_lines.append,
+                    )
+
+        self.assertEqual(call_count[0], 3)
+        self.assertTrue(any("UNAVAILABLE" in line for line in diagnostic_lines))
+        self.assertTrue(
+            any(
+                "temporary service failure [REDACTED API KEY]" in line
+                for line in diagnostic_lines
+            )
+        )
+        self.assertFalse(any("test-key" in line for line in diagnostic_lines))
 
 
 class PortableConfigTests(unittest.TestCase):

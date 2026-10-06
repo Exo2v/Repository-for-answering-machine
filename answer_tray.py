@@ -21,9 +21,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zlib
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 APP_NAME = "Screen Answer"
+APP_VERSION = "1.0.3"
 DEFAULT_MODEL = "gemini-3.8-flash"
 CAPTURE_HOTKEY_TEXT = "Ctrl+Alt+S"
 EXIT_HOTKEY_TEXT = "Ctrl+Alt+Q"
@@ -48,6 +49,27 @@ MAX_API_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_GEMINI_ATTEMPTS = 3
 RETRYABLE_HTTP_STATUSES = (500, 502, 503, 504)
 PORTABLE_CONFIG_NAME = "screen_answer_config.json"
+
+
+def diagnostics_mode_enabled(
+    argv: Optional[Tuple[str, ...]] = None,
+    executable: Optional[str] = None,
+) -> bool:
+    """Return true for the diagnostic build or an explicit source-run flag."""
+    arguments = tuple(sys.argv[1:] if argv is None else argv)
+    executable_path = executable or sys.executable
+    executable_name = os.path.splitext(os.path.basename(executable_path))[0].lower()
+    return "--diagnostics" in arguments or executable_name.endswith("-diagnostic")
+
+
+def _queue_diagnostic_event(
+    events: "queue.Queue[Tuple[Any, ...]]",
+    enabled: bool,
+    message: str,
+) -> None:
+    """Send a timestamped, content-free diagnostic line to the UI thread."""
+    if enabled:
+        events.put(("diagnostic", time.strftime("%Y-%m-%d %H:%M:%S"), str(message)))
 
 
 def portable_config_path() -> str:
@@ -336,10 +358,24 @@ def _extract_gemini_text(response_data: Dict[str, Any]) -> str:
     ).strip()
 
 
-def ask_gemini(api_key: str, model: str, png_image: bytes) -> Tuple[Optional[int], str]:
+def ask_gemini(
+    api_key: str,
+    model: str,
+    png_image: bytes,
+    diagnostic: Optional[Callable[[str], None]] = None,
+) -> Tuple[Optional[int], str]:
     """Send one user-triggered screenshot to Gemini without live web search."""
+
+    def report(message: str) -> None:
+        if diagnostic is not None:
+            safe_message = str(message)
+            if api_key:
+                safe_message = safe_message.replace(api_key, "[REDACTED API KEY]")
+            diagnostic(safe_message)
+
     if not re.fullmatch(r"[A-Za-z0-9._-]{1,100}", model):
         raise RuntimeError("The Gemini model name contains unsupported characters.")
+    report("Preparing Gemini request for model %s." % model)
     image_b64 = base64.b64encode(png_image).decode("ascii")
     request_body = {
         "systemInstruction": {"parts": [{"text": SYSTEM_INSTRUCTION}]},
@@ -372,52 +408,130 @@ def ask_gemini(api_key: str, model: str, png_image: bytes) -> Tuple[Optional[int
     )
     response_bytes = None
     for attempt in range(MAX_GEMINI_ATTEMPTS):
+        attempt_started = time.monotonic()
+        report(
+            "HTTP attempt %d/%d started (request body %d bytes; API key and image content omitted)."
+            % (attempt + 1, MAX_GEMINI_ATTEMPTS, len(encoded_body))
+        )
         try:
             with urllib.request.urlopen(request, timeout=45) as response:
                 response_bytes = response.read(MAX_API_RESPONSE_BYTES + 1)
+                status = getattr(response, "status", None)
+                if status is None:
+                    getcode = getattr(response, "getcode", None)
+                    status = getcode() if getcode is not None else "unknown"
+            report(
+                "HTTP attempt %d/%d received status %s and %d response bytes in %.2f seconds."
+                % (
+                    attempt + 1,
+                    MAX_GEMINI_ATTEMPTS,
+                    status,
+                    len(response_bytes),
+                    time.monotonic() - attempt_started,
+                )
+            )
             break
         except urllib.error.HTTPError as exc:
             status = exc.code
-            exc.close()
+            provider_reason = ""
+            provider_message = ""
+            try:
+                error_bytes = exc.read(4096)
+                error_payload = json.loads(error_bytes.decode("utf-8")) if error_bytes else {}
+                provider_error = error_payload.get("error", {})
+                if isinstance(provider_error, dict):
+                    reason_value = provider_error.get("status")
+                    message_value = provider_error.get("message")
+                    if isinstance(reason_value, str):
+                        provider_reason = reason_value[:100]
+                    if isinstance(message_value, str):
+                        provider_message = message_value.replace("\r", " ").replace("\n", " ")[:400]
+            except (AttributeError, UnicodeDecodeError, ValueError):
+                pass
+            finally:
+                exc.close()
+            report(
+                "HTTP attempt %d/%d failed with status %d after %.2f seconds."
+                % (
+                    attempt + 1,
+                    MAX_GEMINI_ATTEMPTS,
+                    status,
+                    time.monotonic() - attempt_started,
+                )
+            )
+            if provider_reason:
+                report("Gemini error category: %s." % provider_reason)
+            if provider_message:
+                report("Gemini error detail: %s" % provider_message)
             if status in RETRYABLE_HTTP_STATUSES and attempt < MAX_GEMINI_ATTEMPTS - 1:
                 # Temporary overloads (notably HTTP 503) often clear quickly.
                 # Retry in the worker thread so the tray UI remains responsive.
-                time.sleep(2 ** attempt)
+                delay = 2 ** attempt
+                report("Temporary server error; retrying in %d second(s)." % delay)
+                time.sleep(delay)
                 continue
             if status in (401, 403):
+                report("Gemini rejected the API key or account permissions.")
                 raise RuntimeError(
                     "Gemini rejected the API key or account permissions (HTTP %d)." % status
                 )
             if status == 429:
+                report("Gemini reported a quota or rate limit (HTTP 429).")
                 raise RuntimeError("Gemini's quota or rate limit was reached (HTTP 429).")
             if status in RETRYABLE_HTTP_STATUSES:
+                report("Retry limit reached; Gemini is still temporarily unavailable.")
                 raise RuntimeError(
                     "Gemini is temporarily unavailable or overloaded (HTTP %d). "
                     "The request was retried; wait a moment and try again." % status
                 )
+            report("Gemini returned a non-retryable HTTP error (status %d)." % status)
             raise RuntimeError("Gemini returned an HTTP error (%d)." % status)
         except urllib.error.URLError as exc:
             reason = getattr(exc, "reason", None)
             if isinstance(reason, TimeoutError):
+                report(
+                    "Network request timed out after %.2f seconds while waiting for Gemini."
+                    % (time.monotonic() - attempt_started)
+                )
                 raise RuntimeError("The Gemini request timed out. Please try again.")
+            reason_name = type(reason).__name__ if reason is not None else type(exc).__name__
+            report(
+                "Could not reach Gemini after %.2f seconds; network error type: %s."
+                % (time.monotonic() - attempt_started, reason_name)
+            )
             raise RuntimeError("Could not reach Gemini. Check the internet connection and try again.")
     if len(response_bytes) > MAX_API_RESPONSE_BYTES:
+        report("Gemini response exceeded the %d-byte safety limit." % MAX_API_RESPONSE_BYTES)
         raise RuntimeError("Gemini returned an unexpectedly large response.")
     try:
         response_data = json.loads(response_bytes.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
+        report("Gemini response was received but could not be decoded as JSON.")
         raise RuntimeError("Gemini returned a response that could not be read.")
     text = _extract_gemini_text(response_data)
-    return parse_option(text), text
+    option = parse_option(text)
+    if option is None:
+        report(
+            "Response parsing found no reliable option (response length %d characters; raw text omitted)."
+            % len(text)
+        )
+    else:
+        report("Response parsing recognized option %d; raw text omitted." % option)
+    return option, text
 
 
 class WindowsTray:
     """Small ctypes-based notification-area icon and global-hotkey host."""
 
-    def __init__(self, events: "queue.Queue[Tuple[Any, ...]]") -> None:
+    def __init__(
+        self,
+        events: "queue.Queue[Tuple[Any, ...]]",
+        diagnostics_enabled: bool = False,
+    ) -> None:
         if os.name != "nt":
             raise RuntimeError("Screen Answer is currently a Windows-only program.")
         self.events = events
+        self.diagnostics_enabled = diagnostics_enabled
         self.hwnd = None
         self._ready = threading.Event()
         self._lock = threading.RLock()
@@ -439,6 +553,11 @@ class WindowsTray:
         try:
             self._message_thread()
         except Exception as exc:
+            _queue_diagnostic_event(
+                self.events,
+                self.diagnostics_enabled,
+                "Tray thread failed (%s): %s" % (type(exc).__name__, exc),
+            )
             if not self._ready.is_set():
                 self._startup_error = "Could not initialize the Windows tray: %s" % exc
                 self._ready.set()
@@ -480,6 +599,7 @@ class WindowsTray:
         CMD_CAPTURE = 101
         CMD_OPEN = 102
         CMD_EXIT = 103
+        CMD_DIAGNOSTICS = 104
         TRAY_UID = 1
 
         class GUID(ctypes.Structure):
@@ -593,7 +713,7 @@ class WindowsTray:
         def window_proc(hwnd: int, message: int, wparam: int, lparam: int) -> int:
             if message == WM_HOTKEY:
                 if wparam == HOTKEY_CAPTURE_ID:
-                    self.events.put(("capture",))
+                    self.events.put(("capture", CAPTURE_HOTKEY_TEXT))
                     return 0
                 if wparam == HOTKEY_EXIT_ID:
                     self.events.put(("exit",))
@@ -604,9 +724,19 @@ class WindowsTray:
                     self.events.put(("open",))
                     return 0
                 if event in (WM_RBUTTONUP, WM_CONTEXTMENU):
-                    self._show_context_menu(hwnd, POINT, CMD_CAPTURE, CMD_OPEN, CMD_EXIT,
-                                            MF_STRING, MF_SEPARATOR, TPM_RETURNCMD,
-                                            TPM_RIGHTBUTTON, WM_NULL)
+                    self._show_context_menu(
+                        hwnd,
+                        POINT,
+                        CMD_CAPTURE,
+                        CMD_OPEN,
+                        CMD_EXIT,
+                        CMD_DIAGNOSTICS,
+                        MF_STRING,
+                        MF_SEPARATOR,
+                        TPM_RETURNCMD,
+                        TPM_RIGHTBUTTON,
+                        WM_NULL,
+                    )
                     return 0
             elif message == WM_CLOSE:
                 user32.DestroyWindow(hwnd)
@@ -633,6 +763,12 @@ class WindowsTray:
         window_class.hIconSm = 0
         atom = user32.RegisterClassExW(ctypes.byref(window_class))
         if not atom:
+            error_code = ctypes.get_last_error()
+            _queue_diagnostic_event(
+                self.events,
+                self.diagnostics_enabled,
+                "RegisterClassExW failed (Windows error %s)." % error_code,
+            )
             self._startup_error = "Windows could not register the notification-area window."
             self._ready.set()
             return
@@ -652,6 +788,12 @@ class WindowsTray:
             None,
         )
         if not hwnd:
+            error_code = ctypes.get_last_error()
+            _queue_diagnostic_event(
+                self.events,
+                self.diagnostics_enabled,
+                "CreateWindowExW failed (Windows error %s)." % error_code,
+            )
             user32.UnregisterClassW(class_name, instance)
             self._startup_error = "Windows could not create the notification-area window."
             self._ready.set()
@@ -666,21 +808,39 @@ class WindowsTray:
         self._nid.hIcon = self._create_icon(NEUTRAL_RGB)
         self._nid.szTip = "Screen Answer — ready"
         if not shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(self._nid)):
+            error_code = ctypes.get_last_error()
+            _queue_diagnostic_event(
+                self.events,
+                self.diagnostics_enabled,
+                "Shell_NotifyIconW could not add the icon (Windows error %s)." % error_code,
+            )
             user32.DestroyWindow(hwnd)
             user32.UnregisterClassW(class_name, instance)
             self._startup_error = "Windows could not add the notification-area icon."
             self._ready.set()
             return
+        _queue_diagnostic_event(
+            self.events, self.diagnostics_enabled, "Windows notification-area icon installed."
+        )
 
         for hotkey_id, modifiers, key in (
             (HOTKEY_CAPTURE_ID, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, ord("S")),
             (HOTKEY_EXIT_ID, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, ord("Q")),
         ):
+            label = CAPTURE_HOTKEY_TEXT if hotkey_id == HOTKEY_CAPTURE_ID else EXIT_HOTKEY_TEXT
             if user32.RegisterHotKey(hwnd, hotkey_id, modifiers, key):
                 self._registered_hotkeys.add(hotkey_id)
+                _queue_diagnostic_event(
+                    self.events, self.diagnostics_enabled, "Global hotkey %s registered." % label
+                )
             else:
                 error_code = ctypes.get_last_error()
-                label = CAPTURE_HOTKEY_TEXT if hotkey_id == HOTKEY_CAPTURE_ID else EXIT_HOTKEY_TEXT
+                _queue_diagnostic_event(
+                    self.events,
+                    self.diagnostics_enabled,
+                    "Global hotkey %s registration failed (Windows error %s)."
+                    % (label, error_code),
+                )
                 self.events.put(("hotkey_error", label, error_code))
 
         self._ready.set()
@@ -706,6 +866,7 @@ class WindowsTray:
         cmd_capture: int,
         cmd_open: int,
         cmd_exit: int,
+        cmd_diagnostics: int,
         mf_string: int,
         mf_separator: int,
         tpm_returncmd: int,
@@ -719,6 +880,8 @@ class WindowsTray:
         try:
             user32.AppendMenuW(menu, mf_string, cmd_capture, "Capture and ask  (Ctrl+Alt+S)")
             user32.AppendMenuW(menu, mf_string, cmd_open, "Open Screen Answer")
+            if self.diagnostics_enabled:
+                user32.AppendMenuW(menu, mf_string, cmd_diagnostics, "Show diagnostics")
             user32.AppendMenuW(menu, mf_separator, 0, None)
             user32.AppendMenuW(menu, mf_string, cmd_exit, "Exit  (Ctrl+Alt+Q)")
             point = point_type()
@@ -734,9 +897,11 @@ class WindowsTray:
                 None,
             )
             if selected == cmd_capture:
-                self.events.put(("capture",))
+                self.events.put(("capture", "tray menu"))
             elif selected == cmd_open:
                 self.events.put(("open",))
+            elif self.diagnostics_enabled and selected == cmd_diagnostics:
+                self.events.put(("show_diagnostics",))
             elif selected == cmd_exit:
                 self.events.put(("exit",))
             user32.PostMessageW(hwnd, wm_null, 0, 0)
@@ -934,20 +1099,205 @@ class ScreenAnswerApp:
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
 
         self.events: "queue.Queue[Tuple[Any, ...]]" = queue.Queue()
+        self.diagnostics_enabled = diagnostics_mode_enabled()
+        self.diagnostic_lines = []
+        self.diagnostics_window = None
+        self.diagnostics_text = None
+        self.diagnostics_status_var = None
+
         self.config_path = portable_config_path()
         self.portable_config = load_portable_config(self.config_path)
         self._config_has_key = bool(self.portable_config.get("api_key"))
-        self.api_key = os.environ.get("GEMINI_API_KEY", "").strip() or self.portable_config.get("api_key", "")
+        environment_key = os.environ.get("GEMINI_API_KEY", "").strip()
+        self.api_key = environment_key or self.portable_config.get("api_key", "")
+        if environment_key:
+            self.api_key_source = "environment variable"
+        elif self.api_key:
+            self.api_key_source = "portable config sidecar"
+        else:
+            self.api_key_source = "not configured"
         self.model = self.portable_config.get("model", DEFAULT_MODEL)
         self.privacy_acknowledged = False
         self.busy = False
         self._result_generation = 0
         self._fade_job: Optional[str] = None
 
-        self.tray = WindowsTray(self.events)
+        self._log_diagnostic(
+            "Starting Screen Answer %s%s."
+            % (APP_VERSION, " diagnostic build" if self.diagnostics_enabled else "")
+        )
+        self._log_diagnostic(
+            "Runtime: Python %s, %d-bit process."
+            % (sys.version.split()[0], struct.calcsize("P") * 8)
+        )
+        self._log_diagnostic("API key source: %s; key value is never logged." % self.api_key_source)
+        self._log_diagnostic(
+            "Upload consent is not yet active; captures remain blocked until acknowledged in Settings."
+        )
+
+        self.tray = WindowsTray(self.events, diagnostics_enabled=self.diagnostics_enabled)
         self._build_window()
         self.tray.set_state(NEUTRAL_RGB, "Screen Answer — ready; Ctrl+Alt+S to capture")
+        self._log_diagnostic("Application ready; tray icon initialized.")
         self.root.after(100, self._poll_events)
+        if self.diagnostics_enabled:
+            self.root.after(0, self.show_diagnostics)
+
+    def _log_diagnostic(self, message: str) -> None:
+        if not self.diagnostics_enabled:
+            return
+        text = str(message)
+        secrets = (
+            self.api_key,
+            self.portable_config.get("api_key", ""),
+            os.environ.get("GEMINI_API_KEY", "").strip(),
+        )
+        for secret in secrets:
+            if secret:
+                text = text.replace(secret, "[REDACTED API KEY]")
+        _queue_diagnostic_event(self.events, True, text)
+
+    def _append_diagnostic_line(self, line: str) -> None:
+        self.diagnostic_lines.append(line)
+        if len(self.diagnostic_lines) > 3000:
+            del self.diagnostic_lines[: len(self.diagnostic_lines) - 3000]
+        widget = self.diagnostics_text
+        if widget is not None:
+            try:
+                widget.configure(state="normal")
+                widget.insert("end", line + "\n")
+                widget.configure(state="disabled")
+                widget.see("end")
+            except Exception:
+                self.diagnostics_text = None
+
+    def show_diagnostics(self) -> None:
+        if not self.diagnostics_enabled:
+            return
+        import tkinter as tk
+        from tkinter.scrolledtext import ScrolledText
+
+        if self.diagnostics_window is not None:
+            try:
+                self.diagnostics_window.deiconify()
+                self.diagnostics_window.lift()
+                return
+            except Exception:
+                self.diagnostics_window = None
+                self.diagnostics_text = None
+
+        window = tk.Toplevel(self.root)
+        self.diagnostics_window = window
+        window.title("Screen Answer — Diagnostics")
+        window.geometry("820x470")
+        window.minsize(620, 340)
+        window.protocol("WM_DELETE_WINDOW", self._hide_diagnostics)
+
+        outer = tk.Frame(window, padx=12, pady=10)
+        outer.pack(fill="both", expand=True)
+        tk.Label(
+            outer,
+            text=(
+                "Live trace of startup, hotkeys, capture, network attempts, and answer parsing. "
+                "The log omits API keys, screenshot pixels, and raw Gemini response text."
+            ),
+            justify="left",
+            anchor="w",
+            wraplength=780,
+        ).pack(fill="x", pady=(0, 8))
+
+        self.diagnostics_text = ScrolledText(
+            outer,
+            height=18,
+            wrap="word",
+            font=("TkFixedFont", 9),
+            state="disabled",
+        )
+        self.diagnostics_text.pack(fill="both", expand=True)
+        for line in self.diagnostic_lines:
+            self.diagnostics_text.configure(state="normal")
+            self.diagnostics_text.insert("end", line + "\n")
+            self.diagnostics_text.configure(state="disabled")
+        self.diagnostics_text.see("end")
+
+        buttons = tk.Frame(outer)
+        buttons.pack(fill="x", pady=(8, 0))
+        tk.Button(
+            buttons, text="Open settings", command=self._open_settings_from_diagnostics
+        ).pack(side="left")
+        tk.Button(buttons, text="Save log…", command=self._save_diagnostic_log).pack(
+            side="left", padx=(6, 0)
+        )
+        tk.Button(buttons, text="Copy log", command=self._copy_diagnostic_log).pack(
+            side="left", padx=(6, 0)
+        )
+        tk.Button(buttons, text="Clear log", command=self._clear_diagnostic_log).pack(
+            side="left", padx=(6, 0)
+        )
+        tk.Button(buttons, text="Close", command=self._hide_diagnostics).pack(side="right")
+        self.diagnostics_status_var = tk.StringVar(value="Diagnostic events appear here in real time.")
+        tk.Label(outer, textvariable=self.diagnostics_status_var, anchor="w", fg="#555555").pack(
+            fill="x", pady=(6, 0)
+        )
+
+    def _hide_diagnostics(self) -> None:
+        if self.diagnostics_window is not None:
+            try:
+                self.diagnostics_window.withdraw()
+            except Exception:
+                self.diagnostics_window = None
+                self.diagnostics_text = None
+
+    def _open_settings_from_diagnostics(self) -> None:
+        self._log_diagnostic("Settings window opened from Diagnostics.")
+        self.show_window()
+
+    def _save_diagnostic_log(self) -> None:
+        from tkinter import filedialog, messagebox
+
+        path = filedialog.asksaveasfilename(
+            parent=self.diagnostics_window,
+            title="Save Screen Answer diagnostic log",
+            initialfile="ScreenAnswer-diagnostics.txt",
+            defaultextension=".txt",
+            filetypes=(("Text files", "*.txt"), ("All files", "*.*")),
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as log_file:
+                log_file.write("\n".join(self.diagnostic_lines))
+                if self.diagnostic_lines:
+                    log_file.write("\n")
+        except OSError as exc:
+            messagebox.showerror(
+                "Diagnostics",
+                "Could not save the log: %s" % exc,
+                parent=self.diagnostics_window,
+            )
+            return
+        if self.diagnostics_status_var is not None:
+            self.diagnostics_status_var.set("Log saved. Review it before sharing.")
+
+    def _copy_diagnostic_log(self) -> None:
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append("\n".join(self.diagnostic_lines))
+        except Exception:
+            if self.diagnostics_status_var is not None:
+                self.diagnostics_status_var.set("Could not copy the log to the clipboard.")
+            return
+        if self.diagnostics_status_var is not None:
+            self.diagnostics_status_var.set("Log copied to the clipboard. Review it before sharing.")
+
+    def _clear_diagnostic_log(self) -> None:
+        self.diagnostic_lines = []
+        if self.diagnostics_text is not None:
+            self.diagnostics_text.configure(state="normal")
+            self.diagnostics_text.delete("1.0", "end")
+            self.diagnostics_text.configure(state="disabled")
+        if self.diagnostics_status_var is not None:
+            self.diagnostics_status_var.set("Log cleared; new events will appear here.")
 
     def _build_window(self) -> None:
         import tkinter as tk
@@ -1053,6 +1403,9 @@ class ScreenAnswerApp:
         # required before a later hotkey can send another screenshot.
         if not self.privacy_var.get():
             self.privacy_acknowledged = False
+            self._log_diagnostic(
+                "Upload consent unchecked; capture is blocked until Settings are saved again."
+            )
 
     def show_window(self) -> None:
         self.root.deiconify()
@@ -1070,14 +1423,17 @@ class ScreenAnswerApp:
         key = self.api_key_var.get().strip()
         model = self.model_var.get().strip()
         if not key:
+            self._log_diagnostic("Settings save blocked: no API key was entered.")
             self.show_window()
             self._show_error("Enter a Gemini API key before using capture.")
             return False
         if not self.privacy_var.get():
+            self._log_diagnostic("Settings save blocked: full-screen upload notice was not acknowledged.")
             self.show_window()
             self._show_error("Please acknowledge the full-screen upload notice first.")
             return False
         if not re.fullmatch(r"[A-Za-z0-9._-]{1,100}", model):
+            self._log_diagnostic("Settings save blocked: model name contains unsupported characters.")
             self.show_window()
             self._show_error("Enter a valid Gemini model name, such as " + DEFAULT_MODEL + ".")
             return False
@@ -1085,6 +1441,7 @@ class ScreenAnswerApp:
             try:
                 save_portable_config(key, model, self.config_path)
             except OSError as exc:
+                self._log_diagnostic("Could not save portable config (%s)." % type(exc).__name__)
                 self.show_window()
                 self._show_error("Could not save the portable config file: %s" % exc)
                 return False
@@ -1104,8 +1461,13 @@ class ScreenAnswerApp:
             save_message = "Settings saved in memory for this run only."
 
         self.api_key = key
+        self.api_key_source = "portable config sidecar" if self.portable_var.get() else "in-memory settings"
         self.model = model
         self.privacy_acknowledged = True
+        self._log_diagnostic(
+            "Settings saved (model=%s; API key source=%s; upload consent acknowledged)."
+            % (model, self.api_key_source)
+        )
         self.status_var.set(save_message + " Press Ctrl+Alt+S to capture.")
         self.tray.set_state(NEUTRAL_RGB, "Screen Answer — ready; Ctrl+Alt+S to capture")
         self.hide_window()
@@ -1113,13 +1475,22 @@ class ScreenAnswerApp:
 
     def save_and_capture(self) -> None:
         if self.save_settings():
-            self._start_capture()
+            self._start_capture("settings button")
 
-    def _start_capture(self) -> None:
+    def _start_capture(self, trigger: str = "keyboard shortcut") -> None:
+        self._log_diagnostic("Capture requested via %s." % trigger)
         if self.busy:
+            self._log_diagnostic("Capture request ignored: another request is already in progress.")
             self.tray.show_balloon(APP_NAME, "A screenshot request is already in progress.")
             return
-        if not self.api_key or not self.privacy_acknowledged or not self.privacy_var.get():
+        if not self.api_key:
+            self._log_diagnostic("Capture blocked: no API key is configured.")
+            self.privacy_acknowledged = False
+            self.status_var.set("Set an API key and acknowledge the upload notice before capturing.")
+            self.show_window()
+            return
+        if not self.privacy_acknowledged or not self.privacy_var.get():
+            self._log_diagnostic("Capture blocked: full-screen upload consent is not active.")
             self.privacy_acknowledged = False
             self.status_var.set("Set an API key and acknowledge the upload notice before capturing.")
             self.show_window()
@@ -1137,18 +1508,38 @@ class ScreenAnswerApp:
         # The tooltip changes immediately. The balloon is shown only after the
         # screenshot is captured so it cannot cover part of the user's screen.
         self.tray.set_state(NEUTRAL_RGB, "Screen Answer — capturing desktop for Gemini")
+        self._log_diagnostic("Background worker starting; capture includes all connected monitors.")
 
         api_key = self.api_key
         model = self.model
 
         def worker() -> None:
             image: Optional[bytes] = None
+            stage = "desktop capture"
             try:
+                capture_started = time.monotonic()
+                self._log_diagnostic("Desktop capture started.")
                 image = capture_virtual_desktop_png()
+                width, height = struct.unpack_from(">II", image, 16)
+                self._log_diagnostic(
+                    "Desktop capture succeeded: %d x %d pixels, %d PNG bytes, %.2f seconds."
+                    % (width, height, len(image), time.monotonic() - capture_started)
+                )
                 self.events.put(("captured",))
-                option, response_text = ask_gemini(api_key, model, image)
+
+                stage = "Gemini request"
+                option, response_text = ask_gemini(
+                    api_key,
+                    model,
+                    image,
+                    diagnostic=self._log_diagnostic,
+                )
+                self._log_diagnostic("Background request completed; applying the tray result.")
                 self.events.put(("answer", option, response_text))
             except Exception as exc:
+                self._log_diagnostic(
+                    "%s failed (%s): %s" % (stage, type(exc).__name__, exc)
+                )
                 self.events.put(("failure", str(exc)))
             finally:
                 # Avoid retaining the screenshot after the request completes.
@@ -1168,6 +1559,7 @@ class ScreenAnswerApp:
             self._fade_job = None
 
         if option not in OPTION_RGB:
+            self._log_diagnostic("Final result: no reliable multiple-choice option was recognized.")
             self.tray.set_state(NEUTRAL_RGB, "Screen Answer — neutral; no reliable answer")
             self.tray.show_balloon(APP_NAME, "No reliable answer found; the tray icon is grey.")
             self.status_var.set("Neutral — no reliable answer. The tray icon is grey.")
@@ -1175,6 +1567,7 @@ class ScreenAnswerApp:
 
         name = OPTION_NAMES[option]
         color = OPTION_RGB[option]
+        self._log_diagnostic("Final result: option %d (%s); tray icon updated." % (option, name))
         self.tray.set_state(color, "Screen Answer — Option %d (%s)" % (option, name))
         self.tray.show_balloon(APP_NAME, "Option %d — %s" % (option, name))
         self.status_var.set("Option %d — %s. It will fade to grey after 10 seconds." % (option, name))
@@ -1213,21 +1606,29 @@ class ScreenAnswerApp:
             while True:
                 event = self.events.get_nowait()
                 kind = event[0]
-                if kind == "capture":
-                    self._start_capture()
+                if kind == "diagnostic":
+                    self._append_diagnostic_line("[%s] %s" % (event[1], event[2]))
+                elif kind == "capture":
+                    trigger = event[1] if len(event) > 1 else "keyboard shortcut"
+                    self._start_capture(trigger)
                 elif kind == "captured":
                     self.tray.show_balloon(
                         APP_NAME,
                         "Screenshot captured; sending it to Google Gemini over HTTPS.",
                     )
                 elif kind == "open":
+                    self._log_diagnostic("Settings window requested from the tray.")
                     self.show_window()
+                elif kind == "show_diagnostics":
+                    self.show_diagnostics()
                 elif kind == "exit":
+                    self._log_diagnostic("Exit requested.")
                     self.exit_app()
                     return
                 elif kind == "answer":
                     self._set_result(event[1], event[2])
                 elif kind == "failure":
+                    self._log_diagnostic("Request failed: %s" % event[1])
                     self.busy = False
                     self.tray.set_state(NEUTRAL_RGB, "Screen Answer — request failed; neutral")
                     self.tray.show_balloon(APP_NAME, event[1][:200])
@@ -1239,6 +1640,7 @@ class ScreenAnswerApp:
                         "%s is unavailable (Windows error %s)." % (label, code),
                     )
                 elif kind == "fatal":
+                    self._log_diagnostic("Fatal tray error: %s" % event[1])
                     self.show_window()
                     self._show_error(event[1])
                     self.exit_app()
