@@ -43,6 +43,7 @@ from answer_tray import (
     provider_labels_for_executable,
     resolve_api_key,
     schedule_lasso1_self_cleanup,
+    save_lasso1_config,
     pix2text_bundle_importable,
     run_pix2text_ocr,
     save_portable_config,
@@ -170,7 +171,7 @@ class Lasso1ModeTests(unittest.TestCase):
             ("environment-key", "environment variable"),
         )
 
-    def test_first_run_app_stays_tray_only_and_disables_diagnostics(self):
+    def test_first_run_gui_stays_hidden_until_open_and_disables_diagnostics(self):
         class FakeStringVar:
             def __init__(self, value=""):
                 self.value = value
@@ -212,21 +213,27 @@ class Lasso1ModeTests(unittest.TestCase):
                 with patch("answer_tray.portable_config_path", return_value=config_path):
                     with patch("answer_tray.diagnostics_mode_enabled", return_value=True):
                         with patch("answer_tray.WindowsTray", return_value=tray) as tray_class:
-                            with patch.object(ScreenAnswerApp, "_build_window") as build_window:
-                                with patch.dict(
-                                    "sys.modules", {"tkinter": tkinter_module}
-                                ):
+                            with patch.object(
+                                ScreenAnswerApp, "_build_lasso1_window"
+                            ) as lasso_window:
+                                with patch.object(
+                                    ScreenAnswerApp, "_build_window"
+                                ) as build_window:
                                     with patch.dict(
-                                        os.environ,
-                                        {"OPENROUTER_API_KEY": "environment-key"},
+                                        "sys.modules", {"tkinter": tkinter_module}
                                     ):
-                                        app = ScreenAnswerApp(root)
+                                        with patch.dict(
+                                            os.environ,
+                                            {"OPENROUTER_API_KEY": "environment-key"},
+                                        ):
+                                            app = ScreenAnswerApp(root)
 
         self.assertEqual(app.provider, "openrouter")
         self.assertEqual(app.api_key, "config-key")
         self.assertEqual(app.api_key_source, "Lasso1 config file")
         self.assertFalse(app.privacy_acknowledged)
         self.assertFalse(app.diagnostics_enabled)
+        lasso_window.assert_called_once_with()
         build_window.assert_not_called()
         tray_class.assert_called_once_with(
             app.events,
@@ -236,6 +243,63 @@ class Lasso1ModeTests(unittest.TestCase):
         )
         tray.show_balloon.assert_called_once()
         root.deiconify.assert_not_called()
+
+    def test_gui_save_persists_key_and_consent_then_closes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = lasso1_config_path(directory)
+            ensure_lasso1_config(path)
+            app = object.__new__(ScreenAnswerApp)
+            app.lasso1_mode = True
+            app.api_key_var = MagicMock()
+            app.api_key_var.get.return_value = "saved-openrouter-key"
+            app.model_var = MagicMock()
+            app.model_var.get.return_value = DEFAULT_OPENROUTER_MODEL
+            app.privacy_var = MagicMock()
+            app.privacy_var.get.return_value = False
+            app.config_path = path
+            app.api_keys = {"openrouter": ""}
+            app.models = {"openrouter": DEFAULT_OPENROUTER_MODEL}
+            app.api_key_sources = {"openrouter": "not configured"}
+            app.portable_config = {}
+            app.status_var = MagicMock()
+            app.tray = MagicMock()
+            app.hide_window = MagicMock()
+            app.show_window = MagicMock()
+            app._show_error = MagicMock()
+            app._log_diagnostic = MagicMock()
+
+            self.assertTrue(app.save_settings())
+            self.assertFalse(app.privacy_acknowledged)
+            app.hide_window.assert_called_once_with()
+            app._show_error.assert_not_called()
+            with open(path, "r", encoding="utf-8") as config_file:
+                saved = json.load(config_file)
+            self.assertEqual(
+                saved["api_keys"], {"openrouter": "saved-openrouter-key"}
+            )
+            self.assertIs(saved["allow_screenshot_uploads"], False)
+
+            app.hide_window.reset_mock()
+            app.privacy_var.get.return_value = True
+            self.assertTrue(app.save_settings())
+            self.assertTrue(app.privacy_acknowledged)
+            app.hide_window.assert_called_once_with()
+            with open(path, "r", encoding="utf-8") as config_file:
+                saved = json.load(config_file)
+            self.assertIs(saved["allow_screenshot_uploads"], True)
+
+    def test_lasso1_settings_window_can_be_shown_on_demand(self):
+        app = object.__new__(ScreenAnswerApp)
+        app.lasso1_mode = True
+        app.root = MagicMock()
+        app.api_entry = MagicMock()
+
+        app.show_window()
+
+        app.root.deiconify.assert_called_once_with()
+        app.root.lift.assert_called_once_with()
+        app.root.focus_force.assert_called_once_with()
+        app.api_entry.focus_set.assert_called_once_with()
 
     def test_capture_is_blocked_until_config_consent_is_true(self):
         app = object.__new__(ScreenAnswerApp)
@@ -253,10 +317,8 @@ class Lasso1ModeTests(unittest.TestCase):
 
         self.assertFalse(app.busy)
         app.tray.show_balloon.assert_called_once()
-        self.assertIn(
-            "allow_screenshot_uploads",
-            app.tray.show_balloon.call_args.args[1],
-        )
+        self.assertIn("choose Open", app.tray.show_balloon.call_args.args[1])
+        self.assertIn("consent", app.tray.show_balloon.call_args.args[1])
         app.show_window.assert_not_called()
 
     def test_lasso1_context_menu_exposes_folder_and_self_destruct_actions(self):
@@ -296,11 +358,17 @@ class Lasso1ModeTests(unittest.TestCase):
             for call in tray._user32.AppendMenuW.call_args_list
             if call.args[3]
         ]
+        self.assertIn("Open", labels)
         self.assertIn("Open Lasso1 config folder", labels)
         self.assertIn("Self-destruct Lasso1…", labels)
-        self.assertNotIn("Open Lasso1", labels)
+        self.assertNotIn("Open Screen Answer", labels)
         self.assertNotIn("Show diagnostics", labels)
         tray.events.put.assert_called_once_with(("open_config_folder",))
+
+        tray.events.put.reset_mock()
+        tray._user32.TrackPopupMenu.return_value = 102
+        show_menu()
+        tray.events.put.assert_called_once_with(("open",))
 
         tray.events.put.reset_mock()
         tray._user32.TrackPopupMenu.return_value = 106

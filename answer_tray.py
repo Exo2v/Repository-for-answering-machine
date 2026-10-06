@@ -20,6 +20,7 @@ import re
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -208,6 +209,48 @@ def lasso1_config_template() -> Dict[str, Any]:
             "desktop screenshot to OpenRouter. This file is plain text; keep it private."
         ),
     }
+
+
+def save_lasso1_config(
+    path: Optional[str],
+    api_key: str,
+    model: str,
+    allow_screenshot_uploads: bool,
+) -> str:
+    """Atomically save Lasso1's sole key, model, and explicit consent setting."""
+    config_path = path or lasso1_config_path()
+    key = api_key.strip() if isinstance(api_key, str) else ""
+    selected_model = model.strip() if isinstance(model, str) else ""
+    if not key:
+        raise ValueError("An OpenRouter API key is required.")
+    if not valid_model_name("openrouter", selected_model):
+        raise ValueError("Enter a valid OpenRouter model name.")
+
+    config = lasso1_config_template()
+    config["api_keys"]["openrouter"] = key
+    config["models"]["openrouter"] = selected_model
+    config["allow_screenshot_uploads"] = allow_screenshot_uploads is True
+    config_directory = os.path.dirname(os.path.abspath(config_path))
+    os.makedirs(config_directory, exist_ok=True)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=config_directory,
+            prefix=".lasso1-config-",
+            suffix=".tmp",
+            delete=False,
+        ) as config_file:
+            temporary_path = config_file.name
+            json.dump(config, config_file, indent=2)
+            config_file.write("\n")
+        os.replace(temporary_path, config_path)
+        temporary_path = None
+    finally:
+        if temporary_path and os.path.exists(temporary_path):
+            os.remove(temporary_path)
+    return config_path
 
 
 def ensure_lasso1_config(path: Optional[str] = None) -> bool:
@@ -2676,6 +2719,7 @@ class WindowsTray:
             if self.settings_enabled:
                 user32.AppendMenuW(menu, mf_string, cmd_open, "Open %s" % APP_NAME)
             elif self.lasso1_mode:
+                user32.AppendMenuW(menu, mf_string, cmd_open, "Open")
                 user32.AppendMenuW(
                     menu,
                     mf_string,
@@ -2708,7 +2752,7 @@ class WindowsTray:
             )
             if selected == cmd_capture:
                 self.events.put(("capture", "tray menu"))
-            elif self.settings_enabled and selected == cmd_open:
+            elif (self.settings_enabled or self.lasso1_mode) and selected == cmd_open:
                 self.events.put(("open",))
             elif self.lasso1_mode and selected == cmd_open_config_folder:
                 self.events.put(("open_config_folder",))
@@ -2993,21 +3037,23 @@ class ScreenAnswerApp:
             settings_enabled=not self.lasso1_mode,
             lasso1_mode=self.lasso1_mode,
         )
-        if not self.lasso1_mode:
+        if self.lasso1_mode:
+            self._build_lasso1_window()
+        else:
             self._build_window()
         if self.lasso1_mode:
             if not self.api_key:
-                tooltip = "Lasso1 — add OpenRouter key in config"
+                tooltip = "Lasso1 — right-click tray and choose Open to configure"
                 self.tray.show_balloon(
                     APP_NAME,
-                    "Paste a newly rotated key into api_keys.openrouter in %s, then restart."
+                    "Right-click the tray icon and choose Open to enter an OpenRouter key. Config: %s"
                     % self.config_path,
                 )
             elif not self.privacy_acknowledged:
-                tooltip = "Lasso1 — upload consent required in config"
+                tooltip = "Lasso1 — upload consent required"
                 self.tray.show_balloon(
                     APP_NAME,
-                    "Review the upload notice in config.json and set allow_screenshot_uploads to true, then restart.",
+                    "Right-click the tray icon and choose Open to review upload consent, then Save.",
                 )
             else:
                 tooltip = "Lasso1 — ready; Ctrl+Alt+S to capture"
@@ -3180,6 +3226,95 @@ class ScreenAnswerApp:
             self.diagnostics_text.configure(state="disabled")
         if self.diagnostics_status_var is not None:
             self.diagnostics_status_var.set("Log cleared; new events will appear here.")
+
+    def _build_lasso1_window(self) -> None:
+        """Build Lasso1's compact settings window without showing it at startup."""
+        import tkinter as tk
+
+        self.root.title("Lasso1 Settings")
+        outer = tk.Frame(self.root, padx=20, pady=18)
+        outer.pack(fill="both", expand=True)
+
+        tk.Label(
+            outer,
+            text="Lasso1",
+            font=("Segoe UI", 16, "bold"),
+            anchor="w",
+        ).pack(fill="x")
+        tk.Label(
+            outer,
+            text=(
+                "OpenRouter-only tray app. Ctrl+Alt+S captures the full desktop and sends it "
+                "to OpenRouter. Live web search and tool execution are disabled."
+            ),
+            justify="left",
+            wraplength=500,
+            anchor="w",
+        ).pack(fill="x", pady=(6, 14))
+
+        tk.Label(outer, text="OpenRouter API key:", anchor="w").pack(fill="x")
+        self.api_key_var = tk.StringVar(value=self.api_key)
+        self.api_entry = tk.Entry(outer, textvariable=self.api_key_var, show="*", width=64)
+        self.api_entry.pack(fill="x", pady=(3, 10))
+        tk.Label(
+            outer,
+            text=(
+                "The key is stored as plain text in %s. Keep this file private."
+                % self.config_path
+            ),
+            fg="#555555",
+            justify="left",
+            wraplength=500,
+            anchor="w",
+        ).pack(fill="x", pady=(0, 10))
+
+        tk.Label(outer, text="OpenRouter model:", anchor="w").pack(fill="x")
+        self.model_var = tk.StringVar(value=self.model)
+        tk.Entry(outer, textvariable=self.model_var, width=50).pack(fill="x", pady=(3, 10))
+
+        self.privacy_var = tk.BooleanVar(value=self.privacy_acknowledged)
+        self.privacy_checkbutton = tk.Checkbutton(
+            outer,
+            text=(
+                "I consent to sending the full desktop screenshot to OpenRouter when I press "
+                "Ctrl+Alt+S. Leave unchecked to block screenshot uploads."
+            ),
+            variable=self.privacy_var,
+            wraplength=500,
+            justify="left",
+            anchor="w",
+            command=self._privacy_changed,
+        )
+        self.privacy_checkbutton.pack(fill="x", pady=(2, 10))
+
+        status = (
+            "Ready — Ctrl+Alt+S captures after consent is saved."
+            if self.api_key and self.privacy_acknowledged
+            else "Captures remain blocked until a key is saved and upload consent is enabled."
+        )
+        self.status_var = tk.StringVar(value=status)
+        tk.Label(
+            outer,
+            textvariable=self.status_var,
+            anchor="w",
+            justify="left",
+            wraplength=500,
+        ).pack(fill="x", pady=(0, 10))
+
+        buttons = tk.Frame(outer)
+        buttons.pack(fill="x")
+        tk.Button(buttons, text="Save", command=self.save_settings).pack(side="left")
+        tk.Button(buttons, text="Cancel", command=self.hide_window).pack(
+            side="left", padx=(8, 0)
+        )
+
+        self.root.update_idletasks()
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        width = min(max(500, outer.winfo_reqwidth() + 40), max(420, screen_width - 40))
+        height = min(max(370, outer.winfo_reqheight() + 36), max(320, screen_height - 80))
+        self.root.geometry("%dx%d" % (width, height))
+        self.root.minsize(min(460, width), min(340, height))
 
     def _build_window(self) -> None:
         import tkinter as tk
@@ -3393,8 +3528,6 @@ class ScreenAnswerApp:
             )
 
     def show_window(self) -> None:
-        if self.lasso1_mode:
-            return
         self.root.deiconify()
         self.root.lift()
         self.root.focus_force()
@@ -3406,13 +3539,57 @@ class ScreenAnswerApp:
     def hide_window(self) -> None:
         self.root.withdraw()
 
-    def save_settings(self) -> bool:
-        if self.lasso1_mode:
-            self.tray.show_balloon(
-                APP_NAME,
-                "Settings are managed in %s; restart Lasso1 after editing." % self.config_path,
+    def _save_lasso1_settings(self) -> bool:
+        key = self.api_key_var.get().strip()
+        model = self.model_var.get().strip()
+        allow_screenshot_uploads = self.privacy_var.get() is True
+        if not key:
+            self.show_window()
+            self._show_error("Enter an OpenRouter API key before saving.")
+            return False
+        if not valid_model_name("openrouter", model):
+            self.show_window()
+            self._show_error(
+                "Enter a valid OpenRouter model name, such as %s."
+                % DEFAULT_OPENROUTER_MODEL
             )
             return False
+        try:
+            save_lasso1_config(
+                self.config_path,
+                key,
+                model,
+                allow_screenshot_uploads,
+            )
+        except (OSError, ValueError) as exc:
+            self.show_window()
+            self._show_error("Could not save the Lasso1 config file: %s" % exc)
+            return False
+
+        self.provider = self.form_provider = "openrouter"
+        self.api_keys["openrouter"] = self.api_key = key
+        self.models["openrouter"] = self.model = model
+        self.api_key_source = "Lasso1 config file"
+        self.api_key_sources["openrouter"] = self.api_key_source
+        self.privacy_acknowledged = allow_screenshot_uploads
+        self.portable_config["provider"] = "openrouter"
+        self.portable_config["api_keys"] = {"openrouter": key}
+        self.portable_config["models"] = {"openrouter": model}
+        self.portable_config["allow_screenshot_uploads"] = allow_screenshot_uploads
+        self._config_has_key = True
+        if allow_screenshot_uploads:
+            tooltip = "Lasso1 — ready; Ctrl+Alt+S to capture"
+            self.status_var.set("Saved. Ready — Ctrl+Alt+S captures the full desktop.")
+        else:
+            tooltip = "Lasso1 — upload consent required; right-click and Open to review"
+            self.status_var.set("Saved. Captures remain blocked until upload consent is enabled.")
+        self.tray.set_state(NEUTRAL_RGB, tooltip)
+        self.hide_window()
+        return True
+
+    def save_settings(self) -> bool:
+        if self.lasso1_mode:
+            return self._save_lasso1_settings()
         self._remember_form_settings()
         provider = self.form_provider
         provider_label = PROVIDER_LABELS[provider]
@@ -3571,11 +3748,10 @@ class ScreenAnswerApp:
             )
             self.privacy_acknowledged = False
             if self.lasso1_mode:
-                self.status_var.set("Add an OpenRouter key in config.json, then restart.")
+                self.status_var.set("Right-click the tray icon and choose Open to add an OpenRouter key.")
                 self.tray.show_balloon(
                     APP_NAME,
-                    "Add your newly rotated OpenRouter key to %s, then restart."
-                    % self.config_path,
+                    "Right-click the tray icon and choose Open to add an OpenRouter key, then Save.",
                 )
             else:
                 self.status_var.set("Set an API key and acknowledge the upload notice before capturing.")
@@ -3588,10 +3764,10 @@ class ScreenAnswerApp:
             self._log_diagnostic("Capture blocked: full-screen upload consent is not active.")
             self.privacy_acknowledged = False
             if self.lasso1_mode:
-                self.status_var.set("Enable upload consent in config.json, then restart.")
+                self.status_var.set("Review and save upload consent in the Open window before capturing.")
                 self.tray.show_balloon(
                     APP_NAME,
-                    "Review config.json and set allow_screenshot_uploads to true only if you consent, then restart.",
+                    "Right-click the tray icon and choose Open. Enable screenshot upload only if you consent, then Save.",
                 )
             else:
                 self.status_var.set("Set an API key and acknowledge the upload notice before capturing.")
