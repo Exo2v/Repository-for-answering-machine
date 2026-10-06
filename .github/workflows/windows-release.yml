@@ -46,7 +46,8 @@ jobs:
 
   build-pix2text:
     name: Build experimental Pix2Text executable (Windows x64)
-    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    # The commit-message opt-in also permits test builds where manual dispatch is unavailable.
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && contains(github.event.head_commit.message, '[pix2text-build]'))
     runs-on: windows-2022
     timeout-minutes: 120
     steps:
