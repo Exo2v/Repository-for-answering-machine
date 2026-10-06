@@ -29,15 +29,34 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Optional, Tuple
 
 APP_NAME = "Screen Answer"
-APP_VERSION = "1.3.0-experimental"
+APP_VERSION = "1.4.0-experimental"
 DEFAULT_MODEL = "gemini-3.8-flash"
 DEFAULT_MISTRAL_MODEL = "mistral-medium-latest"
+DEFAULT_GROQ_MODEL = "qwen/qwen3.8-27b"
 LEGACY_MISTRAL_MODEL = "ministral-14b-2512"
 MISTRAL_OCR_MODEL = "mistral-ocr-latest"
 DEFAULT_PROVIDER = "gemini"
 _DEFAULT_EXE_NAME = os.path.splitext(os.path.basename(sys.executable))[0].lower()
+
+
+def default_provider_for_executable(executable_name: str) -> str:
+    """Use Groq by default in its dedicated executable variant."""
+    name = os.path.splitext(os.path.basename(executable_name))[0].lower()
+    return "groq" if "groq" in name else DEFAULT_PROVIDER
+
+
+APP_DEFAULT_PROVIDER = default_provider_for_executable(sys.executable)
 DEFAULT_OCR_BACKEND = "pix2text" if "pix2text" in _DEFAULT_EXE_NAME else "provider"
-PROVIDER_LABELS = {"gemini": "Google Gemini", "mistral": "Mistral"}
+PROVIDER_LABELS = {
+    "gemini": "Google Gemini",
+    "mistral": "Mistral",
+    "groq": "Groq",
+}
+API_KEY_ENV_VARS = {
+    "gemini": "GEMINI_API_KEY",
+    "mistral": "MISTRAL_API_KEY",
+    "groq": "GROQ_API_KEY",
+}
 PROVIDER_BY_LABEL = {label: provider for provider, label in PROVIDER_LABELS.items()}
 OCR_BACKEND_LABELS = {
     "provider": "Provider default",
@@ -47,12 +66,23 @@ OCR_BACKEND_BY_LABEL = {label: backend for backend, label in OCR_BACKEND_LABELS.
 DEFAULT_MODELS = {
     "gemini": DEFAULT_MODEL,
     "mistral": DEFAULT_MISTRAL_MODEL,
+    "groq": DEFAULT_GROQ_MODEL,
 }
+
+
+def valid_model_name(provider: str, model: str) -> bool:
+    """Validate editable model IDs, including Groq's slash-namespaced IDs."""
+    if provider == "groq":
+        return bool(re.fullmatch(r"[A-Za-z0-9._/-]{1,120}", model))
+    return bool(re.fullmatch(r"[A-Za-z0-9._-]{1,100}", model))
+
+
 CAPTURE_HOTKEY_TEXT = "Ctrl+Alt+S"
 EXIT_HOTKEY_TEXT = "Ctrl+Alt+Q"
 GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 MISTRAL_ENDPOINT = "https://api.mistral.ai/v1/chat/completions"
 MISTRAL_OCR_ENDPOINT = "https://api.mistral.ai/v1/ocr"
+GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
 
 # The grey state means ready, busy, no answer, or a completed fade.
 NEUTRAL_RGB = (128, 128, 128)
@@ -74,6 +104,7 @@ MAX_API_ATTEMPTS = 3
 MAX_RETRY_AFTER_SECONDS = 30
 MAX_GEMINI_OUTPUT_TOKENS = 2048
 MAX_MISTRAL_OUTPUT_TOKENS = 4096
+MAX_GROQ_OUTPUT_TOKENS = 4096
 MAX_OCR_CONTEXT_CHARS = 48_000
 MAX_DIAGNOSTIC_TEXT_CHARS = 16_000
 RETRYABLE_HTTP_STATUSES = (500, 502, 503, 504)
@@ -120,22 +151,26 @@ def load_portable_config(path: Optional[str] = None) -> Dict[str, Any]:
             raw_config = json.load(config_file)
     except (OSError, ValueError):
         return {
-            "provider": DEFAULT_PROVIDER,
+            "provider": APP_DEFAULT_PROVIDER,
             "api_keys": {},
             "models": {},
             "ocr_backend": DEFAULT_OCR_BACKEND,
         }
     if not isinstance(raw_config, dict):
         return {
-            "provider": DEFAULT_PROVIDER,
+            "provider": APP_DEFAULT_PROVIDER,
             "api_keys": {},
             "models": {},
             "ocr_backend": DEFAULT_OCR_BACKEND,
         }
 
-    provider = raw_config.get("provider", DEFAULT_PROVIDER)
+    # Keep migrating pre-provider Gemini-only config files as Gemini, even when
+    # the app was started through the dedicated Groq-default executable.
+    has_legacy_gemini_fields = "api_key" in raw_config or "model" in raw_config
+    default_config_provider = DEFAULT_PROVIDER if has_legacy_gemini_fields else APP_DEFAULT_PROVIDER
+    provider = raw_config.get("provider", default_config_provider)
     if not isinstance(provider, str) or provider.lower() not in PROVIDER_LABELS:
-        provider = DEFAULT_PROVIDER
+        provider = APP_DEFAULT_PROVIDER
     else:
         provider = provider.lower()
 
@@ -1079,7 +1114,7 @@ def _append_ocr_context(prompt: str, markdown: str) -> str:
     )
 
 
-def _mistral_retry_delay(headers: Any, attempt: int) -> Optional[float]:
+def _retry_after_delay(headers: Any, attempt: int) -> Optional[float]:
     """Use Retry-After when provided; otherwise apply bounded exponential backoff."""
     retry_after = None
     if headers is not None:
@@ -1109,7 +1144,7 @@ def _mistral_retry_delay(headers: Any, attempt: int) -> Optional[float]:
     return min(float(2 ** attempt), float(MAX_RETRY_AFTER_SECONDS))
 
 
-def _report_mistral_rate_headers(
+def _report_rate_limit_headers(
     headers: Any,
     stage: str,
     report: Callable[[str], None],
@@ -1121,6 +1156,12 @@ def _report_mistral_rate_headers(
         "X-RateLimit-Limit",
         "X-RateLimit-Remaining",
         "X-RateLimit-Reset",
+        "X-RateLimit-Limit-Requests",
+        "X-RateLimit-Remaining-Requests",
+        "X-RateLimit-Reset-Requests",
+        "X-RateLimit-Limit-Tokens",
+        "X-RateLimit-Remaining-Tokens",
+        "X-RateLimit-Reset-Tokens",
         "Retry-After",
     ):
         try:
@@ -1169,7 +1210,7 @@ def _mistral_post_json(
                 if status is None:
                     getcode = getattr(response, "getcode", None)
                     status = getcode() if getcode is not None else "unknown"
-            _report_mistral_rate_headers(response_headers, stage, report)
+            _report_rate_limit_headers(response_headers, stage, report)
             report(
                 "%s HTTP attempt %d/%d received status %s and %d response bytes in %.2f seconds."
                 % (
@@ -1201,7 +1242,7 @@ def _mistral_post_json(
                 pass
             finally:
                 exc.close()
-            _report_mistral_rate_headers(error_headers, stage, report)
+            _report_rate_limit_headers(error_headers, stage, report)
             report(
                 "%s HTTP attempt %d/%d failed with status %d after %.2f seconds."
                 % (
@@ -1215,7 +1256,7 @@ def _mistral_post_json(
             if provider_message:
                 report("%s error detail: %s" % (stage, provider_message))
             if status == 429 and attempt < MAX_API_ATTEMPTS - 1:
-                delay = _mistral_retry_delay(error_headers, attempt)
+                delay = _retry_after_delay(error_headers, attempt)
                 if delay is None:
                     report(
                         "%s rate limit requested a wait longer than the %d-second automatic "
@@ -1441,6 +1482,283 @@ def ask_mistral(
             )
         )
     return option, text
+
+
+def _groq_post_json(
+    api_key: str,
+    request_body: Dict[str, Any],
+    report: Callable[[str], None],
+) -> Dict[str, Any]:
+    """POST a bounded Groq chat-completion request with transient-error retries."""
+    encoded_body = json.dumps(request_body, separators=(",", ":")).encode("utf-8")
+    request = urllib.request.Request(
+        GROQ_ENDPOINT,
+        data=encoded_body,
+        headers={
+            "Content-Type": "application/json; charset=utf-8",
+            "Authorization": "Bearer " + api_key,
+        },
+        method="POST",
+    )
+    response_bytes = None
+    for attempt in range(MAX_API_ATTEMPTS):
+        attempt_started = time.monotonic()
+        report(
+            "Groq HTTP attempt %d/%d started (request body %d bytes; key and screenshot omitted)."
+            % (attempt + 1, MAX_API_ATTEMPTS, len(encoded_body))
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                response_bytes = response.read(MAX_API_RESPONSE_BYTES + 1)
+                response_headers = getattr(response, "headers", None)
+                status = getattr(response, "status", None)
+                if status is None:
+                    getcode = getattr(response, "getcode", None)
+                    status = getcode() if getcode is not None else "unknown"
+            _report_rate_limit_headers(response_headers, "Groq", report)
+            report(
+                "Groq HTTP attempt %d/%d received status %s and %d response bytes in %.2f seconds."
+                % (
+                    attempt + 1,
+                    MAX_API_ATTEMPTS,
+                    status,
+                    len(response_bytes),
+                    time.monotonic() - attempt_started,
+                )
+            )
+            break
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            error_headers = getattr(exc, "headers", None)
+            provider_message = ""
+            try:
+                error_bytes = exc.read(4096)
+                error_payload = json.loads(error_bytes.decode("utf-8")) if error_bytes else {}
+                if isinstance(error_payload, dict):
+                    error_value = error_payload.get("error")
+                    if isinstance(error_value, dict):
+                        error_value = error_value.get("message") or error_value.get("detail")
+                    if not isinstance(error_value, str):
+                        error_value = error_payload.get("message") or error_payload.get("detail")
+                    if isinstance(error_value, str):
+                        provider_message = error_value.replace("\r", " ").replace("\n", " ")[:400]
+            except (AttributeError, UnicodeDecodeError, ValueError):
+                pass
+            finally:
+                exc.close()
+            _report_rate_limit_headers(error_headers, "Groq", report)
+            report(
+                "Groq HTTP attempt %d/%d failed with status %d after %.2f seconds."
+                % (
+                    attempt + 1,
+                    MAX_API_ATTEMPTS,
+                    status,
+                    time.monotonic() - attempt_started,
+                )
+            )
+            if provider_message:
+                report("Groq error detail: %s" % provider_message)
+            if status == 429 and attempt < MAX_API_ATTEMPTS - 1:
+                delay = _retry_after_delay(error_headers, attempt)
+                if delay is None:
+                    report(
+                        "Groq rate limit requested a wait longer than the %d-second automatic "
+                        "retry limit; stopping retries."
+                        % MAX_RETRY_AFTER_SECONDS
+                    )
+                else:
+                    report("Groq was rate-limited (HTTP 429); retrying in %.1f second(s)." % delay)
+                    time.sleep(delay)
+                    continue
+            if status in RETRYABLE_HTTP_STATUSES and attempt < MAX_API_ATTEMPTS - 1:
+                delay = 2 ** attempt
+                report("Temporary Groq server error; retrying in %d second(s)." % delay)
+                time.sleep(delay)
+                continue
+            if status in (401, 403):
+                raise RuntimeError("Groq rejected the API key or account permissions (HTTP %d)." % status)
+            if status == 402:
+                raise RuntimeError(
+                    "Groq reported an API billing or account-access issue (HTTP 402)."
+                )
+            if status == 429:
+                raise RuntimeError(
+                    "Groq is rate-limited or its usage quota was reached (HTTP 429). "
+                    "Wait and retry or check GroqCloud usage limits."
+                )
+            if status == 413:
+                raise RuntimeError(
+                    "Groq rejected the screenshot request as too large (HTTP 413). "
+                    "Try reducing the desktop resolution."
+                )
+            if status in RETRYABLE_HTTP_STATUSES:
+                raise RuntimeError(
+                    "Groq is temporarily unavailable (HTTP %d); the request was retried."
+                    % status
+                )
+            raise RuntimeError("Groq returned an HTTP error (%d)." % status)
+        except urllib.error.URLError as exc:
+            reason = getattr(exc, "reason", None)
+            if isinstance(reason, TimeoutError):
+                report(
+                    "Groq request timed out after %.2f seconds."
+                    % (time.monotonic() - attempt_started)
+                )
+                raise RuntimeError("The Groq request timed out. Please try again.")
+            reason_name = type(reason).__name__ if reason is not None else type(exc).__name__
+            report(
+                "Could not reach Groq after %.2f seconds; network error type: %s."
+                % (time.monotonic() - attempt_started, reason_name)
+            )
+            raise RuntimeError("Could not reach Groq. Check the internet connection and try again.")
+        except TimeoutError:
+            report("Groq request timed out after %.2f seconds." % (time.monotonic() - attempt_started))
+            raise RuntimeError("The Groq request timed out. Please try again.")
+
+    if response_bytes is None:
+        raise RuntimeError("Groq did not return a response.")
+    if len(response_bytes) > MAX_API_RESPONSE_BYTES:
+        report("Groq response exceeded the %d-byte safety limit." % MAX_API_RESPONSE_BYTES)
+        raise RuntimeError("Groq returned an unexpectedly large response.")
+    try:
+        response_data = json.loads(response_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        report("Groq response could not be decoded as JSON.")
+        raise RuntimeError("Groq returned a response that could not be read.")
+    if not isinstance(response_data, dict):
+        report("Groq response JSON was not an object.")
+        raise RuntimeError("Groq returned an invalid response.")
+    return response_data
+
+
+def _log_groq_response_metadata(
+    response_data: Dict[str, Any],
+    report: Callable[[str], None],
+) -> None:
+    """Log safe Groq completion metadata, never hidden reasoning or image contents."""
+    if not isinstance(response_data, dict):
+        report("Groq response metadata: top-level JSON value was not an object.")
+        return
+    model = response_data.get("model")
+    response_id = response_data.get("id")
+    if not isinstance(model, str):
+        model = "not provided"
+    if not isinstance(response_id, str):
+        response_id = "not provided"
+    model = model.replace("\r", " ").replace("\n", " ")[:100]
+    response_id = response_id.replace("\r", " ").replace("\n", " ")[:100]
+    choices = response_data.get("choices")
+    choices = choices if isinstance(choices, list) else []
+    report(
+        "Groq response metadata: choice_count=%d; model=%s; response_id=%s."
+        % (len(choices), model, response_id)
+    )
+    usage = response_data.get("usage")
+    if isinstance(usage, dict):
+        counts = []
+        for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            count = usage.get(field)
+            if isinstance(count, int) and not isinstance(count, bool):
+                counts.append("%s=%d" % (field, count))
+        if counts:
+            report("Groq token usage: %s." % ", ".join(counts))
+    for index, choice in enumerate(choices[:3]):
+        if not isinstance(choice, dict):
+            continue
+        finish_reason = choice.get("finish_reason", "not provided")
+        if not isinstance(finish_reason, str):
+            finish_reason = "not provided"
+        message = choice.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        text_characters = len(content) if isinstance(content, str) else 0
+        report(
+            "Groq choice %d: finish_reason=%s; text_characters=%d."
+            % (index, finish_reason[:100], text_characters)
+        )
+
+
+def ask_groq(
+    api_key: str,
+    model: str,
+    png_image: bytes,
+    diagnostic: Optional[Callable[[str], None]] = None,
+    ocr_markdown: str = "",
+) -> Tuple[Optional[int], str]:
+    """Send the screenshot directly to Groq's vision chat model; no OCR service is called."""
+    def report(message: str) -> None:
+        if diagnostic is not None:
+            safe_message = str(message)
+            if api_key:
+                safe_message = safe_message.replace(api_key, "[REDACTED API KEY]")
+            diagnostic(safe_message)
+
+    if not valid_model_name("groq", model):
+        raise RuntimeError("The Groq model name contains unsupported characters.")
+
+    markdown = ocr_markdown.strip() if isinstance(ocr_markdown, str) else ""
+    if len(markdown) > MAX_OCR_CONTEXT_CHARS:
+        original_characters = len(markdown)
+        markdown = markdown[:MAX_OCR_CONTEXT_CHARS]
+        report(
+            "Local OCR Markdown truncated from %d to %d characters for the solver request."
+            % (original_characters, len(markdown))
+        )
+    if markdown:
+        report("Attaching %d characters of optional local OCR transcript to Groq vision chat." % len(markdown))
+    else:
+        report("Sending the screenshot directly to Groq vision chat; no separate OCR API is used.")
+
+    image_data_uri = "data:image/png;base64," + base64.b64encode(png_image).decode("ascii")
+    request_body: Dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SYSTEM_INSTRUCTION},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": _append_ocr_context(USER_PROMPT, markdown)},
+                    {"type": "image_url", "image_url": {"url": image_data_uri}},
+                ],
+            },
+        ],
+        "max_completion_tokens": MAX_GROQ_OUTPUT_TOKENS,
+    }
+    if model.lower() == DEFAULT_GROQ_MODEL:
+        # Groq documents these Qwen parameters for its thinking mode; hide the
+        # separate internal reasoning field and only consume the final message.
+        request_body.update(
+            {
+                "temperature": 1.0,
+                "top_p": 0.95,
+                "reasoning_effort": "high",
+                "reasoning_format": "hidden",
+            }
+        )
+    report("Preparing Groq vision request for model %s." % model)
+    response_data = _groq_post_json(api_key, request_body, report)
+    if diagnostic is not None:
+        _log_groq_response_metadata(response_data, report)
+    text = _extract_mistral_text(response_data)
+    if diagnostic is not None:
+        _report_model_output("Groq", text, report)
+    option = parse_option(text)
+    if option is None:
+        report(
+            "Groq response parsing found no explicit, reliable ANSWER line "
+            "(response length %d characters)." % len(text)
+        )
+    else:
+        report(
+            "Groq response parsing recognized option position %d%s."
+            % (
+                option,
+                "; final response is shown above in diagnostics"
+                if diagnostic is not None
+                else "",
+            )
+        )
+    return option, text
+
 
 class WindowsTray:
     """Small ctypes-based notification-area icon and global-hotkey host."""
@@ -2035,9 +2353,8 @@ class ScreenAnswerApp:
         self.api_keys: Dict[str, str] = {}
         self.models: Dict[str, str] = {}
         self.api_key_sources: Dict[str, str] = {}
-        environment_variables = {"gemini": "GEMINI_API_KEY", "mistral": "MISTRAL_API_KEY"}
         for provider in PROVIDER_LABELS:
-            environment_key = os.environ.get(environment_variables[provider], "").strip()
+            environment_key = os.environ.get(API_KEY_ENV_VARS[provider], "").strip()
             saved_key = stored_keys.get(provider, "")
             self.api_keys[provider] = environment_key or saved_key
             if environment_key:
@@ -2048,9 +2365,9 @@ class ScreenAnswerApp:
                 self.api_key_sources[provider] = "not configured"
             self.models[provider] = stored_models.get(provider, DEFAULT_MODELS[provider])
 
-        self.provider = self.portable_config.get("provider", DEFAULT_PROVIDER)
+        self.provider = self.portable_config.get("provider", APP_DEFAULT_PROVIDER)
         if self.provider not in PROVIDER_LABELS:
-            self.provider = DEFAULT_PROVIDER
+            self.provider = APP_DEFAULT_PROVIDER
         self.form_provider = self.provider
         self.ocr_backend = self.portable_config.get("ocr_backend", DEFAULT_OCR_BACKEND)
         if self.ocr_backend not in OCR_BACKEND_LABELS:
@@ -2100,7 +2417,7 @@ class ScreenAnswerApp:
         secrets.extend(self.portable_config.get("api_keys", {}).values())
         secrets.extend(
             os.environ.get(variable, "").strip()
-            for variable in ("GEMINI_API_KEY", "MISTRAL_API_KEY")
+            for variable in API_KEY_ENV_VARS.values()
         )
         for secret in secrets:
             if secret:
@@ -2295,8 +2612,10 @@ class ScreenAnswerApp:
         tk.Label(
             outer,
             text=(
-                "Pix2Text runs locally but needs a separate install and model download. "
-                "The screenshot and OCR text are still sent to the selected AI provider."
+                "Provider default sends the screenshot directly to the selected vision model "
+                "(Groq has no separate OCR call; Mistral uses hosted OCR). Optional Pix2Text "
+                "runs locally but needs its own install/model download; the screenshot and OCR "
+                "text are still sent to the selected AI provider."
             ),
             justify="left",
             wraplength=430,
@@ -2364,9 +2683,9 @@ class ScreenAnswerApp:
             outer,
             text=(
                 "The screenshot is not saved to disk. Provider-default Mistral uses separate "
-                "OCR and chat requests; local Pix2Text OCR skips that OCR API call but still "
-                "uploads the screenshot for solving. Verify answers and use only where AI "
-                "assistance is permitted."
+                "OCR and chat requests; Gemini and Groq send the image directly to vision chat. "
+                "Local Pix2Text OCR skips Mistral's OCR API call but still uploads the screenshot "
+                "for solving. Verify answers and use only where AI assistance is permitted."
             ),
             fg="#555555",
             justify="left",
@@ -2400,6 +2719,11 @@ class ScreenAnswerApp:
             return (
                 "I understand each capture uploads the full desktop screenshot to Mistral "
                 "OCR and chat APIs for transcription and solving."
+            )
+        if provider == "groq":
+            return (
+                "I understand each capture uploads the full desktop screenshot directly to "
+                "Groq's vision chat API; no separate OCR service is called."
             )
         return "I understand each capture uploads the full desktop screenshot to %s." % provider_label
 
@@ -2476,7 +2800,7 @@ class ScreenAnswerApp:
             self.show_window()
             self._show_error("Please acknowledge the full-screen upload notice first.")
             return False
-        if not re.fullmatch(r"[A-Za-z0-9._-]{1,100}", model):
+        if not valid_model_name(provider, model):
             self._log_diagnostic("Settings save blocked: model name contains unsupported characters.")
             self.show_window()
             self._show_error(
@@ -2651,6 +2975,14 @@ class ScreenAnswerApp:
                         diagnostic=diagnostic_callback,
                         local_ocr_markdown=local_ocr_markdown,
                     )
+                elif provider == "groq":
+                    option, response_text = ask_groq(
+                        api_key,
+                        model,
+                        image,
+                        diagnostic=diagnostic_callback,
+                        ocr_markdown=local_ocr_markdown or "",
+                    )
                 else:
                     option, response_text = ask_gemini(
                         api_key,
@@ -2794,6 +3126,8 @@ class ScreenAnswerApp:
 def main() -> int:
     if "--check-pix2text" in sys.argv[1:]:
         return 0 if pix2text_bundle_importable() else 1
+    if "--check-groq-provider" in sys.argv[1:]:
+        return 0 if APP_DEFAULT_PROVIDER == "groq" else 1
     if os.name != "nt":
         print("Screen Answer runs on Windows 7/10 and later.", file=sys.stderr)
         return 1

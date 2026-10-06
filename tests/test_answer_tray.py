@@ -13,6 +13,8 @@ from unittest.mock import MagicMock, patch
 from answer_tray import (
     _encode_rgb_png,
     DEFAULT_MISTRAL_MODEL,
+    DEFAULT_GROQ_MODEL,
+    GROQ_ENDPOINT,
     MISTRAL_OCR_ENDPOINT,
     MISTRAL_OCR_MODEL,
     _extract_gemini_text,
@@ -20,12 +22,15 @@ from answer_tray import (
     _extract_mistral_text,
     ask_gemini,
     ask_mistral,
+    ask_groq,
+    default_provider_for_executable,
     diagnostics_mode_enabled,
     load_portable_config,
     parse_option,
     pix2text_bundle_importable,
     run_pix2text_ocr,
     save_portable_config,
+    valid_model_name,
 )
 
 
@@ -804,6 +809,189 @@ class MistralRequestTests(unittest.TestCase):
         )
 
 
+class GroqRequestTests(unittest.TestCase):
+    def test_direct_vision_request_uses_image_url_without_ocr_or_tools(self):
+        image_bytes = b"fake png bytes"
+        final_text = (
+            "TRANSCRIPTION: compute 1 + 1; choices A=1, B=2, C=3, D=4.\n"
+            "SOLUTION: 1 + 1 = 2, so the second choice matches.\n"
+            "ANSWER: B"
+        )
+        captured = []
+        diagnostics = []
+        response_payload = {
+            "id": "groq-request-1",
+            "model": DEFAULT_GROQ_MODEL,
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": final_text,
+                        "reasoning": "hidden reasoning must not be returned or logged",
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 80, "total_tokens": 180},
+        }
+
+        class FakeResponse:
+            status = 200
+            headers = {"x-ratelimit-remaining-tokens": "1000"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+            def read(self, limit=-1):
+                data = json.dumps(response_payload).encode("utf-8")
+                return data if limit < 0 else data[:limit]
+
+        def fake_urlopen(request, timeout):
+            captured.append(
+                {
+                    "url": request.full_url,
+                    "authorization": request.get_header("Authorization"),
+                    "body": json.loads(request.data.decode("utf-8")),
+                    "timeout": timeout,
+                }
+            )
+            return FakeResponse()
+
+        with patch("answer_tray.urllib.request.urlopen", side_effect=fake_urlopen):
+            option, response_text = ask_groq(
+                "groq-test-key", DEFAULT_GROQ_MODEL, image_bytes, diagnostics.append
+            )
+
+        self.assertEqual(option, 2)
+        self.assertEqual(response_text, final_text)
+        self.assertNotIn("hidden reasoning", response_text)
+        self.assertEqual(len(captured), 1)
+        request = captured[0]
+        self.assertEqual(request["url"], GROQ_ENDPOINT)
+        self.assertEqual(request["authorization"], "Bearer groq-test-key")
+        self.assertEqual(request["timeout"], 60)
+        body = request["body"]
+        self.assertEqual(body["model"], DEFAULT_GROQ_MODEL)
+        self.assertEqual(body["max_completion_tokens"], 4096)
+        self.assertEqual(body["reasoning_effort"], "high")
+        self.assertEqual(body["reasoning_format"], "hidden")
+        self.assertNotIn("tools", body)
+        self.assertNotIn("tool_choice", body)
+        self.assertIn("Do not use live web search", body["messages"][0]["content"])
+        content = body["messages"][1]["content"]
+        self.assertEqual(content[1]["type"], "image_url")
+        self.assertEqual(
+            content[1]["image_url"]["url"],
+            "data:image/png;base64," + base64.b64encode(image_bytes).decode("ascii"),
+        )
+        self.assertTrue(any("no separate OCR API is used" in line for line in diagnostics))
+        self.assertFalse(any("hidden reasoning" in line for line in diagnostics))
+
+    def test_optional_local_ocr_transcript_is_context_only(self):
+        captured = []
+        transcript = "Question: x + 1 = 3\nA. 1\nB. 2"
+
+        class FakeResponse:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+            def read(self, limit=-1):
+                data = json.dumps(
+                    {"choices": [{"message": {"content": "ANSWER: B"}}]}
+                ).encode("utf-8")
+                return data if limit < 0 else data[:limit]
+
+        def fake_urlopen(request, timeout):
+            captured.append((request.full_url, json.loads(request.data.decode("utf-8"))))
+            return FakeResponse()
+
+        with patch("answer_tray.urllib.request.urlopen", side_effect=fake_urlopen):
+            option, _ = ask_groq("key", DEFAULT_GROQ_MODEL, b"image", ocr_markdown=transcript)
+
+        self.assertEqual(option, 2)
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0][0], GROQ_ENDPOINT)
+        self.assertIn(transcript, captured[0][1]["messages"][1]["content"][0]["text"])
+
+    def test_retries_bounded_429_using_retry_after(self):
+        attempts = []
+        diagnostics = []
+
+        class FakeResponse:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+            def read(self, limit=-1):
+                data = json.dumps(
+                    {"choices": [{"message": {"content": "ANSWER: C"}}]}
+                ).encode("utf-8")
+                return data if limit < 0 else data[:limit]
+
+        def fake_urlopen(request, timeout):
+            attempts.append(request.full_url)
+            if len(attempts) == 1:
+                raise urllib.error.HTTPError(
+                    request.full_url,
+                    429,
+                    "Too Many Requests",
+                    {"Retry-After": "2", "x-ratelimit-remaining-tokens": "0"},
+                    io.BytesIO(b'{"error":{"message":"rate limit exceeded"}}'),
+                )
+            return FakeResponse()
+
+        with patch("answer_tray.urllib.request.urlopen", side_effect=fake_urlopen):
+            with patch("answer_tray.time.sleep") as sleep:
+                option, _ = ask_groq("key", DEFAULT_GROQ_MODEL, b"image", diagnostics.append)
+
+        self.assertEqual(option, 3)
+        self.assertEqual(attempts, [GROQ_ENDPOINT, GROQ_ENDPOINT])
+        sleep.assert_called_once_with(2.0)
+        self.assertTrue(any("Retry-After=2" in line for line in diagnostics))
+        self.assertTrue(any("retrying in 2.0 second(s)" in line for line in diagnostics))
+
+    def test_auth_error_diagnostics_redact_api_key(self):
+        api_key = "groq-secret-key"
+        diagnostics = []
+
+        def fake_urlopen(request, timeout):
+            raise urllib.error.HTTPError(
+                GROQ_ENDPOINT,
+                401,
+                "Unauthorized",
+                None,
+                io.BytesIO(
+                    json.dumps({"error": {"message": "invalid key " + api_key}}).encode("utf-8")
+                ),
+            )
+
+        with patch("answer_tray.urllib.request.urlopen", side_effect=fake_urlopen):
+            with self.assertRaisesRegex(RuntimeError, "Groq rejected the API key"):
+                ask_groq(api_key, DEFAULT_GROQ_MODEL, b"image", diagnostics.append)
+
+        self.assertTrue(any("[REDACTED API KEY]" in line for line in diagnostics))
+        self.assertFalse(any(api_key in line for line in diagnostics))
+
+    def test_model_namespaced_id_and_groq_executable_default(self):
+        self.assertTrue(valid_model_name("groq", DEFAULT_GROQ_MODEL))
+        self.assertFalse(valid_model_name("gemini", DEFAULT_GROQ_MODEL))
+        self.assertFalse(valid_model_name("groq", "qwen/model?bad"))
+        self.assertEqual(default_provider_for_executable("ScreenAnswer-Groq.exe"), "groq")
+        self.assertEqual(default_provider_for_executable("ScreenAnswer.exe"), "gemini")
+
+
 class PortableConfigTests(unittest.TestCase):
     def test_saves_and_loads_key_and_model(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -819,22 +1007,38 @@ class PortableConfigTests(unittest.TestCase):
                 },
             )
 
-    def test_saves_both_providers_and_migrates_legacy_gemini_config(self):
+    def test_saves_all_providers_and_migrates_legacy_gemini_config(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "screen_answer_config.json")
             save_portable_config(
                 path=path,
                 provider="mistral",
-                api_keys={"gemini": "gemini-key", "mistral": "mistral-key"},
-                models={"gemini": "gemini-3.8-flash", "mistral": "ministral-14b-2512"},
+                api_keys={
+                    "gemini": "gemini-key",
+                    "mistral": "mistral-key",
+                    "groq": "groq-key",
+                },
+                models={
+                    "gemini": "gemini-3.8-flash",
+                    "mistral": "ministral-14b-2512",
+                    "groq": DEFAULT_GROQ_MODEL,
+                },
                 ocr_backend="pix2text",
             )
             self.assertEqual(
                 load_portable_config(path),
                 {
                     "provider": "mistral",
-                    "api_keys": {"gemini": "gemini-key", "mistral": "mistral-key"},
-                    "models": {"gemini": "gemini-3.8-flash", "mistral": "mistral-medium-latest"},
+                    "api_keys": {
+                        "gemini": "gemini-key",
+                        "mistral": "mistral-key",
+                        "groq": "groq-key",
+                    },
+                    "models": {
+                        "gemini": "gemini-3.8-flash",
+                        "mistral": "mistral-medium-latest",
+                        "groq": DEFAULT_GROQ_MODEL,
+                    },
                     "ocr_backend": "pix2text",
                 },
             )
@@ -863,6 +1067,20 @@ class PortableConfigTests(unittest.TestCase):
             with open(path, "w", encoding="utf-8") as config_file:
                 config_file.write("not json")
             self.assertEqual(load_portable_config(path), empty_config)
+
+
+    def test_groq_executable_defaults_to_groq_but_keeps_gemini_legacy_migration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "screen_answer_config.json")
+            with patch("answer_tray.APP_DEFAULT_PROVIDER", "groq"):
+                self.assertEqual(load_portable_config(path)["provider"], "groq")
+                with open(path, "w", encoding="utf-8") as config_file:
+                    json.dump({"api_key": "old-gemini-key", "model": "gemini-3.8-flash"}, config_file)
+                migrated = load_portable_config(path)
+
+        self.assertEqual(migrated["provider"], "gemini")
+        self.assertEqual(migrated["api_keys"], {"gemini": "old-gemini-key"})
+        self.assertEqual(migrated["models"], {"gemini": "gemini-3.8-flash"})
 
 
 class PngEncodingTests(unittest.TestCase):
