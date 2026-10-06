@@ -344,6 +344,7 @@ class Lasso1ModeTests(unittest.TestCase):
                 103,
                 104,
                 105,
+                107,
                 106,
                 0,
                 0x0800,
@@ -359,11 +360,17 @@ class Lasso1ModeTests(unittest.TestCase):
             if call.args[3]
         ]
         self.assertIn("Open", labels)
+        self.assertIn("Open Lasso1 config file", labels)
         self.assertIn("Open Lasso1 config folder", labels)
         self.assertIn("Self-destruct Lasso1…", labels)
         self.assertNotIn("Open Screen Answer", labels)
         self.assertNotIn("Show diagnostics", labels)
         tray.events.put.assert_called_once_with(("open_config_folder",))
+
+        tray.events.put.reset_mock()
+        tray._user32.TrackPopupMenu.return_value = 107
+        show_menu()
+        tray.events.put.assert_called_once_with(("open_config_file",))
 
         tray.events.put.reset_mock()
         tray._user32.TrackPopupMenu.return_value = 102
@@ -385,6 +392,17 @@ class Lasso1ModeTests(unittest.TestCase):
             with patch("answer_tray.os.startfile", create=True) as startfile:
                 self.assertTrue(app.open_lasso1_config_folder())
         startfile.assert_called_once_with(os.path.dirname(os.path.abspath(config_path)))
+
+    def test_open_config_file_uses_the_lasso1_appdata_config_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = os.path.join(directory, "Lasso1", "config.json")
+            app = object.__new__(ScreenAnswerApp)
+            app.lasso1_mode = True
+            app.config_path = config_path
+            app.tray = MagicMock()
+            with patch("answer_tray.os.startfile", create=True) as startfile:
+                self.assertTrue(app.open_lasso1_config_file())
+        startfile.assert_called_once_with(os.path.abspath(config_path))
 
     def test_self_destruct_requires_confirmation_and_schedules_only_when_accepted(self):
         app = object.__new__(ScreenAnswerApp)

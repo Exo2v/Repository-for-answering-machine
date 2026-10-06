@@ -2426,6 +2426,7 @@ class WindowsTray:
         CMD_DIAGNOSTICS = 104
         CMD_OPEN_CONFIG_FOLDER = 105
         CMD_SELF_DESTRUCT = 106
+        CMD_OPEN_CONFIG_FILE = 107
         TRAY_UID = 1
 
         class GUID(ctypes.Structure):
@@ -2565,6 +2566,7 @@ class WindowsTray:
                         CMD_EXIT,
                         CMD_DIAGNOSTICS,
                         CMD_OPEN_CONFIG_FOLDER,
+                        CMD_OPEN_CONFIG_FILE,
                         CMD_SELF_DESTRUCT,
                         MF_STRING,
                         MF_SEPARATOR,
@@ -2703,6 +2705,7 @@ class WindowsTray:
         cmd_exit: int,
         cmd_diagnostics: int,
         cmd_open_config_folder: int,
+        cmd_open_config_file: int,
         cmd_self_destruct: int,
         mf_string: int,
         mf_separator: int,
@@ -2720,6 +2723,12 @@ class WindowsTray:
                 user32.AppendMenuW(menu, mf_string, cmd_open, "Open %s" % APP_NAME)
             elif self.lasso1_mode:
                 user32.AppendMenuW(menu, mf_string, cmd_open, "Open")
+                user32.AppendMenuW(
+                    menu,
+                    mf_string,
+                    cmd_open_config_file,
+                    "Open Lasso1 config file",
+                )
                 user32.AppendMenuW(
                     menu,
                     mf_string,
@@ -2756,6 +2765,8 @@ class WindowsTray:
                 self.events.put(("open",))
             elif self.lasso1_mode and selected == cmd_open_config_folder:
                 self.events.put(("open_config_folder",))
+            elif self.lasso1_mode and selected == cmd_open_config_file:
+                self.events.put(("open_config_file",))
             elif self.lasso1_mode and selected == cmd_self_destruct:
                 self.events.put(("self_destruct",))
             elif self.diagnostics_enabled and selected == cmd_diagnostics:
@@ -3697,6 +3708,21 @@ class ScreenAnswerApp:
             return False
         return True
 
+    def open_lasso1_config_file(self) -> bool:
+        """Open Lasso1's per-user config in the user's default JSON/text editor."""
+        if not self.lasso1_mode:
+            return False
+        config_path = os.path.abspath(self.config_path)
+        try:
+            os.startfile(config_path)
+        except (AttributeError, OSError) as exc:
+            self.tray.show_balloon(
+                APP_NAME,
+                "Could not open the Lasso1 config file (%s)." % type(exc).__name__,
+            )
+            return False
+        return True
+
     def _confirm_lasso1_self_destruct(self) -> bool:
         """Ask for native Yes/No confirmation before deleting Lasso1's own files."""
         if not self.lasso1_mode:
@@ -3970,6 +3996,8 @@ class ScreenAnswerApp:
                     self.show_window()
                 elif kind == "open_config_folder":
                     self.open_lasso1_config_folder()
+                elif kind == "open_config_file":
+                    self.open_lasso1_config_file()
                 elif kind == "self_destruct":
                     if self.self_destruct():
                         return

@@ -192,5 +192,5 @@ jobs:
 
             Capture uses Ctrl+Alt+S; the full virtual desktop is sent to OpenRouter only after explicit config-file consent. Web search and tool execution are disabled.
 
-            Other tray-menu actions open the config folder or start the confirmed self-destruct cleanup, which removes Lasso1.exe and config.json after exit.
+            Right-click also offers Open Lasso1 config file (opens config.json in the default editor), Open Lasso1 config folder, and the confirmed self-destruct cleanup, which removes Lasso1.exe and config.json after exit.
           files: release-assets/Lasso1.exe
