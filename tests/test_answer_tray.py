@@ -11,7 +11,11 @@ from unittest.mock import patch
 
 from answer_tray import (
     _encode_rgb_png,
+    DEFAULT_MISTRAL_MODEL,
+    MISTRAL_OCR_ENDPOINT,
+    MISTRAL_OCR_MODEL,
     _extract_gemini_text,
+    _extract_mistral_ocr_markdown,
     _extract_mistral_text,
     ask_gemini,
     ask_mistral,
@@ -37,13 +41,34 @@ class ParseOptionTests(unittest.TestCase):
             with self.subTest(option=option):
                 self.assertEqual(parse_option(str(option)), option)
 
-    def test_accepts_short_unambiguous_variants(self):
+    def test_accepts_short_unambiguous_variants_and_lettered_choices(self):
         self.assertEqual(parse_option(" Option 2 "), 2)
         self.assertEqual(parse_option("Answer: 4."), 4)
         self.assertEqual(parse_option("option 3)"), 3)
+        self.assertEqual(parse_option("Answer: B"), 2)
+        self.assertEqual(parse_option("D"), 4)
+
+    def test_extracts_explicit_final_answer_after_reasoning(self):
+        response = (
+            "TRANSCRIPTION: Find the integral.\n"
+            "SOLUTION: Use substitution; 1 + 2 = 3 and check the sign.\n"
+            "ANSWER: C"
+        )
+        self.assertEqual(parse_option(response), 3)
+        self.assertEqual(parse_option("Work says answer: 1\nFinal answer: D"), 4)
 
     def test_neutral_for_no_answer_or_ambiguous_response(self):
-        values = ("", "0", "5", "Option 1 or 2", "The answer is 3 because…", "maybe 4")
+        values = (
+            "",
+            "0",
+            "5",
+            "Option 1 or 2",
+            "The answer is 3 because…",
+            "maybe 4",
+            "Calculation uses option 2 but gives no final label.",
+            "FINAL ANSWER: 2\nFINAL ANSWER: 3",
+            "ANSWER: 0",
+        )
         for text in values:
             with self.subTest(text=text):
                 self.assertIsNone(parse_option(text))
@@ -56,6 +81,23 @@ class ParseOptionTests(unittest.TestCase):
         }
         self.assertEqual(_extract_gemini_text(payload), "2")
         self.assertEqual(_extract_gemini_text({"candidates": []}), "")
+        self.assertEqual(
+            _extract_gemini_text(
+                {
+                    "candidates": [
+                        {
+                            "content": {
+                                "parts": [
+                                    {"text": "private thought", "thought": True},
+                                    {"text": "ANSWER: B"},
+                                ]
+                            }
+                        }
+                    ]
+                }
+            ),
+            "ANSWER: B",
+        )
 
 
 class GeminiRequestTests(unittest.TestCase):
@@ -64,7 +106,19 @@ class GeminiRequestTests(unittest.TestCase):
         captured = {}
         response_payload = {
             "candidates": [
-                {"content": {"parts": [{"text": "3"}]}}
+                {
+                    "content": {
+                        "parts": [
+                            {
+                                "text": (
+                                    "TRANSCRIPTION: a question with choices A-D.\n"
+                                    "SOLUTION: calculate and verify the value.\n"
+                                    "ANSWER: C"
+                                )
+                            }
+                        ]
+                    }
+                }
             ]
         }
 
@@ -88,13 +142,18 @@ class GeminiRequestTests(unittest.TestCase):
             option, response_text = ask_gemini("test-key", "gemini-3.8-flash", image_bytes)
 
         self.assertEqual(option, 3)
-        self.assertEqual(response_text, "3")
+        self.assertIn("ANSWER: C", response_text)
         self.assertNotIn("tools", captured["body"])
+        self.assertEqual(captured["body"]["generationConfig"]["maxOutputTokens"], 2048)
         parts = captured["body"]["contents"][0]["parts"]
         self.assertEqual(parts[1]["inlineData"]["data"], base64.b64encode(image_bytes).decode("ascii"))
 
-    def test_diagnostic_callback_omits_raw_model_response(self):
-        private_response = "question text from the screenshot"
+    def test_diagnostic_callback_shows_final_model_text_but_redacts_key(self):
+        private_response = (
+            "TRANSCRIPTION: question text from the screenshot.\n"
+            "SOLUTION: concise calculation.\n"
+            "ANSWER: A"
+        )
         response_payload = {
             "candidates": [
                 {"content": {"parts": [{"text": private_response}]}}
@@ -120,11 +179,12 @@ class GeminiRequestTests(unittest.TestCase):
                 "test-key", "gemini-3.8-flash", b"image", diagnostic=diagnostic_lines.append
             )
 
-        self.assertIsNone(option)
+        self.assertEqual(option, 1)
         self.assertEqual(response_text, private_response)
-        self.assertFalse(any(private_response in line for line in diagnostic_lines))
+        self.assertTrue(any("final response (diagnostic-only" in line for line in diagnostic_lines))
+        self.assertTrue(any("TRANSCRIPTION: question text" in line for line in diagnostic_lines))
+        self.assertTrue(any("ANSWER: A" in line for line in diagnostic_lines))
         self.assertFalse(any("test-key" in line for line in diagnostic_lines))
-        self.assertTrue(any("raw text omitted" in line for line in diagnostic_lines))
 
     def test_diagnostics_explain_empty_response_structure(self):
         response_payload = {
@@ -209,7 +269,7 @@ class GeminiRequestTests(unittest.TestCase):
         sleep.assert_called_once_with(1)
         self.assertTrue(any("failed with status 503" in line for line in diagnostic_lines))
         self.assertTrue(any("retrying in 1 second" in line for line in diagnostic_lines))
-        self.assertTrue(any("recognized option 1" in line for line in diagnostic_lines))
+        self.assertTrue(any("recognized option position 1" in line for line in diagnostic_lines))
         self.assertFalse(any("test-key" in line for line in diagnostic_lines))
 
     def test_final_503_diagnostic_includes_provider_reason_without_key(self):
@@ -248,23 +308,52 @@ class GeminiRequestTests(unittest.TestCase):
 
 
 class MistralRequestTests(unittest.TestCase):
-    def test_uses_base64_vision_chat_without_search_tools(self):
+    def test_ocr_then_reasoned_vision_chat_without_search_tools(self):
         image_bytes = b"fake png bytes"
-        captured = {}
-        response_payload = {
-            "id": "mistral-request-1",
-            "model": "ministral-14b-2512",
-            "choices": [
-                {
-                    "message": {"role": "assistant", "content": "2"},
-                    "finish_reason": "stop",
-                }
-            ],
-            "usage": {"prompt_tokens": 300, "completion_tokens": 1, "total_tokens": 301},
+        markdown = "Question: compute 1 + 1.\nA. 1\nB. 2\nC. 3\nD. 4"
+        final_text = (
+            "TRANSCRIPTION: compute 1 + 1; choices A=1, B=2, C=3, D=4.\n"
+            "SOLUTION: 1 + 1 = 2, so the second choice matches.\n"
+            "ANSWER: B"
+        )
+        captured = []
+        responses = {
+            MISTRAL_OCR_ENDPOINT: {
+                "model": MISTRAL_OCR_MODEL,
+                "pages": [{"index": 0, "markdown": markdown}],
+            },
+            "https://api.mistral.ai/v1/chat/completions": {
+                "id": "mistral-request-1",
+                "model": DEFAULT_MISTRAL_MODEL,
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "thinking",
+                                    "text": "hidden reasoning must not leak",
+                                    "thinking": [{"type": "text", "text": "hidden reasoning"}],
+                                },
+                                {"type": "text", "text": final_text},
+                            ],
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 900,
+                    "completion_tokens": 400,
+                    "total_tokens": 1300,
+                },
+            },
         }
 
         class FakeResponse:
             status = 200
+
+            def __init__(self, payload):
+                self.payload = payload
 
             def __enter__(self):
                 return self
@@ -273,47 +362,80 @@ class MistralRequestTests(unittest.TestCase):
                 return False
 
             def read(self, limit=-1):
-                data = json.dumps(response_payload).encode("utf-8")
+                data = json.dumps(self.payload).encode("utf-8")
                 return data if limit < 0 else data[:limit]
 
         def fake_urlopen(request, timeout):
-            captured["url"] = request.full_url
-            captured["authorization"] = request.get_header("Authorization")
-            captured["body"] = json.loads(request.data.decode("utf-8"))
-            captured["timeout"] = timeout
-            return FakeResponse()
+            captured.append(
+                {
+                    "url": request.full_url,
+                    "authorization": request.get_header("Authorization"),
+                    "body": json.loads(request.data.decode("utf-8")),
+                    "timeout": timeout,
+                }
+            )
+            return FakeResponse(responses[request.full_url])
 
         with patch("answer_tray.urllib.request.urlopen", side_effect=fake_urlopen):
             option, response_text = ask_mistral(
-                "mistral-test-key", "ministral-14b-2512", image_bytes
+                "mistral-test-key", DEFAULT_MISTRAL_MODEL, image_bytes
             )
 
         self.assertEqual(option, 2)
-        self.assertEqual(response_text, "2")
-        self.assertEqual(captured["url"], "https://api.mistral.ai/v1/chat/completions")
-        self.assertEqual(captured["authorization"], "Bearer mistral-test-key")
-        self.assertEqual(captured["timeout"], 45)
-        self.assertEqual(captured["body"]["model"], "ministral-14b-2512")
-        self.assertNotIn("tools", captured["body"])
-        content = captured["body"]["messages"][1]["content"]
-        self.assertEqual(content[0]["type"], "text")
+        self.assertEqual(response_text, final_text)
+        self.assertNotIn("hidden reasoning", response_text)
+        self.assertEqual(len(captured), 2)
+        ocr_call, chat_call = captured
+        self.assertEqual(ocr_call["url"], MISTRAL_OCR_ENDPOINT)
+        self.assertEqual(ocr_call["authorization"], "Bearer mistral-test-key")
+        self.assertEqual(ocr_call["timeout"], 60)
+        self.assertEqual(ocr_call["body"]["model"], MISTRAL_OCR_MODEL)
+        self.assertEqual(
+            ocr_call["body"]["document"]["image_url"],
+            "data:image/png;base64," + base64.b64encode(image_bytes).decode("ascii"),
+        )
+        self.assertEqual(chat_call["url"], "https://api.mistral.ai/v1/chat/completions")
+        self.assertEqual(chat_call["timeout"], 60)
+        self.assertEqual(chat_call["body"]["model"], DEFAULT_MISTRAL_MODEL)
+        self.assertEqual(chat_call["body"]["reasoning_effort"], "high")
+        self.assertEqual(chat_call["body"]["max_tokens"], 4096)
+        self.assertNotIn("tools", chat_call["body"])
+        content = chat_call["body"]["messages"][1]["content"]
+        self.assertIn(markdown, content[0]["text"])
         self.assertEqual(content[1]["type"], "image_url")
         self.assertEqual(
             content[1]["image_url"],
             "data:image/png;base64," + base64.b64encode(image_bytes).decode("ascii"),
         )
 
-    def test_mistral_diagnostics_redact_key_and_omit_answer_text(self):
-        private_response = "private text that could have come from the screenshot"
-        response_payload = {
-            "choices": [
-                {"message": {"role": "assistant", "content": private_response}, "finish_reason": "stop"}
+    def test_ocr_extractor_returns_first_page_markdown(self):
+        payload = {
+            "pages": [
+                {"markdown": "  integral\noptions  "},
+                {"markdown": "second page"},
             ]
         }
+        self.assertEqual(_extract_mistral_ocr_markdown(payload), "integral\noptions")
+        self.assertEqual(_extract_mistral_ocr_markdown({"pages": []}), "")
+        self.assertEqual(_extract_mistral_ocr_markdown({"pages": [{"text": "no markdown"}]}), "")
+
+    def test_diagnostics_include_ocr_and_final_text_but_redact_key(self):
+        secret = "mistral-secret-key"
+        markdown = "Question contains " + secret + " and an integral."
+        final_text = "TRANSCRIPTION: " + secret + "\nSOLUTION: compute carefully.\nANSWER: 2"
         diagnostic_lines = []
+        responses = {
+            MISTRAL_OCR_ENDPOINT: {"pages": [{"markdown": markdown}]},
+            "https://api.mistral.ai/v1/chat/completions": {
+                "choices": [{"message": {"role": "assistant", "content": final_text}}]
+            },
+        }
 
         class FakeResponse:
             status = 200
+
+            def __init__(self, payload):
+                self.payload = payload
 
             def __enter__(self):
                 return self
@@ -322,28 +444,35 @@ class MistralRequestTests(unittest.TestCase):
                 return False
 
             def read(self, limit=-1):
-                data = json.dumps(response_payload).encode("utf-8")
+                data = json.dumps(self.payload).encode("utf-8")
                 return data if limit < 0 else data[:limit]
 
-        with patch("answer_tray.urllib.request.urlopen", return_value=FakeResponse()):
+        def fake_urlopen(request, timeout):
+            return FakeResponse(responses[request.full_url])
+
+        with patch("answer_tray.urllib.request.urlopen", side_effect=fake_urlopen):
             option, response_text = ask_mistral(
-                "mistral-secret-key",
-                "ministral-14b-2512",
+                secret,
+                DEFAULT_MISTRAL_MODEL,
                 b"image",
                 diagnostic=diagnostic_lines.append,
             )
 
-        self.assertIsNone(option)
-        self.assertEqual(response_text, private_response)
-        self.assertTrue(any("choice_count=1" in line for line in diagnostic_lines))
-        self.assertFalse(any(private_response in line for line in diagnostic_lines))
-        self.assertFalse(any("mistral-secret-key" in line for line in diagnostic_lines))
-        self.assertEqual(_extract_mistral_text({"choices": []}), "")
+        self.assertEqual(option, 2)
+        self.assertEqual(response_text, final_text)
+        self.assertTrue(any("Mistral OCR pages[0].markdown" in line for line in diagnostic_lines))
+        self.assertTrue(any("Question contains [REDACTED API KEY]" in line for line in diagnostic_lines))
+        self.assertTrue(any("final response (diagnostic-only" in line for line in diagnostic_lines))
+        self.assertTrue(any("ANSWER: 2" in line for line in diagnostic_lines))
+        self.assertFalse(any(secret in line for line in diagnostic_lines))
 
-    def test_retries_mistral_server_error(self):
-        attempts = [0]
-        response_payload = {
-            "choices": [{"message": {"role": "assistant", "content": "1"}}]
+    def test_ocr_failure_falls_back_to_original_image(self):
+        calls = []
+        diagnostic_lines = []
+        chat_payload = {
+            "choices": [
+                {"message": {"role": "assistant", "content": "SOLUTION: read image.\nANSWER: 1"}}
+            ]
         }
 
         class FakeResponse:
@@ -356,12 +485,65 @@ class MistralRequestTests(unittest.TestCase):
                 return False
 
             def read(self, limit=-1):
-                data = json.dumps(response_payload).encode("utf-8")
+                data = json.dumps(chat_payload).encode("utf-8")
                 return data if limit < 0 else data[:limit]
 
         def fake_urlopen(request, timeout):
-            attempts[0] += 1
-            if attempts[0] == 1:
+            calls.append(request.full_url)
+            if request.full_url == MISTRAL_OCR_ENDPOINT:
+                raise urllib.error.HTTPError(
+                    request.full_url,
+                    402,
+                    "Payment Required",
+                    None,
+                    io.BytesIO(b'{"error":{"message":"OCR access unavailable"}}'),
+                )
+            return FakeResponse()
+
+        with patch("answer_tray.urllib.request.urlopen", side_effect=fake_urlopen):
+            option, _ = ask_mistral(
+                "key", DEFAULT_MISTRAL_MODEL, b"image", diagnostic=diagnostic_lines.append
+            )
+
+        self.assertEqual(option, 1)
+        self.assertEqual(calls, [MISTRAL_OCR_ENDPOINT, "https://api.mistral.ai/v1/chat/completions"])
+        self.assertTrue(
+            any("continuing with direct screenshot vision input" in line for line in diagnostic_lines)
+        )
+
+    def test_retries_temporary_chat_error_after_ocr_succeeds(self):
+        calls = []
+        chat_attempts = [0]
+        diagnostics = []
+        responses = {
+            MISTRAL_OCR_ENDPOINT: {"pages": [{"markdown": "Question and choices"}]},
+            "https://api.mistral.ai/v1/chat/completions": {
+                "choices": [{"message": {"role": "assistant", "content": "ANSWER: D"}}]
+            },
+        }
+
+        class FakeResponse:
+            status = 200
+
+            def __init__(self, payload):
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+            def read(self, limit=-1):
+                data = json.dumps(self.payload).encode("utf-8")
+                return data if limit < 0 else data[:limit]
+
+        def fake_urlopen(request, timeout):
+            calls.append(request.full_url)
+            if request.full_url == MISTRAL_OCR_ENDPOINT:
+                return FakeResponse(responses[request.full_url])
+            chat_attempts[0] += 1
+            if chat_attempts[0] == 1:
                 raise urllib.error.HTTPError(
                     request.full_url,
                     503,
@@ -369,19 +551,24 @@ class MistralRequestTests(unittest.TestCase):
                     None,
                     io.BytesIO(b'{"message":"temporarily busy"}'),
                 )
-            return FakeResponse()
+            return FakeResponse(responses[request.full_url])
 
-        diagnostics = []
         with patch("answer_tray.urllib.request.urlopen", side_effect=fake_urlopen):
             with patch("answer_tray.time.sleep") as sleep:
                 option, _ = ask_mistral(
-                    "key", "ministral-14b-2512", b"image", diagnostic=diagnostics.append
+                    "key", DEFAULT_MISTRAL_MODEL, b"image", diagnostic=diagnostics.append
                 )
 
-        self.assertEqual(option, 1)
-        self.assertEqual(attempts[0], 2)
+        self.assertEqual(option, 4)
+        self.assertEqual(calls, [
+            MISTRAL_OCR_ENDPOINT,
+            "https://api.mistral.ai/v1/chat/completions",
+            "https://api.mistral.ai/v1/chat/completions",
+        ])
         sleep.assert_called_once_with(1)
-        self.assertTrue(any("Mistral error detail: temporarily busy" in line for line in diagnostics))
+        self.assertTrue(any("chat error detail: temporarily busy" in line for line in diagnostics))
+        self.assertTrue(any("recognized option position 4" in line for line in diagnostics))
+
 
 class PortableConfigTests(unittest.TestCase):
     def test_saves_and_loads_key_and_model(self):
@@ -411,7 +598,7 @@ class PortableConfigTests(unittest.TestCase):
                 {
                     "provider": "mistral",
                     "api_keys": {"gemini": "gemini-key", "mistral": "mistral-key"},
-                    "models": {"gemini": "gemini-3.8-flash", "mistral": "ministral-14b-2512"},
+                    "models": {"gemini": "gemini-3.8-flash", "mistral": "mistral-medium-latest"},
                 },
             )
             with open(path, "w", encoding="utf-8") as config_file:
