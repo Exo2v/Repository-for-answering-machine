@@ -124,6 +124,49 @@ class GeminiRequestTests(unittest.TestCase):
         self.assertFalse(any("test-key" in line for line in diagnostic_lines))
         self.assertTrue(any("raw text omitted" in line for line in diagnostic_lines))
 
+    def test_diagnostics_explain_empty_response_structure(self):
+        response_payload = {
+            "promptFeedback": {
+                "blockReason": "SAFETY",
+                "safetyRatings": [
+                    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "probability": "HIGH"}
+                ],
+            },
+            "usageMetadata": {
+                "promptTokenCount": 320,
+                "candidatesTokenCount": 0,
+                "totalTokenCount": 320,
+            },
+            "modelVersion": "gemini-3.8-flash-test",
+        }
+        diagnostic_lines = []
+
+        class FakeResponse:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+            def read(self, limit=-1):
+                data = json.dumps(response_payload).encode("utf-8")
+                return data if limit < 0 else data[:limit]
+
+        with patch("answer_tray.urllib.request.urlopen", return_value=FakeResponse()):
+            option, response_text = ask_gemini(
+                "test-key", "gemini-3.8-flash", b"image", diagnostic=diagnostic_lines.append
+            )
+
+        self.assertIsNone(option)
+        self.assertEqual(response_text, "")
+        self.assertTrue(any("candidate_count=0" in line for line in diagnostic_lines))
+        self.assertTrue(any("block_reason=SAFETY" in line for line in diagnostic_lines))
+        self.assertTrue(any("HARM_CATEGORY_DANGEROUS_CONTENT:HIGH" in line for line in diagnostic_lines))
+        self.assertTrue(any("candidatesTokenCount=0" in line for line in diagnostic_lines))
+        self.assertFalse(any("test-key" in line for line in diagnostic_lines))
+
     def test_retries_temporary_503_then_succeeds(self):
         response_payload = {
             "candidates": [{"content": {"parts": [{"text": "1"}]}}]

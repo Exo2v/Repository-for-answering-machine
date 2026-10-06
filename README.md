@@ -28,7 +28,7 @@ The model is set to `gemini-3.8-flash` by default and can be changed in the sett
 
 ## Diagnostic test build
 
-The `ScreenAnswer-Diagnostic.exe` release build opens a live diagnostics window at startup. It shows startup/configuration state, whether the global hotkeys registered, capture dimensions and timing, each Gemini HTTP attempt and status, retry delays, network failures, response parsing, and the final tray result. Use **Open settings** in that window to enter a key and acknowledge the upload notice; capture still requires your explicit action.
+The `ScreenAnswer-Diagnostic.exe` release build opens a live diagnostics window at startup. It shows startup/configuration state, whether the global hotkeys registered, capture dimensions and timing, each Gemini HTTP attempt and status, retry delays, network failures, and safe response metadata (candidate count, prompt block/finish reasons, and token counts) alongside answer parsing and the final tray result. Use **Open settings** in that window to enter a key and acknowledge the upload notice; capture still requires your explicit action.
 
 This is a diagnostic build of the real app, **not a simulation**: after consent and a capture hotkey/button, it captures the full desktop and sends the screenshot to Gemini just like the regular build. The diagnostics log intentionally excludes the API key, screenshot pixels, and raw Gemini response text. You can save or copy the log from the diagnostics window; review it before sharing. Screenshots are not written to disk.
 

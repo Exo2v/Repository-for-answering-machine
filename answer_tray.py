@@ -24,7 +24,7 @@ import zlib
 from typing import Any, Callable, Dict, Optional, Tuple
 
 APP_NAME = "Screen Answer"
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.0.4"
 DEFAULT_MODEL = "gemini-3.8-flash"
 CAPTURE_HOTKEY_TEXT = "Ctrl+Alt+S"
 EXIT_HOTKEY_TEXT = "Ctrl+Alt+Q"
@@ -348,15 +348,119 @@ def capture_virtual_desktop_png() -> bytes:
 
 
 def _extract_gemini_text(response_data: Dict[str, Any]) -> str:
-    candidates = response_data.get("candidates") or []
-    if not candidates:
+    """Return the first candidate's text, tolerating incomplete API responses."""
+    if not isinstance(response_data, dict):
         return ""
-    content = candidates[0].get("content") or {}
-    parts = content.get("parts") or []
+    candidates = response_data.get("candidates")
+    if not isinstance(candidates, list) or not candidates:
+        return ""
+    candidate = candidates[0]
+    if not isinstance(candidate, dict):
+        return ""
+    content = candidate.get("content")
+    if not isinstance(content, dict):
+        return ""
+    parts = content.get("parts")
+    if not isinstance(parts, list):
+        return ""
     return "".join(
-        part.get("text", "") for part in parts if isinstance(part, dict)
+        part.get("text", "")
+        for part in parts
+        if isinstance(part, dict) and isinstance(part.get("text", ""), str)
     ).strip()
 
+
+def _log_gemini_response_metadata(
+    response_data: Dict[str, Any],
+    report: Callable[[str], None],
+) -> None:
+    """Log safe response structure metadata without including generated text."""
+    if not isinstance(response_data, dict):
+        report("Gemini response metadata: top-level JSON value was not an object.")
+        return
+
+    candidates_value = response_data.get("candidates")
+    candidates = candidates_value if isinstance(candidates_value, list) else []
+    model_version = response_data.get("modelVersion")
+    if not isinstance(model_version, str):
+        model_version = "not provided"
+    model_version = model_version.replace("\r", " ").replace("\n", " ")[:100]
+    response_id = response_data.get("responseId")
+    if not isinstance(response_id, str):
+        response_id = "not provided"
+    response_id = response_id.replace("\r", " ").replace("\n", " ")[:100]
+    report(
+        "Gemini response metadata: candidate_count=%d; model_version=%s; response_id=%s."
+        % (len(candidates), model_version, response_id)
+    )
+    if candidates_value is not None and not isinstance(candidates_value, list):
+        report("Gemini response metadata: candidates field had type %s." % type(candidates_value).__name__)
+
+    prompt_feedback = response_data.get("promptFeedback")
+    if isinstance(prompt_feedback, dict):
+        block_reason = prompt_feedback.get("blockReason")
+        if isinstance(block_reason, str):
+            report("Gemini prompt feedback: block_reason=%s." % block_reason[:100])
+        ratings = prompt_feedback.get("safetyRatings")
+        if isinstance(ratings, list):
+            rating_summary = []
+            for rating in ratings[:10]:
+                if not isinstance(rating, dict):
+                    continue
+                category = rating.get("category")
+                probability = rating.get("probability")
+                if isinstance(category, str) and isinstance(probability, str):
+                    rating_summary.append("%s:%s" % (category[:60], probability[:40]))
+            if rating_summary:
+                report("Gemini prompt safety ratings: %s." % ", ".join(rating_summary))
+
+    usage = response_data.get("usageMetadata")
+    if isinstance(usage, dict):
+        counts = []
+        for field in ("promptTokenCount", "candidatesTokenCount", "totalTokenCount"):
+            count = usage.get(field)
+            if isinstance(count, int) and not isinstance(count, bool):
+                counts.append("%s=%d" % (field, count))
+        if counts:
+            report("Gemini token usage: %s." % ", ".join(counts))
+
+    for index, candidate in enumerate(candidates[:3]):
+        if not isinstance(candidate, dict):
+            report("Gemini candidate %d had type %s." % (index, type(candidate).__name__))
+            continue
+        finish_reason = candidate.get("finishReason")
+        if not isinstance(finish_reason, str):
+            finish_reason = "not provided"
+        content = candidate.get("content")
+        role = content.get("role", "not provided") if isinstance(content, dict) else "not provided"
+        if not isinstance(role, str):
+            role = "not provided"
+        parts = content.get("parts") if isinstance(content, dict) else None
+        parts = parts if isinstance(parts, list) else []
+        text_characters = sum(
+            len(part.get("text", ""))
+            for part in parts
+            if isinstance(part, dict) and isinstance(part.get("text", ""), str)
+        )
+        part_types = sorted(
+            set(
+                str(key)[:40]
+                for part in parts
+                if isinstance(part, dict)
+                for key in part.keys()
+            )
+        )
+        report(
+            "Gemini candidate %d: finish_reason=%s; role=%s; parts=%d; text_characters=%d; part_types=%s."
+            % (
+                index,
+                finish_reason[:100],
+                role[:40],
+                len(parts),
+                text_characters,
+                ",".join(part_types[:8]) if part_types else "none",
+            )
+        )
 
 def ask_gemini(
     api_key: str,
@@ -508,6 +612,8 @@ def ask_gemini(
     except (UnicodeDecodeError, json.JSONDecodeError):
         report("Gemini response was received but could not be decoded as JSON.")
         raise RuntimeError("Gemini returned a response that could not be read.")
+    if diagnostic is not None:
+        _log_gemini_response_metadata(response_data, report)
     text = _extract_gemini_text(response_data)
     option = parse_option(text)
     if option is None:
