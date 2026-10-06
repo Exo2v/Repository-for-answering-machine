@@ -1,4 +1,5 @@
 import base64
+import io
 import json
 import os
 import struct
@@ -101,7 +102,7 @@ class GeminiRequestTests(unittest.TestCase):
             call_count[0] += 1
             if call_count[0] == 1:
                 raise urllib.error.HTTPError(
-                    request.full_url, 503, "Service Unavailable", None, None
+                    request.full_url, 503, "Service Unavailable", None, io.BytesIO()
                 )
             return FakeResponse()
 
