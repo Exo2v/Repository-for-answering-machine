@@ -50,7 +50,7 @@ jobs:
   build-pix2text:
     name: Build experimental Pix2Text executable (Windows x64)
     # The commit-message opt-in also permits test builds where manual dispatch is unavailable.
-    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && contains(github.event.head_commit.message, '[pix2text-build]'))
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && contains(github.event.head_commit.message, '[pix2text-build]'))
     runs-on: windows-2022
     timeout-minutes: 120
     steps:
@@ -114,19 +114,12 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     needs:
       - build-standard
-      - build-pix2text
     runs-on: ubuntu-latest
     steps:
       - name: Download standard executables
         uses: actions/download-artifact@v4
         with:
           name: ScreenAnswer-Windows-32bit
-          path: release-assets
-
-      - name: Download experimental Pix2Text executable
-        uses: actions/download-artifact@v4
-        with:
-          name: ScreenAnswer-Pix2Text-Windows-x64
           path: release-assets
 
       - name: Attach executables to GitHub Release
@@ -138,4 +131,3 @@ jobs:
             release-assets/ScreenAnswer.exe
             release-assets/ScreenAnswer-Diagnostic.exe
             release-assets/ScreenAnswer-Groq.exe
-            release-assets/ScreenAnswer-Pix2Text.exe
