@@ -14,7 +14,9 @@ from answer_tray import (
     _encode_rgb_png,
     DEFAULT_MISTRAL_MODEL,
     DEFAULT_GROQ_MODEL,
+    DEFAULT_OPENROUTER_MODEL,
     GROQ_ENDPOINT,
+    OPENROUTER_ENDPOINT,
     MISTRAL_OCR_ENDPOINT,
     MISTRAL_OCR_MODEL,
     _extract_gemini_text,
@@ -23,8 +25,10 @@ from answer_tray import (
     ask_gemini,
     ask_mistral,
     ask_groq,
+    ask_openrouter,
     default_provider_for_executable,
     diagnostics_mode_enabled,
+    main,
     load_portable_config,
     parse_option,
     pix2text_bundle_importable,
@@ -984,12 +988,234 @@ class GroqRequestTests(unittest.TestCase):
         self.assertTrue(any("[REDACTED API KEY]" in line for line in diagnostics))
         self.assertFalse(any(api_key in line for line in diagnostics))
 
-    def test_model_namespaced_id_and_groq_executable_default(self):
+    def test_namespaced_model_id_and_groq_executable_default(self):
         self.assertTrue(valid_model_name("groq", DEFAULT_GROQ_MODEL))
         self.assertFalse(valid_model_name("gemini", DEFAULT_GROQ_MODEL))
         self.assertFalse(valid_model_name("groq", "qwen/model?bad"))
+        self.assertTrue(valid_model_name("openrouter", DEFAULT_OPENROUTER_MODEL))
+        self.assertFalse(valid_model_name("openrouter", "google/model:online"))
         self.assertEqual(default_provider_for_executable("ScreenAnswer-Groq.exe"), "groq")
         self.assertEqual(default_provider_for_executable("ScreenAnswer.exe"), "gemini")
+
+
+class OpenRouterRequestTests(unittest.TestCase):
+    def test_direct_vision_request_uses_base64_image_without_search_or_ocr(self):
+        image_bytes = b"fake OpenRouter screenshot"
+        final_text = (
+            "TRANSCRIPTION: compute 1 + 1; choices A=1, B=2, C=3, D=4.\n"
+            "SOLUTION: 1 + 1 = 2, so the second choice matches.\n"
+            "ANSWER: B"
+        )
+        captured = []
+        diagnostics = []
+        response_payload = {
+            "id": "openrouter-request-1",
+            "model": DEFAULT_OPENROUTER_MODEL,
+            "provider": "Google AI Studio",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": final_text,
+                        "reasoning": "hidden reasoning must not be returned or logged",
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 120,
+                "completion_tokens": 70,
+                "total_tokens": 190,
+                "cost": 0.00123,
+            },
+        }
+
+        class FakeResponse:
+            status = 200
+            headers = {"X-RateLimit-Remaining": "5"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+            def read(self, limit=-1):
+                data = json.dumps(response_payload).encode("utf-8")
+                return data if limit < 0 else data[:limit]
+
+        def fake_urlopen(request, timeout):
+            captured.append(
+                {
+                    "url": request.full_url,
+                    "authorization": request.get_header("Authorization"),
+                    "body": json.loads(request.data.decode("utf-8")),
+                    "timeout": timeout,
+                }
+            )
+            return FakeResponse()
+
+        with patch("answer_tray.urllib.request.urlopen", side_effect=fake_urlopen):
+            option, response_text = ask_openrouter(
+                "openrouter-test-key",
+                DEFAULT_OPENROUTER_MODEL,
+                image_bytes,
+                diagnostic=diagnostics.append,
+            )
+
+        self.assertEqual(option, 2)
+        self.assertEqual(response_text, final_text)
+        self.assertEqual(len(captured), 1)
+        request = captured[0]
+        self.assertEqual(request["url"], OPENROUTER_ENDPOINT)
+        self.assertEqual(request["authorization"], "Bearer openrouter-test-key")
+        self.assertEqual(request["timeout"], 60)
+        body = request["body"]
+        self.assertEqual(body["model"], DEFAULT_OPENROUTER_MODEL)
+        self.assertEqual(body["max_tokens"], 4096)
+        self.assertNotIn("tools", body)
+        self.assertNotIn("plugins", body)
+        self.assertIn("Do not use live web search", body["messages"][0]["content"])
+        content = body["messages"][1]["content"]
+        self.assertEqual(content[1]["type"], "image_url")
+        self.assertEqual(
+            content[1]["image_url"]["url"],
+            "data:image/png;base64," + base64.b64encode(image_bytes).decode("ascii"),
+        )
+        self.assertTrue(any("no separate OCR API is used" in line for line in diagnostics))
+        self.assertTrue(any("routed_provider=Google AI Studio" in line for line in diagnostics))
+        self.assertTrue(any("request cost" in line for line in diagnostics))
+        self.assertFalse(any("hidden reasoning" in line for line in diagnostics))
+        self.assertFalse(any("openrouter-test-key" in line for line in diagnostics))
+
+    def test_local_ocr_is_optional_context_and_no_second_api_is_called(self):
+        calls = []
+        transcript = "Question: x + 1 = 3\nA. 1\nB. 2"
+
+        class FakeResponse:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+            def read(self, limit=-1):
+                data = json.dumps(
+                    {"choices": [{"message": {"content": "ANSWER: B"}}]}
+                ).encode("utf-8")
+                return data if limit < 0 else data[:limit]
+
+        def fake_urlopen(request, timeout):
+            calls.append((request.full_url, json.loads(request.data.decode("utf-8"))))
+            return FakeResponse()
+
+        with patch("answer_tray.urllib.request.urlopen", side_effect=fake_urlopen):
+            option, _ = ask_openrouter(
+                "key", DEFAULT_OPENROUTER_MODEL, b"original screenshot", ocr_markdown=transcript
+            )
+
+        self.assertEqual(option, 2)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], OPENROUTER_ENDPOINT)
+        text_part, image_part = calls[0][1]["messages"][1]["content"]
+        self.assertIn(transcript, text_part["text"])
+        self.assertEqual(image_part["type"], "image_url")
+
+    def test_retries_rate_limit_and_redacts_api_key_in_diagnostics(self):
+        api_key = "openrouter-secret-key"
+        attempts = []
+        diagnostics = []
+
+        class FakeResponse:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+            def read(self, limit=-1):
+                data = json.dumps(
+                    {"choices": [{"message": {"content": "ANSWER: C"}}]}
+                ).encode("utf-8")
+                return data if limit < 0 else data[:limit]
+
+        def fake_urlopen(request, timeout):
+            attempts.append(request.full_url)
+            if len(attempts) == 1:
+                error_payload = {"error": {"code": 429, "message": "rate limit: " + api_key}}
+                raise urllib.error.HTTPError(
+                    request.full_url,
+                    429,
+                    "Too Many Requests",
+                    {"Retry-After": "2", "X-RateLimit-Remaining": "0"},
+                    io.BytesIO(json.dumps(error_payload).encode("utf-8")),
+                )
+            return FakeResponse()
+
+        with patch("answer_tray.urllib.request.urlopen", side_effect=fake_urlopen):
+            with patch("answer_tray.time.sleep") as sleep:
+                option, _ = ask_openrouter(
+                    api_key, DEFAULT_OPENROUTER_MODEL, b"image", diagnostics.append
+                )
+
+        self.assertEqual(option, 3)
+        self.assertEqual(attempts, [OPENROUTER_ENDPOINT, OPENROUTER_ENDPOINT])
+        sleep.assert_called_once_with(2.0)
+        self.assertTrue(any("Retry-After=2" in line for line in diagnostics))
+        self.assertTrue(any("retrying in 2.0 second(s)" in line for line in diagnostics))
+        self.assertTrue(any("[REDACTED API KEY]" in line for line in diagnostics))
+        self.assertFalse(any(api_key in line for line in diagnostics))
+
+    def test_rejects_online_model_suffix_before_any_network_request(self):
+        self.assertTrue(valid_model_name("openrouter", DEFAULT_OPENROUTER_MODEL))
+        self.assertTrue(valid_model_name("openrouter", "~openai/gpt-sol-latest"))
+        self.assertTrue(valid_model_name("openrouter", "qwen/qwen3.8-27b:free"))
+        self.assertFalse(valid_model_name("openrouter", "google/gemini-3.8-flash:online"))
+        self.assertFalse(valid_model_name("openrouter", "model?bad"))
+        with patch("answer_tray.urllib.request.urlopen") as urlopen:
+            with self.assertRaisesRegex(RuntimeError, "web-search mode"):
+                ask_openrouter("key", "google/gemini-3.8-flash:online", b"image")
+        urlopen.assert_not_called()
+
+    def test_packaged_diagnostic_smoke_check_recognizes_openrouter(self):
+        with patch("sys.argv", ["ScreenAnswer-Diagnostic.exe", "--check-openrouter-support"]):
+            self.assertEqual(main(), 0)
+
+    def test_handles_inference_error_returned_inside_http_200_response(self):
+        diagnostics = []
+        response_payload = {
+            "error": {
+                "code": 503,
+                "message": "No provider is currently available.",
+                "metadata": {"error_type": "provider_unavailable"},
+            }
+        }
+
+        class FakeResponse:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+            def read(self, limit=-1):
+                data = json.dumps(response_payload).encode("utf-8")
+                return data if limit < 0 else data[:limit]
+
+        with patch("answer_tray.urllib.request.urlopen", return_value=FakeResponse()):
+            with self.assertRaisesRegex(RuntimeError, "inference error"):
+                ask_openrouter(
+                    "key", DEFAULT_OPENROUTER_MODEL, b"image", diagnostics.append
+                )
+
+        self.assertTrue(any("provider_unavailable" in line for line in diagnostics))
+        self.assertTrue(any("No provider is currently available" in line for line in diagnostics))
 
 
 class PortableConfigTests(unittest.TestCase):
@@ -1007,7 +1233,7 @@ class PortableConfigTests(unittest.TestCase):
                 },
             )
 
-    def test_saves_all_providers_and_migrates_legacy_gemini_config(self):
+    def test_saves_all_provider_keys_and_models_and_migrates_legacy_gemini_config(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "screen_answer_config.json")
             save_portable_config(
@@ -1017,11 +1243,13 @@ class PortableConfigTests(unittest.TestCase):
                     "gemini": "gemini-key",
                     "mistral": "mistral-key",
                     "groq": "groq-key",
+                    "openrouter": "openrouter-key",
                 },
                 models={
                     "gemini": "gemini-3.8-flash",
                     "mistral": "ministral-14b-2512",
                     "groq": DEFAULT_GROQ_MODEL,
+                    "openrouter": DEFAULT_OPENROUTER_MODEL,
                 },
                 ocr_backend="pix2text",
             )
@@ -1033,11 +1261,13 @@ class PortableConfigTests(unittest.TestCase):
                         "gemini": "gemini-key",
                         "mistral": "mistral-key",
                         "groq": "groq-key",
+                        "openrouter": "openrouter-key",
                     },
                     "models": {
                         "gemini": "gemini-3.8-flash",
                         "mistral": "mistral-medium-latest",
                         "groq": DEFAULT_GROQ_MODEL,
+                        "openrouter": DEFAULT_OPENROUTER_MODEL,
                     },
                     "ocr_backend": "pix2text",
                 },

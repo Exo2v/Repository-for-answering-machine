@@ -29,10 +29,11 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Optional, Tuple
 
 APP_NAME = "Screen Answer"
-APP_VERSION = "1.4.0-experimental"
+APP_VERSION = "1.5.0-experimental"
 DEFAULT_MODEL = "gemini-3.8-flash"
 DEFAULT_MISTRAL_MODEL = "mistral-medium-latest"
 DEFAULT_GROQ_MODEL = "qwen/qwen3.8-27b"
+DEFAULT_OPENROUTER_MODEL = "google/gemini-3.8-flash"
 LEGACY_MISTRAL_MODEL = "ministral-14b-2512"
 MISTRAL_OCR_MODEL = "mistral-ocr-latest"
 DEFAULT_PROVIDER = "gemini"
@@ -51,11 +52,13 @@ PROVIDER_LABELS = {
     "gemini": "Google Gemini",
     "mistral": "Mistral",
     "groq": "Groq",
+    "openrouter": "OpenRouter",
 }
 API_KEY_ENV_VARS = {
     "gemini": "GEMINI_API_KEY",
     "mistral": "MISTRAL_API_KEY",
     "groq": "GROQ_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
 }
 PROVIDER_BY_LABEL = {label: provider for provider, label in PROVIDER_LABELS.items()}
 OCR_BACKEND_LABELS = {
@@ -67,13 +70,19 @@ DEFAULT_MODELS = {
     "gemini": DEFAULT_MODEL,
     "mistral": DEFAULT_MISTRAL_MODEL,
     "groq": DEFAULT_GROQ_MODEL,
+    "openrouter": DEFAULT_OPENROUTER_MODEL,
 }
 
 
 def valid_model_name(provider: str, model: str) -> bool:
-    """Validate editable model IDs, including Groq's slash-namespaced IDs."""
+    """Validate editable model IDs, including namespaced provider model slugs."""
     if provider == "groq":
         return bool(re.fullmatch(r"[A-Za-z0-9._/-]{1,120}", model))
+    if provider == "openrouter":
+        # OpenRouter slugs may be namespaced and use router/variant suffixes.
+        # Its :online suffix enables web search, which this app intentionally forbids.
+        valid_slug = bool(re.fullmatch(r"[A-Za-z0-9._~:/-]{1,120}", model))
+        return valid_slug and not model.lower().endswith(":online")
     return bool(re.fullmatch(r"[A-Za-z0-9._-]{1,100}", model))
 
 
@@ -83,6 +92,7 @@ GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{mode
 MISTRAL_ENDPOINT = "https://api.mistral.ai/v1/chat/completions"
 MISTRAL_OCR_ENDPOINT = "https://api.mistral.ai/v1/ocr"
 GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
+OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
 
 # The grey state means ready, busy, no answer, or a completed fade.
 NEUTRAL_RGB = (128, 128, 128)
@@ -105,6 +115,7 @@ MAX_RETRY_AFTER_SECONDS = 30
 MAX_GEMINI_OUTPUT_TOKENS = 2048
 MAX_MISTRAL_OUTPUT_TOKENS = 4096
 MAX_GROQ_OUTPUT_TOKENS = 4096
+MAX_OPENROUTER_OUTPUT_TOKENS = 4096
 MAX_OCR_CONTEXT_CHARS = 48_000
 MAX_DIAGNOSTIC_TEXT_CHARS = 16_000
 RETRYABLE_HTTP_STATUSES = (500, 502, 503, 504)
@@ -1760,6 +1771,343 @@ def ask_groq(
     return option, text
 
 
+def _openrouter_error_details(response_data: Dict[str, Any]) -> Tuple[str, str]:
+    """Extract bounded error code/message fields without exposing raw response JSON."""
+    error_code = ""
+    error_message = ""
+    error_value = response_data.get("error") if isinstance(response_data, dict) else None
+    if isinstance(error_value, dict):
+        code_value = error_value.get("code")
+        if isinstance(code_value, (int, str)) and not isinstance(code_value, bool):
+            error_code = str(code_value).replace("\r", " ").replace("\n", " ")[:80]
+        message_value = error_value.get("message") or error_value.get("detail")
+        metadata = error_value.get("metadata")
+        if isinstance(metadata, dict):
+            error_type = metadata.get("error_type")
+            if isinstance(error_type, str):
+                error_code = (error_code + " " + error_type).strip()[:120]
+    elif isinstance(error_value, str):
+        message_value = error_value
+    else:
+        message_value = response_data.get("message") or response_data.get("detail")
+    if isinstance(message_value, str):
+        error_message = message_value.replace("\r", " ").replace("\n", " ")[:400]
+    return error_code, error_message
+
+
+def _openrouter_post_json(
+    api_key: str,
+    request_body: Dict[str, Any],
+    report: Callable[[str], None],
+) -> Dict[str, Any]:
+    """POST a bounded OpenRouter chat-completion request with transient retries."""
+    encoded_body = json.dumps(request_body, separators=(",", ":")).encode("utf-8")
+    request = urllib.request.Request(
+        OPENROUTER_ENDPOINT,
+        data=encoded_body,
+        headers={
+            "Content-Type": "application/json; charset=utf-8",
+            "Authorization": "Bearer " + api_key,
+        },
+        method="POST",
+    )
+    response_bytes = None
+    for attempt in range(MAX_API_ATTEMPTS):
+        attempt_started = time.monotonic()
+        report(
+            "OpenRouter HTTP attempt %d/%d started (request body %d bytes; key and screenshot omitted)."
+            % (attempt + 1, MAX_API_ATTEMPTS, len(encoded_body))
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                response_bytes = response.read(MAX_API_RESPONSE_BYTES + 1)
+                response_headers = getattr(response, "headers", None)
+                status = getattr(response, "status", None)
+                if status is None:
+                    getcode = getattr(response, "getcode", None)
+                    status = getcode() if getcode is not None else "unknown"
+            _report_rate_limit_headers(response_headers, "OpenRouter", report)
+            report(
+                "OpenRouter HTTP attempt %d/%d received status %s and %d response bytes in %.2f seconds."
+                % (
+                    attempt + 1,
+                    MAX_API_ATTEMPTS,
+                    status,
+                    len(response_bytes),
+                    time.monotonic() - attempt_started,
+                )
+            )
+            break
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            error_headers = getattr(exc, "headers", None)
+            provider_code = ""
+            provider_message = ""
+            try:
+                error_bytes = exc.read(4096)
+                error_payload = json.loads(error_bytes.decode("utf-8")) if error_bytes else {}
+                if isinstance(error_payload, dict):
+                    provider_code, provider_message = _openrouter_error_details(error_payload)
+            except (AttributeError, UnicodeDecodeError, ValueError):
+                pass
+            finally:
+                exc.close()
+            _report_rate_limit_headers(error_headers, "OpenRouter", report)
+            report(
+                "OpenRouter HTTP attempt %d/%d failed with status %d after %.2f seconds."
+                % (
+                    attempt + 1,
+                    MAX_API_ATTEMPTS,
+                    status,
+                    time.monotonic() - attempt_started,
+                )
+            )
+            if provider_code:
+                report("OpenRouter error code/type: %s." % provider_code)
+            if provider_message:
+                report("OpenRouter error detail: %s" % provider_message)
+            if status == 429 and attempt < MAX_API_ATTEMPTS - 1:
+                delay = _retry_after_delay(error_headers, attempt)
+                if delay is None:
+                    report(
+                        "OpenRouter rate limit requested a wait longer than the %d-second "
+                        "automatic retry limit; stopping retries."
+                        % MAX_RETRY_AFTER_SECONDS
+                    )
+                else:
+                    report(
+                        "OpenRouter was rate-limited (HTTP 429); retrying in %.1f second(s)."
+                        % delay
+                    )
+                    time.sleep(delay)
+                    continue
+            if status in RETRYABLE_HTTP_STATUSES and attempt < MAX_API_ATTEMPTS - 1:
+                delay = 2 ** attempt
+                report("Temporary OpenRouter server/provider error; retrying in %d second(s)." % delay)
+                time.sleep(delay)
+                continue
+            if status == 401:
+                raise RuntimeError("OpenRouter rejected the API key (HTTP 401).")
+            if status == 403:
+                raise RuntimeError(
+                    "OpenRouter rejected the request or account permissions (HTTP 403). "
+                    "A moderation or guardrail rule may also have blocked it."
+                )
+            if status == 402:
+                raise RuntimeError(
+                    "OpenRouter reported insufficient credits or account budget (HTTP 402)."
+                )
+            if status == 408:
+                raise RuntimeError("OpenRouter timed out while processing the request (HTTP 408).")
+            if status == 429:
+                raise RuntimeError(
+                    "OpenRouter rate-limited the request (HTTP 429). Wait and try again or "
+                    "check the account's request and usage limits."
+                )
+            if status == 413:
+                raise RuntimeError(
+                    "OpenRouter rejected the screenshot request as too large (HTTP 413). "
+                    "Try reducing the desktop resolution."
+                )
+            if status in RETRYABLE_HTTP_STATUSES:
+                raise RuntimeError(
+                    "OpenRouter or its selected model provider is temporarily unavailable "
+                    "(HTTP %d); the request was retried." % status
+                )
+            raise RuntimeError("OpenRouter returned an HTTP error (%d)." % status)
+        except urllib.error.URLError as exc:
+            reason = getattr(exc, "reason", None)
+            if isinstance(reason, TimeoutError):
+                report(
+                    "OpenRouter request timed out after %.2f seconds."
+                    % (time.monotonic() - attempt_started)
+                )
+                raise RuntimeError("The OpenRouter request timed out. Please try again.")
+            reason_name = type(reason).__name__ if reason is not None else type(exc).__name__
+            report(
+                "Could not reach OpenRouter after %.2f seconds; network error type: %s."
+                % (time.monotonic() - attempt_started, reason_name)
+            )
+            raise RuntimeError(
+                "Could not reach OpenRouter. Check the internet connection and try again."
+            )
+        except TimeoutError:
+            report(
+                "OpenRouter request timed out after %.2f seconds."
+                % (time.monotonic() - attempt_started)
+            )
+            raise RuntimeError("The OpenRouter request timed out. Please try again.")
+
+    if response_bytes is None:
+        raise RuntimeError("OpenRouter did not return a response.")
+    if len(response_bytes) > MAX_API_RESPONSE_BYTES:
+        report("OpenRouter response exceeded the %d-byte safety limit." % MAX_API_RESPONSE_BYTES)
+        raise RuntimeError("OpenRouter returned an unexpectedly large response.")
+    try:
+        response_data = json.loads(response_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        report("OpenRouter response could not be decoded as JSON.")
+        raise RuntimeError("OpenRouter returned a response that could not be read.")
+    if not isinstance(response_data, dict):
+        report("OpenRouter response JSON was not an object.")
+        raise RuntimeError("OpenRouter returned an invalid response.")
+    return response_data
+
+
+def _log_openrouter_response_metadata(
+    response_data: Dict[str, Any],
+    report: Callable[[str], None],
+) -> None:
+    """Log routing/usage metadata without exposing image content or hidden reasoning."""
+    model = response_data.get("model")
+    response_id = response_data.get("id")
+    routed_provider = response_data.get("provider")
+    for name, value in (("model", model), ("response_id", response_id), ("provider", routed_provider)):
+        if not isinstance(value, str):
+            value = "not provided"
+        value = value.replace("\r", " ").replace("\n", " ")[:100]
+        if name == "model":
+            model = value
+        elif name == "response_id":
+            response_id = value
+        else:
+            routed_provider = value
+    choices_value = response_data.get("choices")
+    choices = choices_value if isinstance(choices_value, list) else []
+    report(
+        "OpenRouter response metadata: choice_count=%d; model=%s; routed_provider=%s; response_id=%s."
+        % (len(choices), model, routed_provider, response_id)
+    )
+    usage = response_data.get("usage")
+    if isinstance(usage, dict):
+        counts = []
+        for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            count = usage.get(field)
+            if isinstance(count, int) and not isinstance(count, bool):
+                counts.append("%s=%d" % (field, count))
+        if counts:
+            report("OpenRouter token usage: %s." % ", ".join(counts))
+        cost = usage.get("cost")
+        if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+            report("OpenRouter reported request cost: %.8f account currency units." % cost)
+    for index, choice in enumerate(choices[:3]):
+        if not isinstance(choice, dict):
+            continue
+        finish_reason = choice.get("finish_reason", "not provided")
+        if not isinstance(finish_reason, str):
+            finish_reason = "not provided"
+        message = choice.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, str):
+            text_characters = len(content)
+        elif isinstance(content, list):
+            text_characters = sum(
+                len(part.get("text", ""))
+                for part in content
+                if (
+                    isinstance(part, dict)
+                    and part.get("type") not in ("thinking", "reasoning")
+                    and isinstance(part.get("text", ""), str)
+                )
+            )
+        else:
+            text_characters = 0
+        report(
+            "OpenRouter choice %d: finish_reason=%s; text_characters=%d."
+            % (index, finish_reason[:100], text_characters)
+        )
+
+
+def ask_openrouter(
+    api_key: str,
+    model: str,
+    png_image: bytes,
+    diagnostic: Optional[Callable[[str], None]] = None,
+    ocr_markdown: str = "",
+) -> Tuple[Optional[int], str]:
+    """Send a screenshot directly to OpenRouter vision chat without search or hosted OCR."""
+    def report(message: str) -> None:
+        if diagnostic is not None:
+            safe_message = str(message)
+            if api_key:
+                safe_message = safe_message.replace(api_key, "[REDACTED API KEY]")
+            diagnostic(safe_message)
+
+    if not valid_model_name("openrouter", model):
+        raise RuntimeError(
+            "The OpenRouter model name is invalid or uses :online web-search mode, which is disabled."
+        )
+
+    markdown = ocr_markdown.strip() if isinstance(ocr_markdown, str) else ""
+    if len(markdown) > MAX_OCR_CONTEXT_CHARS:
+        original_characters = len(markdown)
+        markdown = markdown[:MAX_OCR_CONTEXT_CHARS]
+        report(
+            "Local OCR Markdown truncated from %d to %d characters for the solver request."
+            % (original_characters, len(markdown))
+        )
+    if markdown:
+        report(
+            "Attaching %d characters of optional local OCR transcript to OpenRouter vision chat."
+            % len(markdown)
+        )
+    else:
+        report(
+            "Sending the screenshot directly to OpenRouter vision chat; no separate OCR API is used."
+        )
+
+    image_data_uri = "data:image/png;base64," + base64.b64encode(png_image).decode("ascii")
+    request_body: Dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SYSTEM_INSTRUCTION},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": _append_ocr_context(USER_PROMPT, markdown)},
+                    {"type": "image_url", "image_url": {"url": image_data_uri}},
+                ],
+            },
+        ],
+        "max_tokens": MAX_OPENROUTER_OUTPUT_TOKENS,
+    }
+    report("Preparing OpenRouter vision request for model %s." % model)
+    response_data = _openrouter_post_json(api_key, request_body, report)
+    if response_data.get("error") is not None:
+        error_code, error_message = _openrouter_error_details(response_data)
+        if error_code:
+            report("OpenRouter inference error code/type: %s." % error_code)
+        if error_message:
+            report("OpenRouter inference error detail: %s" % error_message)
+        suffix = " (code %s)" % error_code if error_code else ""
+        raise RuntimeError(
+            "OpenRouter reported a model/provider inference error%s. See Diagnostics for details."
+            % suffix
+        )
+    if diagnostic is not None:
+        _log_openrouter_response_metadata(response_data, report)
+    text = _extract_mistral_text(response_data)
+    if diagnostic is not None:
+        _report_model_output("OpenRouter", text, report)
+    option = parse_option(text)
+    if option is None:
+        report(
+            "OpenRouter response parsing found no explicit, reliable ANSWER line "
+            "(response length %d characters)." % len(text)
+        )
+    else:
+        report(
+            "OpenRouter response parsing recognized option position %d%s."
+            % (
+                option,
+                "; final response is shown above in diagnostics"
+                if diagnostic is not None
+                else "",
+            )
+        )
+    return option, text
+
+
 class WindowsTray:
     """Small ctypes-based notification-area icon and global-hotkey host."""
 
@@ -2466,8 +2814,8 @@ class ScreenAnswerApp:
             outer,
             text=(
                 "Live trace of startup, hotkeys, capture, provider requests, OCR, and answer parsing. "
-                "The log omits API keys and screenshot pixels, but may show OCR text and the "
-                "model's final response. Review it before copying or sharing."
+                "The log omits API keys and screenshot pixels, but may show OCR text, the "
+                "model's final response, and provider error details. Review it before copying or sharing."
             ),
             justify="left",
             anchor="w",
@@ -2613,7 +2961,8 @@ class ScreenAnswerApp:
             outer,
             text=(
                 "Provider default sends the screenshot directly to the selected vision model "
-                "(Groq has no separate OCR call; Mistral uses hosted OCR). Optional Pix2Text "
+                "(Gemini, Groq, and OpenRouter make no separate OCR call; Mistral uses hosted OCR). "
+                "Optional Pix2Text "
                 "runs locally but needs its own install/model download; the screenshot and OCR "
                 "text are still sent to the selected AI provider."
             ),
@@ -2683,8 +3032,8 @@ class ScreenAnswerApp:
             outer,
             text=(
                 "The screenshot is not saved to disk. Provider-default Mistral uses separate "
-                "OCR and chat requests; Gemini and Groq send the image directly to vision chat. "
-                "Local Pix2Text OCR skips Mistral's OCR API call but still uploads the screenshot "
+                "OCR and chat requests; Gemini, Groq, and OpenRouter send the image directly "
+                "to vision chat. Local Pix2Text OCR skips Mistral's OCR API call but still uploads the screenshot "
                 "for solving. Verify answers and use only where AI assistance is permitted."
             ),
             fg="#555555",
@@ -2724,6 +3073,11 @@ class ScreenAnswerApp:
             return (
                 "I understand each capture uploads the full desktop screenshot directly to "
                 "Groq's vision chat API; no separate OCR service is called."
+            )
+        if provider == "openrouter":
+            return (
+                "I understand each capture uploads the full desktop screenshot directly to "
+                "OpenRouter's vision chat API; no separate OCR service or live web search is used."
             )
         return "I understand each capture uploads the full desktop screenshot to %s." % provider_label
 
@@ -2983,6 +3337,14 @@ class ScreenAnswerApp:
                         diagnostic=diagnostic_callback,
                         ocr_markdown=local_ocr_markdown or "",
                     )
+                elif provider == "openrouter":
+                    option, response_text = ask_openrouter(
+                        api_key,
+                        model,
+                        image,
+                        diagnostic=diagnostic_callback,
+                        ocr_markdown=local_ocr_markdown or "",
+                    )
                 else:
                     option, response_text = ask_gemini(
                         api_key,
@@ -3128,6 +3490,14 @@ def main() -> int:
         return 0 if pix2text_bundle_importable() else 1
     if "--check-groq-provider" in sys.argv[1:]:
         return 0 if APP_DEFAULT_PROVIDER == "groq" else 1
+    if "--check-openrouter-support" in sys.argv[1:]:
+        return 0 if (
+            PROVIDER_LABELS.get("openrouter") == "OpenRouter"
+            and API_KEY_ENV_VARS.get("openrouter") == "OPENROUTER_API_KEY"
+            and DEFAULT_MODELS.get("openrouter") == DEFAULT_OPENROUTER_MODEL
+            and valid_model_name("openrouter", DEFAULT_OPENROUTER_MODEL)
+            and OPENROUTER_ENDPOINT == "https://openrouter.ai/api/v1/chat/completions"
+        ) else 1
     if os.name != "nt":
         print("Screen Answer runs on Windows 7/10 and later.", file=sys.stderr)
         return 1

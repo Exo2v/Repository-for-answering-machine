@@ -35,6 +35,7 @@ jobs:
           pyinstaller --noconfirm --clean --onefile --windowed --name ScreenAnswer-Diagnostic answer_tray.py
           pyinstaller --noconfirm --clean --onefile --windowed --name ScreenAnswer-Groq answer_tray.py
           .\dist\ScreenAnswer-Groq.exe --check-groq-provider
+          .\dist\ScreenAnswer-Diagnostic.exe --check-openrouter-support
 
       - name: Upload standard standalone executables
         uses: actions/upload-artifact@v4
