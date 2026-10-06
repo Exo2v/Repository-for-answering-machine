@@ -6,7 +6,7 @@ A small, user-triggered Windows study helper. It uses only Python's standard lib
 
 - The app has a **visible notification-area (system tray) icon**. It is not a stealth/hidden process and it does not install itself to Windows startup.
 - A screenshot is taken only after the user presses **Ctrl+Alt+S**, clicks **Capture & ask now**, or selects **Capture and ask** from the tray menu.
-- Every capture includes the **entire virtual desktop / all monitors**. The app shows a tray notification and sends that image over HTTPS to the Google Gemini API with Google Search grounding. The image is held in memory and is not written to a screenshot file.
+- Every capture includes the **entire virtual desktop / all monitors**. The app shows a tray notification and sends that image over HTTPS to Google Gemini for an AI-only response. **Live web search / Google Search grounding is disabled.** The image is held in memory and is not written to a screenshot file.
 - The user enters their own Gemini API key. The key is kept in memory for that run only; it is not saved in a config file. `GEMINI_API_KEY` may also be set in the environment, but the app still requires acknowledging the upload notice in its window.
 - Use this only with screen content you are allowed to share with Google and where AI assistance is permitted. Gemini can be wrong; the tray color is a suggestion, not a guarantee.
 - There is no self-destruct or file-deletion hotkey. **Ctrl+Alt+Q** and the tray menu's **Exit** command close the app normally. Remove the downloaded `.exe` or source folder yourself if you want to uninstall it.
@@ -23,7 +23,7 @@ A small, user-triggered Windows study helper. It uses only Python's standard lib
    - Grey: neutral / no reliable answer / ready
 4. A result stays at full color for 10 seconds, then fades to grey over about 1.5 seconds. **Ctrl+Alt+Q** exits.
 
-The model is set to `gemini-3.8-flash` by default and can be changed in the settings window. A Gemini API key, internet access, and available Google API quota are required. Google API availability, pricing, and model names can change.
+The model is set to `gemini-3.8-flash` by default and can be changed in the settings window. The model answers from the screenshot and its existing knowledge; it does not look up current facts on the web. A Gemini API key, internet access, and available Google API quota are required. Free-tier eligibility and quotas, API pricing, and model names can change.
 
 ## Run from source
 

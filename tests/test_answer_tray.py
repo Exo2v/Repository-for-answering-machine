@@ -1,8 +1,11 @@
+import base64
+import json
 import struct
 import unittest
 import zlib
+from unittest.mock import patch
 
-from answer_tray import _encode_rgb_png, _extract_gemini_text, parse_option
+from answer_tray import _encode_rgb_png, _extract_gemini_text, ask_gemini, parse_option
 
 
 class ParseOptionTests(unittest.TestCase):
@@ -30,6 +33,42 @@ class ParseOptionTests(unittest.TestCase):
         }
         self.assertEqual(_extract_gemini_text(payload), "2")
         self.assertEqual(_extract_gemini_text({"candidates": []}), "")
+
+
+class GeminiRequestTests(unittest.TestCase):
+    def test_uses_screenshot_without_search_tools(self):
+        image_bytes = b"fake png bytes"
+        captured = {}
+        response_payload = {
+            "candidates": [
+                {"content": {"parts": [{"text": "3"}]}}
+            ]
+        }
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+            def read(self, limit=-1):
+                encoded = json.dumps(response_payload).encode("utf-8")
+                return encoded if limit < 0 else encoded[:limit]
+
+        def fake_urlopen(request, timeout):
+            captured["body"] = json.loads(request.data.decode("utf-8"))
+            captured["timeout"] = timeout
+            return FakeResponse()
+
+        with patch("answer_tray.urllib.request.urlopen", side_effect=fake_urlopen):
+            option, response_text = ask_gemini("test-key", "gemini-3.8-flash", image_bytes)
+
+        self.assertEqual(option, 3)
+        self.assertEqual(response_text, "3")
+        self.assertNotIn("tools", captured["body"])
+        parts = captured["body"]["contents"][0]["parts"]
+        self.assertEqual(parts[1]["inlineData"]["data"], base64.b64encode(image_bytes).decode("ascii"))
 
 
 class PngEncodingTests(unittest.TestCase):
