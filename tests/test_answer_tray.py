@@ -35,6 +35,8 @@ from answer_tray import (
     diagnostics_mode_enabled,
     ensure_lasso1_config,
     is_lasso1_executable,
+    is_lassv7_executable,
+    lasso_config_directory_for_executable,
     lasso1_config_path,
     lasso1_config_template,
     main,
@@ -61,23 +63,34 @@ class DiagnosticsModeTests(unittest.TestCase):
 
 
 class Lasso1ModeTests(unittest.TestCase):
-    def test_lasso1_executable_is_openrouter_only_and_never_enables_diagnostics(self):
+    def test_lasso_executables_are_openrouter_only_and_never_enable_diagnostics(self):
         self.assertTrue(is_lasso1_executable("Lasso1.exe"))
+        self.assertTrue(is_lasso1_executable("LassV7.exe"))
+        self.assertTrue(is_lassv7_executable("LassV7.exe"))
+        self.assertFalse(is_lassv7_executable("Lasso1.exe"))
         self.assertFalse(is_lasso1_executable("ScreenAnswer.exe"))
         self.assertEqual(
             provider_labels_for_executable("Lasso1.exe"),
             {"openrouter": "OpenRouter"},
         )
+        self.assertEqual(
+            provider_labels_for_executable("LassV7.exe"),
+            {"openrouter": "OpenRouter"},
+        )
         self.assertEqual(default_provider_for_executable("Lasso1.exe"), "openrouter")
+        self.assertEqual(default_provider_for_executable("LassV7.exe"), "openrouter")
+        self.assertEqual(lasso_config_directory_for_executable("LassV7.exe"), "LassV7")
         self.assertFalse(diagnostics_mode_enabled(("--diagnostics",), "Lasso1.exe"))
+        self.assertFalse(diagnostics_mode_enabled(("--diagnostics",), "LassV7.exe"))
 
-    def test_first_run_config_uses_per_user_folder_and_requires_upload_opt_in(self):
+    def test_first_run_config_uses_variant_folder_and_has_no_prefilled_values(self):
         with tempfile.TemporaryDirectory() as directory:
             path = lasso1_config_path(directory)
-            self.assertEqual(
-                path,
-                os.path.join(directory, "Lasso1", "config.json"),
-            )
+            self.assertEqual(path, os.path.join(directory, "Lasso1", "config.json"))
+            with patch("answer_tray.LASSOV7_MODE", True):
+                lassv7_path = lasso1_config_path(directory)
+            self.assertEqual(lassv7_path, os.path.join(directory, "LassV7", "config.json"))
+
             self.assertTrue(ensure_lasso1_config(path))
             with open(path, "r", encoding="utf-8") as config_file:
                 config = json.load(config_file)
@@ -85,11 +98,9 @@ class Lasso1ModeTests(unittest.TestCase):
             self.assertEqual(config, lasso1_config_template())
             self.assertEqual(config["provider"], "openrouter")
             self.assertEqual(config["api_keys"], {"openrouter": ""})
-            self.assertEqual(
-                config["models"], {"openrouter": DEFAULT_OPENROUTER_MODEL}
-            )
+            self.assertEqual(config["models"], {"openrouter": ""})
             self.assertIs(config["allow_screenshot_uploads"], False)
-            self.assertIn("newly rotated OpenRouter API key", config["_instructions"])
+            self.assertNotIn("_instructions", config)
 
             config["allow_screenshot_uploads"] = True
             with open(path, "w", encoding="utf-8") as config_file:
@@ -97,6 +108,39 @@ class Lasso1ModeTests(unittest.TestCase):
             self.assertFalse(ensure_lasso1_config(path))
             with open(path, "r", encoding="utf-8") as config_file:
                 self.assertIs(json.load(config_file)["allow_screenshot_uploads"], True)
+
+    def test_migrates_only_the_old_untouched_prefilled_model_template(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "Lasso1", "config.json")
+            os.makedirs(os.path.dirname(path))
+            old_template = {
+                "provider": "openrouter",
+                "api_keys": {"openrouter": ""},
+                "models": {"openrouter": DEFAULT_OPENROUTER_MODEL},
+                "allow_screenshot_uploads": False,
+                "_instructions": (
+                    "Paste a newly rotated OpenRouter API key into api_keys.openrouter. "
+                    "This is the old first-run template."
+                ),
+            }
+            with open(path, "w", encoding="utf-8") as config_file:
+                json.dump(old_template, config_file)
+
+            self.assertFalse(ensure_lasso1_config(path))
+            with open(path, "r", encoding="utf-8") as config_file:
+                migrated = json.load(config_file)
+            self.assertEqual(migrated["models"], {"openrouter": ""})
+            self.assertNotIn("_instructions", migrated)
+
+            saved_config = dict(old_template)
+            saved_config["api_keys"] = {"openrouter": "saved-key"}
+            with open(path, "w", encoding="utf-8") as config_file:
+                json.dump(saved_config, config_file)
+            self.assertFalse(ensure_lasso1_config(path))
+            with open(path, "r", encoding="utf-8") as config_file:
+                preserved = json.load(config_file)
+            self.assertEqual(preserved["models"]["openrouter"], DEFAULT_OPENROUTER_MODEL)
+            self.assertEqual(preserved["api_keys"]["openrouter"], "saved-key")
 
     def test_config_loader_keeps_only_openrouter_and_requires_boolean_consent(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -189,17 +233,7 @@ class Lasso1ModeTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             config_path = os.path.join(directory, "Lasso1", "config.json")
-            os.makedirs(os.path.dirname(config_path))
-            with open(config_path, "w", encoding="utf-8") as config_file:
-                json.dump(
-                    {
-                        "provider": "openrouter",
-                        "api_keys": {"openrouter": "config-key"},
-                        "models": {"openrouter": DEFAULT_OPENROUTER_MODEL},
-                        "allow_screenshot_uploads": False,
-                    },
-                    config_file,
-                )
+            self.assertTrue(ensure_lasso1_config(config_path))
             with patch.multiple(
                 "answer_tray",
                 LASSO1_MODE=True,
@@ -229,8 +263,9 @@ class Lasso1ModeTests(unittest.TestCase):
                                             app = ScreenAnswerApp(root)
 
         self.assertEqual(app.provider, "openrouter")
-        self.assertEqual(app.api_key, "config-key")
-        self.assertEqual(app.api_key_source, "Lasso1 config file")
+        self.assertEqual(app.api_key, "")
+        self.assertEqual(app.api_key_source, "not configured")
+        self.assertEqual(app.model, "")
         self.assertFalse(app.privacy_acknowledged)
         self.assertFalse(app.diagnostics_enabled)
         lasso_window.assert_called_once_with()
@@ -321,7 +356,31 @@ class Lasso1ModeTests(unittest.TestCase):
         self.assertIn("consent", app.tray.show_balloon.call_args.args[1])
         app.show_window.assert_not_called()
 
-    def test_lasso1_context_menu_exposes_folder_and_self_destruct_actions(self):
+    def test_capture_is_blocked_until_lasso_model_is_configured(self):
+        app = object.__new__(ScreenAnswerApp)
+        app.lasso1_mode = True
+        app.busy = False
+        app.api_key = "config-key"
+        app.model = ""
+        app.privacy_acknowledged = True
+        app.provider = "openrouter"
+        app.status_var = MagicMock()
+        app.tray = MagicMock()
+        app._log_diagnostic = MagicMock()
+        app.show_window = MagicMock()
+
+        app._start_capture("test")
+
+        self.assertFalse(app.busy)
+        app.tray.show_balloon.assert_called_once()
+        self.assertIn("OpenRouter model", app.tray.show_balloon.call_args.args[1])
+        app.show_window.assert_not_called()
+
+    def test_lasso1_context_menu_exposes_config_file_folder_and_self_destruct_actions(self):
+        app_name_patch = patch("answer_tray.APP_NAME", "Lasso1")
+        app_name_patch.start()
+        self.addCleanup(app_name_patch.stop)
+
         class Point(ctypes.Structure):
             _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
 
@@ -381,6 +440,19 @@ class Lasso1ModeTests(unittest.TestCase):
         tray._user32.TrackPopupMenu.return_value = 106
         show_menu()
         tray.events.put.assert_called_once_with(("self_destruct",))
+
+        tray._user32.AppendMenuW.reset_mock()
+        tray._user32.TrackPopupMenu.return_value = 0
+        with patch("answer_tray.APP_NAME", "LassV7"):
+            show_menu()
+        lassv7_labels = [
+            call.args[3]
+            for call in tray._user32.AppendMenuW.call_args_list
+            if call.args[3]
+        ]
+        self.assertIn("Open LassV7 config file", lassv7_labels)
+        self.assertIn("Open LassV7 config folder", lassv7_labels)
+        self.assertIn("Self-destruct LassV7…", lassv7_labels)
 
     def test_open_config_folder_uses_the_lasso1_appdata_directory(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -458,6 +530,7 @@ class Lasso1ModeTests(unittest.TestCase):
         with patch.multiple(
             "answer_tray",
             LASSO1_MODE=True,
+            LASSOV7_MODE=False,
             APP_NAME="Lasso1",
             APP_DEFAULT_PROVIDER="openrouter",
             PROVIDER_LABELS={"openrouter": "OpenRouter"},
@@ -466,6 +539,22 @@ class Lasso1ModeTests(unittest.TestCase):
         ):
             with patch("sys.argv", ["Lasso1.exe", "--check-lasso1-build"]):
                 self.assertEqual(main(), 0)
+
+    def test_packaged_lassv7_build_check(self):
+        with patch.multiple(
+            "answer_tray",
+            LASSO1_MODE=True,
+            LASSOV7_MODE=True,
+            APP_NAME="LassV7",
+            APP_DEFAULT_PROVIDER="openrouter",
+            PROVIDER_LABELS={"openrouter": "OpenRouter"},
+            API_KEY_ENV_VARS={"openrouter": "OPENROUTER_API_KEY"},
+            DEFAULT_MODELS={"openrouter": DEFAULT_OPENROUTER_MODEL},
+        ):
+            with patch("answer_tray.sys.version_info", (3, 8, 10, "final", 0)):
+                with patch("answer_tray.struct.calcsize", return_value=4):
+                    with patch("sys.argv", ["LassV7.exe", "--check-lassv7-build"]):
+                        self.assertEqual(main(), 0)
 
 
 class Pix2TextOCRTests(unittest.TestCase):

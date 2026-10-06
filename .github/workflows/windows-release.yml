@@ -51,14 +51,14 @@ jobs:
           retention-days: 30
 
   build-lasso1:
-    name: Build OpenRouter-only Lasso1 executable
+    name: Build Lasso1 and Windows 7-compatible LassV7 executables
     if: github.ref == 'refs/tags/lasso1' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && contains(github.event.head_commit.message, '[lasso1-build]'))
     runs-on: windows-2022
     steps:
       - name: Check out source
         uses: actions/checkout@v4
 
-      - name: Set up 32-bit Python 3.8
+      - name: Set up 32-bit Python 3.8.10 (Windows 7 target)
         uses: actions/setup-python@v5
         with:
           python-version: "3.8.10"
@@ -67,17 +67,21 @@ jobs:
       - name: Test
         run: python -m unittest discover -s tests -v
 
-      - name: Package Lasso1 standalone executable
+      - name: Package Lasso1 and Windows 7-compatible LassV7 executables
         run: |
           python -m pip install pyinstaller==5.13.2
           pyinstaller --noconfirm --clean --onefile --windowed --name Lasso1 answer_tray.py
           .\dist\Lasso1.exe --check-lasso1-build
+          pyinstaller --noconfirm --onefile --windowed --name LassV7 --distpath dist --workpath build-lassv7\work --specpath build-lassv7\spec answer_tray.py
+          .\dist\LassV7.exe --check-lassv7-build
 
-      - name: Upload Lasso1 executable
+      - name: Upload Lasso executables
         uses: actions/upload-artifact@v4
         with:
           name: Lasso1-Windows-32bit
-          path: dist/Lasso1.exe
+          path: |
+            dist/Lasso1.exe
+            dist/LassV7.exe
           if-no-files-found: error
           retention-days: 30
 
@@ -186,11 +190,13 @@ jobs:
           generate_release_notes: false
           overwrite_files: true
           body: |
-            Lasso1 is a tray-only, OpenRouter-only Windows build.
+            Lasso1 and LassV7 are tray-only, OpenRouter-only Windows builds. LassV7.exe is the dedicated 32-bit Windows 7-compatible build packaged with Python 3.8.10 and PyInstaller 5.13.2.
 
-            On first run, it creates `%APPDATA%\Lasso1\config.json`. Right-click the tray and choose Open to enter your OpenRouter key and optionally consent to screenshot uploads; Save writes this config and closes the GUI. Upload consent is off by default. The key is never bundled in the executable.
+            On first run, Lasso1 creates `%APPDATA%\Lasso1\config.json`; LassV7 creates `%APPDATA%\LassV7\config.json`. API-key and model values are blank and are not bundled in either executable. Right-click the tray and choose Open to enter values; Save writes the matching config and closes the GUI. Screenshot-upload consent is off by default.
 
             Capture uses Ctrl+Alt+S; the full virtual desktop is sent to OpenRouter only after explicit config-file consent. Web search and tool execution are disabled.
 
-            Right-click also offers Open Lasso1 config file (opens config.json in the default editor), Open Lasso1 config folder, and the confirmed self-destruct cleanup, which removes Lasso1.exe and config.json after exit.
-          files: release-assets/Lasso1.exe
+            Right-click also offers matching config-file and config-folder actions, plus confirmed self-destruct, which deletes only the running executable and its matching config.json after exit.
+          files: |
+            release-assets/Lasso1.exe
+            release-assets/LassV7.exe

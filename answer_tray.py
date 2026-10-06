@@ -37,25 +37,43 @@ DEFAULT_OPENROUTER_MODEL = "google/gemini-3.8-flash"
 LEGACY_MISTRAL_MODEL = "ministral-14b-2512"
 MISTRAL_OCR_MODEL = "mistral-ocr-latest"
 DEFAULT_PROVIDER = "gemini"
+LASSO1_CONFIG_DIRECTORY = "Lasso1"
+LASSV7_CONFIG_DIRECTORY = "LassV7"
+LASSO1_CONFIG_FILENAME = "config.json"
 _DEFAULT_EXE_NAME = os.path.splitext(os.path.basename(sys.executable))[0].lower()
 
 
-def is_lasso1_executable(executable_name: Optional[str] = None) -> bool:
-    """Identify the OpenRouter-only, tray-only Lasso1 package by its file name."""
+def lasso_config_directory_for_executable(executable_name: Optional[str] = None) -> Optional[str]:
+    """Return the private config directory for a dedicated Lasso executable."""
     name = executable_name or sys.executable
     name = os.path.splitext(os.path.basename(name))[0].lower()
-    return name == "lasso1"
+    return {
+        "lasso1": LASSO1_CONFIG_DIRECTORY,
+        "lassv7": LASSV7_CONFIG_DIRECTORY,
+    }.get(name)
 
 
+def is_lasso1_executable(executable_name: Optional[str] = None) -> bool:
+    """Identify either OpenRouter-only, tray-only Lasso executable."""
+    return lasso_config_directory_for_executable(executable_name) is not None
+
+
+def is_lassv7_executable(executable_name: Optional[str] = None) -> bool:
+    """Identify the Python 3.8 / Windows 7-compatible Lasso package."""
+    name = executable_name or sys.executable
+    return os.path.splitext(os.path.basename(name))[0].lower() == "lassv7"
+
+
+LASSOV7_MODE = is_lassv7_executable()
 LASSO1_MODE = is_lasso1_executable()
-APP_NAME = "Lasso1" if LASSO1_MODE else "Screen Answer"
-APP_VERSION = "lasso1" if LASSO1_MODE else "1.5.0-experimental"
+APP_NAME = "LassV7" if LASSOV7_MODE else "Lasso1" if LASSO1_MODE else "Screen Answer"
+APP_VERSION = "lassv7" if LASSOV7_MODE else "lasso1" if LASSO1_MODE else "1.5.0-experimental"
 
 
 def default_provider_for_executable(executable_name: str) -> str:
     """Select the dedicated provider for a named executable variant."""
     name = os.path.splitext(os.path.basename(executable_name))[0].lower()
-    if name == "lasso1":
+    if is_lasso1_executable(name):
         return "openrouter"
     return "groq" if "groq" in name else DEFAULT_PROVIDER
 
@@ -83,7 +101,7 @@ _ALL_DEFAULT_MODELS = {
 
 
 def provider_labels_for_executable(executable_name: str) -> Dict[str, str]:
-    """Expose only OpenRouter in the dedicated Lasso1 build."""
+    """Expose only OpenRouter in either dedicated Lasso executable."""
     if is_lasso1_executable(executable_name):
         return {"openrouter": _ALL_PROVIDER_LABELS["openrouter"]}
     return dict(_ALL_PROVIDER_LABELS)
@@ -148,8 +166,6 @@ MAX_OCR_CONTEXT_CHARS = 48_000
 MAX_DIAGNOSTIC_TEXT_CHARS = 16_000
 RETRYABLE_HTTP_STATUSES = (500, 502, 503, 504)
 PORTABLE_CONFIG_NAME = "screen_answer_config.json"
-LASSO1_CONFIG_DIRECTORY = "Lasso1"
-LASSO1_CONFIG_FILENAME = "config.json"
 _PIX2TEXT_ENGINE: Any = None
 _PIX2TEXT_ENGINE_LOCK = threading.RLock()
 
@@ -178,15 +194,16 @@ def _queue_diagnostic_event(
 
 
 def lasso1_config_path(app_data_root: Optional[str] = None) -> str:
-    """Return the per-user AppData path for Lasso1's editable, unbundled config."""
+    """Return the per-user config path for the running Lasso executable."""
     root = app_data_root or os.environ.get("APPDATA") or os.environ.get("LOCALAPPDATA")
     if not root:
         root = os.path.expanduser("~")
-    return os.path.join(root, LASSO1_CONFIG_DIRECTORY, LASSO1_CONFIG_FILENAME)
+    config_directory = LASSV7_CONFIG_DIRECTORY if LASSOV7_MODE else LASSO1_CONFIG_DIRECTORY
+    return os.path.join(root, config_directory, LASSO1_CONFIG_FILENAME)
 
 
 def portable_config_path() -> str:
-    """Return the provider config path beside the app or in Lasso1's AppData folder."""
+    """Return the provider config path beside the app or in the matching Lasso folder."""
     if LASSO1_MODE:
         return lasso1_config_path()
     if getattr(sys, "frozen", False):
@@ -197,18 +214,38 @@ def portable_config_path() -> str:
 
 
 def lasso1_config_template() -> Dict[str, Any]:
-    """Return a key-free, OpenRouter-only first-run config and explicit upload opt-in."""
+    """Return a value-free OpenRouter-only config with screenshot upload disabled."""
     return {
         "provider": "openrouter",
         "api_keys": {"openrouter": ""},
-        "models": {"openrouter": DEFAULT_OPENROUTER_MODEL},
+        "models": {"openrouter": ""},
         "allow_screenshot_uploads": False,
-        "_instructions": (
-            "Paste a newly rotated OpenRouter API key into api_keys.openrouter. "
-            "Set allow_screenshot_uploads to true only if you consent to sending the full "
-            "desktop screenshot to OpenRouter. This file is plain text; keep it private."
-        ),
     }
+
+
+def _write_lasso1_json_atomically(path: str, config: Dict[str, Any]) -> None:
+    """Atomically replace a small Lasso config file without leaking partial JSON."""
+    config_path = os.path.abspath(path)
+    config_directory = os.path.dirname(config_path)
+    os.makedirs(config_directory, exist_ok=True)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=config_directory,
+            prefix=".lasso-config-",
+            suffix=".tmp",
+            delete=False,
+        ) as config_file:
+            temporary_path = config_file.name
+            json.dump(config, config_file, indent=2)
+            config_file.write("\n")
+        os.replace(temporary_path, config_path)
+        temporary_path = None
+    finally:
+        if temporary_path and os.path.exists(temporary_path):
+            os.remove(temporary_path)
 
 
 def save_lasso1_config(
@@ -217,7 +254,7 @@ def save_lasso1_config(
     model: str,
     allow_screenshot_uploads: bool,
 ) -> str:
-    """Atomically save Lasso1's sole key, model, and explicit consent setting."""
+    """Atomically save the Lasso build's sole key, model, and explicit consent setting."""
     config_path = path or lasso1_config_path()
     key = api_key.strip() if isinstance(api_key, str) else ""
     selected_model = model.strip() if isinstance(model, str) else ""
@@ -230,31 +267,48 @@ def save_lasso1_config(
     config["api_keys"]["openrouter"] = key
     config["models"]["openrouter"] = selected_model
     config["allow_screenshot_uploads"] = allow_screenshot_uploads is True
-    config_directory = os.path.dirname(os.path.abspath(config_path))
-    os.makedirs(config_directory, exist_ok=True)
-    temporary_path = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
-            dir=config_directory,
-            prefix=".lasso1-config-",
-            suffix=".tmp",
-            delete=False,
-        ) as config_file:
-            temporary_path = config_file.name
-            json.dump(config, config_file, indent=2)
-            config_file.write("\n")
-        os.replace(temporary_path, config_path)
-        temporary_path = None
-    finally:
-        if temporary_path and os.path.exists(temporary_path):
-            os.remove(temporary_path)
+    _write_lasso1_json_atomically(config_path, config)
     return config_path
 
 
+def _clear_old_generated_model_default(config_path: str) -> bool:
+    """Blank the old bundled model only in untouched, key-free first-run configs."""
+    try:
+        with open(config_path, "r", encoding="utf-8") as config_file:
+            config = json.load(config_file)
+    except (OSError, ValueError):
+        return False
+    if not isinstance(config, dict):
+        return False
+    if not str(config.get("_instructions", "")).startswith(
+        "Paste a newly rotated OpenRouter API key"
+    ):
+        return False
+    stored_keys = config.get("api_keys")
+    stored_key = stored_keys.get("openrouter", "") if isinstance(stored_keys, dict) else ""
+    legacy_key = config.get("api_key", "")
+    if (isinstance(stored_key, str) and stored_key.strip()) or (
+        isinstance(legacy_key, str) and legacy_key.strip()
+    ):
+        return False
+    if config.get("allow_screenshot_uploads") is True:
+        return False
+    stored_models = config.get("models")
+    if not isinstance(stored_models, dict):
+        return False
+    if stored_models.get("openrouter") != DEFAULT_OPENROUTER_MODEL:
+        return False
+
+    stored_models = dict(stored_models)
+    stored_models["openrouter"] = ""
+    config["models"] = stored_models
+    config.pop("_instructions", None)
+    _write_lasso1_json_atomically(config_path, config)
+    return True
+
+
 def ensure_lasso1_config(path: Optional[str] = None) -> bool:
-    """Create Lasso1's AppData folder and empty config on first run; never overwrite."""
+    """Create Lasso's AppData config; migrate only the previous untouched template."""
     config_path = path or lasso1_config_path()
     directory = os.path.dirname(os.path.abspath(config_path))
     if directory:
@@ -264,6 +318,7 @@ def ensure_lasso1_config(path: Optional[str] = None) -> bool:
             json.dump(lasso1_config_template(), config_file, indent=2)
             config_file.write("\n")
     except FileExistsError:
+        _clear_old_generated_model_default(config_path)
         return False
     return True
 
@@ -277,14 +332,15 @@ def schedule_lasso1_self_cleanup(
     executable_path: Optional[str] = None,
     config_path: Optional[str] = None,
 ) -> bool:
-    """Delete only Lasso1.exe and its config after this process exits."""
+    """Delete only the running Lasso executable and its matching private config."""
     exe_path = os.path.abspath(executable_path or sys.executable)
     saved_config_path = os.path.abspath(config_path or lasso1_config_path())
     config_directory = os.path.dirname(saved_config_path)
+    expected_config_directory = lasso_config_directory_for_executable(exe_path)
     if (
-        os.path.basename(exe_path).lower() != "lasso1.exe"
+        expected_config_directory is None
         or os.path.basename(saved_config_path).lower() != LASSO1_CONFIG_FILENAME.lower()
-        or os.path.basename(config_directory).lower() != LASSO1_CONFIG_DIRECTORY.lower()
+        or os.path.basename(config_directory).lower() != expected_config_directory.lower()
     ):
         return False
     if os.name != "nt":
@@ -446,14 +502,15 @@ def resolve_api_key(
     environment: Optional[Dict[str, str]] = None,
     lasso1_mode: Optional[bool] = None,
 ) -> Tuple[str, str]:
-    """Resolve a key and source; Lasso1 deliberately ignores environment keys."""
+    """Resolve a key and source; Lasso builds deliberately ignore environment keys."""
     use_lasso1_rules = LASSO1_MODE if lasso1_mode is None else lasso1_mode
     saved_key = stored_keys.get(provider, "")
     if not isinstance(saved_key, str):
         saved_key = ""
     saved_key = saved_key.strip()
     if use_lasso1_rules:
-        return (saved_key, "Lasso1 config file" if saved_key else "not configured")
+        config_source = "LassV7 config file" if LASSOV7_MODE else "Lasso1 config file"
+        return (saved_key, config_source if saved_key else "not configured")
 
     env = os.environ if environment is None else environment
     env_name = API_KEY_ENV_VARS.get(provider)
@@ -2727,13 +2784,13 @@ class WindowsTray:
                     menu,
                     mf_string,
                     cmd_open_config_file,
-                    "Open Lasso1 config file",
+                    "Open %s config file" % APP_NAME,
                 )
                 user32.AppendMenuW(
                     menu,
                     mf_string,
                     cmd_open_config_folder,
-                    "Open Lasso1 config folder",
+                    "Open %s config folder" % APP_NAME,
                 )
             if self.diagnostics_enabled:
                 user32.AppendMenuW(menu, mf_string, cmd_diagnostics, "Show diagnostics")
@@ -2743,7 +2800,7 @@ class WindowsTray:
                     menu,
                     mf_string,
                     cmd_self_destruct,
-                    "Self-destruct Lasso1…",
+                    "Self-destruct %s…" % APP_NAME,
                 )
             user32.AppendMenuW(menu, mf_separator, 0, None)
             user32.AppendMenuW(menu, mf_string, cmd_exit, "Exit  (Ctrl+Alt+Q)")
@@ -2976,7 +3033,7 @@ class ScreenAnswerApp:
         self.diagnostics_status_var = None
         self.api_entry = None
         self.privacy_var = None
-        self.status_var = tk.StringVar(value="Lasso1 is starting." if self.lasso1_mode else "Ready.")
+        self.status_var = tk.StringVar(value="%s is starting." % APP_NAME if self.lasso1_mode else "Ready.")
 
         self.config_path = portable_config_path()
         if self.lasso1_mode:
@@ -2989,14 +3046,17 @@ class ScreenAnswerApp:
         self.models: Dict[str, str] = {}
         self.api_key_sources: Dict[str, str] = {}
         for provider in PROVIDER_LABELS:
-            # Lasso1 intentionally reads its sole credential from the editable
+            # Lasso builds intentionally read their sole credential from the editable
             # per-user config file, never from the EXE or process environment.
             self.api_keys[provider], self.api_key_sources[provider] = resolve_api_key(
                 provider,
                 stored_keys,
                 lasso1_mode=self.lasso1_mode,
             )
-            self.models[provider] = stored_models.get(provider, DEFAULT_MODELS[provider])
+            self.models[provider] = stored_models.get(
+                provider,
+                "" if self.lasso1_mode else DEFAULT_MODELS[provider],
+            )
 
         if self.lasso1_mode:
             self.provider = "openrouter"
@@ -3053,21 +3113,21 @@ class ScreenAnswerApp:
         else:
             self._build_window()
         if self.lasso1_mode:
-            if not self.api_key:
-                tooltip = "Lasso1 — right-click tray and choose Open to configure"
+            if not self.api_key or not self.model:
+                tooltip = "%s — right-click tray and choose Open to configure" % APP_NAME
                 self.tray.show_balloon(
                     APP_NAME,
-                    "Right-click the tray icon and choose Open to enter an OpenRouter key. Config: %s"
+                    "Right-click the tray icon and choose Open to enter an OpenRouter key and model. Config: %s"
                     % self.config_path,
                 )
             elif not self.privacy_acknowledged:
-                tooltip = "Lasso1 — upload consent required"
+                tooltip = "%s — upload consent required" % APP_NAME
                 self.tray.show_balloon(
                     APP_NAME,
                     "Right-click the tray icon and choose Open to review upload consent, then Save.",
                 )
             else:
-                tooltip = "Lasso1 — ready; Ctrl+Alt+S to capture"
+                tooltip = "%s — ready; Ctrl+Alt+S to capture" % APP_NAME
                 self.tray.show_balloon(
                     APP_NAME,
                     "Ready. Ctrl+Alt+S captures the full desktop and sends it to OpenRouter.",
@@ -3242,13 +3302,13 @@ class ScreenAnswerApp:
         """Build Lasso1's compact settings window without showing it at startup."""
         import tkinter as tk
 
-        self.root.title("Lasso1 Settings")
+        self.root.title("%s Settings" % APP_NAME)
         outer = tk.Frame(self.root, padx=20, pady=18)
         outer.pack(fill="both", expand=True)
 
         tk.Label(
             outer,
-            text="Lasso1",
+            text=APP_NAME,
             font=("Segoe UI", 16, "bold"),
             anchor="w",
         ).pack(fill="x")
@@ -3279,7 +3339,11 @@ class ScreenAnswerApp:
             anchor="w",
         ).pack(fill="x", pady=(0, 10))
 
-        tk.Label(outer, text="OpenRouter model:", anchor="w").pack(fill="x")
+        tk.Label(
+            outer,
+            text="OpenRouter model (required; not prefilled):",
+            anchor="w",
+        ).pack(fill="x")
         self.model_var = tk.StringVar(value=self.model)
         tk.Entry(outer, textvariable=self.model_var, width=50).pack(fill="x", pady=(3, 10))
 
@@ -3574,13 +3638,13 @@ class ScreenAnswerApp:
             )
         except (OSError, ValueError) as exc:
             self.show_window()
-            self._show_error("Could not save the Lasso1 config file: %s" % exc)
+            self._show_error("Could not save the %s config file: %s" % (APP_NAME, exc))
             return False
 
         self.provider = self.form_provider = "openrouter"
         self.api_keys["openrouter"] = self.api_key = key
         self.models["openrouter"] = self.model = model
-        self.api_key_source = "Lasso1 config file"
+        self.api_key_source = "%s config file" % APP_NAME
         self.api_key_sources["openrouter"] = self.api_key_source
         self.privacy_acknowledged = allow_screenshot_uploads
         self.portable_config["provider"] = "openrouter"
@@ -3589,10 +3653,10 @@ class ScreenAnswerApp:
         self.portable_config["allow_screenshot_uploads"] = allow_screenshot_uploads
         self._config_has_key = True
         if allow_screenshot_uploads:
-            tooltip = "Lasso1 — ready; Ctrl+Alt+S to capture"
+            tooltip = "%s — ready; Ctrl+Alt+S to capture" % APP_NAME
             self.status_var.set("Saved. Ready — Ctrl+Alt+S captures the full desktop.")
         else:
-            tooltip = "Lasso1 — upload consent required; right-click and Open to review"
+            tooltip = "%s — upload consent required; right-click and Open to review" % APP_NAME
             self.status_var.set("Saved. Captures remain blocked until upload consent is enabled.")
         self.tray.set_state(NEUTRAL_RGB, tooltip)
         self.hide_window()
@@ -3694,7 +3758,7 @@ class ScreenAnswerApp:
             self._start_capture("settings button")
 
     def open_lasso1_config_folder(self) -> bool:
-        """Open the per-user folder containing Lasso1's editable config file."""
+        """Open the per-user folder containing the running Lasso config file."""
         if not self.lasso1_mode:
             return False
         folder = os.path.dirname(os.path.abspath(self.config_path))
@@ -3703,13 +3767,14 @@ class ScreenAnswerApp:
         except (AttributeError, OSError) as exc:
             self.tray.show_balloon(
                 APP_NAME,
-                "Could not open the Lasso1 config folder (%s)." % type(exc).__name__,
+                "Could not open the %s config folder (%s)."
+                % (APP_NAME, type(exc).__name__),
             )
             return False
         return True
 
     def open_lasso1_config_file(self) -> bool:
-        """Open Lasso1's per-user config in the user's default JSON/text editor."""
+        """Open the running Lasso app's per-user config in the default editor."""
         if not self.lasso1_mode:
             return False
         config_path = os.path.abspath(self.config_path)
@@ -3718,13 +3783,14 @@ class ScreenAnswerApp:
         except (AttributeError, OSError) as exc:
             self.tray.show_balloon(
                 APP_NAME,
-                "Could not open the Lasso1 config file (%s)." % type(exc).__name__,
+                "Could not open the %s config file (%s)."
+                % (APP_NAME, type(exc).__name__),
             )
             return False
         return True
 
     def _confirm_lasso1_self_destruct(self) -> bool:
-        """Ask for native Yes/No confirmation before deleting Lasso1's own files."""
+        """Ask for native Yes/No confirmation before deleting this Lasso build's files."""
         if not self.lasso1_mode:
             return False
         user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -3736,28 +3802,30 @@ class ScreenAnswerApp:
             ctypes.c_uint,
         ]
         message_box.restype = ctypes.c_int
+        config_directory = LASSV7_CONFIG_DIRECTORY if LASSOV7_MODE else LASSO1_CONFIG_DIRECTORY
         message = (
-            "This permanently deletes Lasso1.exe and Lasso1's config.json "
+            "This permanently deletes %s.exe and %s's config.json "
             "(including its saved OpenRouter key), then closes the app. "
-            "The Lasso1 folder is removed only if it is empty; other files are left alone.\n\n"
+            "The %s folder is removed only if it is empty; other files are left alone.\n\n"
             "This cannot be undone. Continue?"
-        )
+        ) % (APP_NAME, APP_NAME, config_directory)
         flags = 0x00000004 | 0x00000030 | 0x00000100 | 0x00010000 | 0x00040000
-        return message_box(None, message, "Confirm Lasso1 self-destruct", flags) == 6
+        return message_box(None, message, "Confirm %s self-destruct" % APP_NAME, flags) == 6
 
     def self_destruct(self) -> bool:
-        """Confirm, schedule deletion of Lasso1.exe/config.json, and exit."""
+        """Confirm, schedule deletion of the current Lasso executable and config, then exit."""
         if not self.lasso1_mode or not self._confirm_lasso1_self_destruct():
             return False
         if not schedule_lasso1_self_cleanup(sys.executable, self.config_path):
             self.tray.show_balloon(
                 APP_NAME,
-                "Cleanup could not be scheduled. Nothing was deleted; Lasso1 is still running.",
+                "Cleanup could not be scheduled. Nothing was deleted; %s is still running."
+                % APP_NAME,
             )
             return False
         self.tray.show_balloon(
             APP_NAME,
-            "Lasso1 is closing. Its EXE and config/key will be deleted shortly.",
+            "%s is closing. Its EXE and config/key will be deleted shortly." % APP_NAME,
         )
         self.exit_app()
         return True
@@ -3798,6 +3866,17 @@ class ScreenAnswerApp:
             else:
                 self.status_var.set("Set an API key and acknowledge the upload notice before capturing.")
                 self.show_window()
+            return
+
+        if self.lasso1_mode and (
+            not isinstance(getattr(self, "model", None), str) or not self.model.strip()
+        ):
+            self._log_diagnostic("Capture blocked: no OpenRouter model is configured.")
+            self.status_var.set("Right-click the tray icon and choose Open to enter an OpenRouter model.")
+            self.tray.show_balloon(
+                APP_NAME,
+                "Right-click the tray icon and choose Open to enter an OpenRouter model, then Save.",
+            )
             return
 
         self.busy = True
@@ -4059,12 +4138,28 @@ def main() -> int:
     if "--check-lasso1-build" in sys.argv[1:]:
         return 0 if (
             LASSO1_MODE
+            and not LASSOV7_MODE
             and APP_NAME == "Lasso1"
             and APP_DEFAULT_PROVIDER == "openrouter"
             and tuple(PROVIDER_LABELS) == ("openrouter",)
             and tuple(API_KEY_ENV_VARS) == ("openrouter",)
             and tuple(DEFAULT_MODELS) == ("openrouter",)
             and diagnostics_mode_enabled(("--diagnostics",), "Lasso1.exe") is False
+        ) else 1
+    if "--check-lassv7-build" in sys.argv[1:]:
+        return 0 if (
+            LASSO1_MODE
+            and LASSOV7_MODE
+            and APP_NAME == "LassV7"
+            and APP_DEFAULT_PROVIDER == "openrouter"
+            and tuple(PROVIDER_LABELS) == ("openrouter",)
+            and tuple(API_KEY_ENV_VARS) == ("openrouter",)
+            and tuple(DEFAULT_MODELS) == ("openrouter",)
+            and lasso_config_directory_for_executable("LassV7.exe")
+            == LASSV7_CONFIG_DIRECTORY
+            and sys.version_info[:3] == (3, 8, 10)
+            and struct.calcsize("P") == 4
+            and diagnostics_mode_enabled(("--diagnostics",), "LassV7.exe") is False
         ) else 1
     if os.name != "nt":
         print("%s runs on Windows 7/10 and later." % APP_NAME, file=sys.stderr)
