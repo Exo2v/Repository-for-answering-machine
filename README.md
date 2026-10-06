@@ -32,7 +32,7 @@ The `ScreenAnswer-Diagnostic.exe` release build opens a live diagnostics window 
 
 This is a diagnostic build of the real app, **not a simulation**: after consent and a capture hotkey/button, it captures the full desktop and sends the screenshot to Gemini just like the regular build. The diagnostics log intentionally excludes the API key, screenshot pixels, and raw Gemini response text. You can save or copy the log from the diagnostics window; review it before sharing. Screenshots are not written to disk.
 
-For a source run, use `python answer_tray.py --diagnostics`. Right-click the diagnostic build's tray icon and choose **Show diagnostics** if you close the window. Keep `ScreenAnswer.exe` for normal use; the diagnostic build is a separate test executable.
+For a source run, use `python answer_tray.py --diagnostics`. Right-click the diagnostic build's tray icon and choose **Show diagnostics** if you close the window. If you use the portable config sidecar, keep `ScreenAnswer-Diagnostic.exe` beside `screen_answer_config.json`; otherwise enter the key in its Settings window. Keep `ScreenAnswer.exe` for normal use; the diagnostic build is a separate test executable.
 
 ## Run from source
 
