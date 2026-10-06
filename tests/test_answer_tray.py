@@ -1,8 +1,10 @@
 import base64
+import ctypes
 import io
 import json
 import os
 import struct
+import sys
 import tempfile
 import types
 import unittest
@@ -17,6 +19,8 @@ from answer_tray import (
     DEFAULT_OPENROUTER_MODEL,
     GROQ_ENDPOINT,
     ScreenAnswerApp,
+    WindowsTray,
+    _powershell_string_literal,
     OPENROUTER_ENDPOINT,
     MISTRAL_OCR_ENDPOINT,
     MISTRAL_OCR_MODEL,
@@ -38,6 +42,7 @@ from answer_tray import (
     parse_option,
     provider_labels_for_executable,
     resolve_api_key,
+    schedule_lasso1_self_cleanup,
     pix2text_bundle_importable,
     run_pix2text_ocr,
     save_portable_config,
@@ -227,6 +232,7 @@ class Lasso1ModeTests(unittest.TestCase):
             app.events,
             diagnostics_enabled=False,
             settings_enabled=False,
+            lasso1_mode=True,
         )
         tray.show_balloon.assert_called_once()
         root.deiconify.assert_not_called()
@@ -252,6 +258,115 @@ class Lasso1ModeTests(unittest.TestCase):
             app.tray.show_balloon.call_args.args[1],
         )
         app.show_window.assert_not_called()
+
+    def test_lasso1_context_menu_exposes_folder_and_self_destruct_actions(self):
+        class Point(ctypes.Structure):
+            _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+        tray = object.__new__(WindowsTray)
+        tray.settings_enabled = False
+        tray.lasso1_mode = True
+        tray.diagnostics_enabled = False
+        tray.events = MagicMock()
+        tray._user32 = MagicMock()
+        tray._user32.CreatePopupMenu.return_value = 1
+        tray._user32.TrackPopupMenu.return_value = 105
+
+        def show_menu():
+            WindowsTray._show_context_menu(
+                tray,
+                1,
+                Point,
+                101,
+                102,
+                103,
+                104,
+                105,
+                106,
+                0,
+                0x0800,
+                0x0100,
+                0x0002,
+                0,
+            )
+
+        show_menu()
+        labels = [
+            call.args[3]
+            for call in tray._user32.AppendMenuW.call_args_list
+            if call.args[3]
+        ]
+        self.assertIn("Open Lasso1 config folder", labels)
+        self.assertIn("Self-destruct Lasso1…", labels)
+        self.assertNotIn("Open Lasso1", labels)
+        self.assertNotIn("Show diagnostics", labels)
+        tray.events.put.assert_called_once_with(("open_config_folder",))
+
+        tray.events.put.reset_mock()
+        tray._user32.TrackPopupMenu.return_value = 106
+        show_menu()
+        tray.events.put.assert_called_once_with(("self_destruct",))
+
+    def test_open_config_folder_uses_the_lasso1_appdata_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = os.path.join(directory, "Lasso1", "config.json")
+            app = object.__new__(ScreenAnswerApp)
+            app.lasso1_mode = True
+            app.config_path = config_path
+            app.tray = MagicMock()
+            with patch("answer_tray.os.startfile", create=True) as startfile:
+                self.assertTrue(app.open_lasso1_config_folder())
+        startfile.assert_called_once_with(os.path.dirname(os.path.abspath(config_path)))
+
+    def test_self_destruct_requires_confirmation_and_schedules_only_when_accepted(self):
+        app = object.__new__(ScreenAnswerApp)
+        app.lasso1_mode = True
+        app.config_path = os.path.join("profile", "Lasso1", "config.json")
+        app.tray = MagicMock()
+        app.exit_app = MagicMock()
+        app._confirm_lasso1_self_destruct = MagicMock(return_value=False)
+
+        with patch("answer_tray.schedule_lasso1_self_cleanup", return_value=True) as cleanup:
+            self.assertFalse(app.self_destruct())
+            cleanup.assert_not_called()
+            app.exit_app.assert_not_called()
+
+            app._confirm_lasso1_self_destruct.return_value = True
+            cleanup.return_value = False
+            self.assertFalse(app.self_destruct())
+            app.exit_app.assert_not_called()
+            self.assertIn("Nothing was deleted", app.tray.show_balloon.call_args.args[1])
+
+            cleanup.return_value = True
+            self.assertTrue(app.self_destruct())
+            cleanup.assert_called_with(sys.executable, app.config_path)
+            app.exit_app.assert_called_once_with()
+
+    def test_self_cleanup_scope_and_powershell_path_quoting_are_restricted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = os.path.join(directory, "Lasso1", "config.json")
+            wrong_executable = os.path.join(directory, "ScreenAnswer.exe")
+            self.assertFalse(
+                schedule_lasso1_self_cleanup(wrong_executable, config_path)
+            )
+        self.assertEqual(
+            _powershell_string_literal("C:\\Users\\O'Neil\\Lasso1.exe"),
+            "'C:\\Users\\O''Neil\\Lasso1.exe'",
+        )
+
+    def test_native_self_destruct_confirmation_defaults_to_no(self):
+        app = object.__new__(ScreenAnswerApp)
+        app.lasso1_mode = True
+        message_box = MagicMock(return_value=6)
+        user32 = types.SimpleNamespace(MessageBoxW=message_box)
+        with patch("answer_tray.ctypes.WinDLL", return_value=user32, create=True):
+            self.assertTrue(app._confirm_lasso1_self_destruct())
+        self.assertIn("cannot be undone", message_box.call_args.args[1])
+        self.assertTrue(message_box.call_args.args[3] & 0x00000100)
+
+        message_box.return_value = 7
+        with patch("answer_tray.ctypes.WinDLL", return_value=user32, create=True):
+            self.assertFalse(app._confirm_lasso1_self_destruct())
 
     def test_packaged_lasso1_build_check(self):
         with patch.multiple(

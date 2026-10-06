@@ -18,6 +18,7 @@ import os
 import queue
 import re
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -224,7 +225,97 @@ def ensure_lasso1_config(path: Optional[str] = None) -> bool:
     return True
 
 
+def _powershell_string_literal(value: str) -> str:
+    """Quote a value for a PowerShell single-quoted string literal."""
+    return "'" + value.replace("'", "''") + "'"
+
+
+def schedule_lasso1_self_cleanup(
+    executable_path: Optional[str] = None,
+    config_path: Optional[str] = None,
+) -> bool:
+    """Delete only Lasso1.exe and its config after this process exits."""
+    exe_path = os.path.abspath(executable_path or sys.executable)
+    saved_config_path = os.path.abspath(config_path or lasso1_config_path())
+    config_directory = os.path.dirname(saved_config_path)
+    if (
+        os.path.basename(exe_path).lower() != "lasso1.exe"
+        or os.path.basename(saved_config_path).lower() != LASSO1_CONFIG_FILENAME.lower()
+        or os.path.basename(config_directory).lower() != LASSO1_CONFIG_DIRECTORY.lower()
+    ):
+        return False
+    if os.name != "nt":
+        return False
+
+    system_root = os.environ.get("SystemRoot", r"C:\Windows")
+    powershell_path = os.path.join(
+        system_root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"
+    )
+    if not os.path.isfile(powershell_path):
+        return False
+
+    cleanup_script = """
+$ErrorActionPreference = 'SilentlyContinue'
+$exePath = %s
+$configPath = %s
+$configDirectory = %s
+Start-Sleep -Seconds 2
+for ($attempt = 0; $attempt -lt 60; $attempt++) {
+    if (-not (Test-Path -LiteralPath $exePath)) { break }
+    try {
+        Remove-Item -LiteralPath $exePath -Force -ErrorAction Stop
+        break
+    } catch {
+        Start-Sleep -Milliseconds 500
+    }
+}
+try {
+    if (Test-Path -LiteralPath $configPath) {
+        Remove-Item -LiteralPath $configPath -Force -ErrorAction Stop
+    }
+} catch {}
+try {
+    if (Test-Path -LiteralPath $configDirectory -PathType Container) {
+        $remaining = @(Get-ChildItem -LiteralPath $configDirectory -Force -ErrorAction SilentlyContinue)
+        if ($remaining.Count -eq 0) {
+            Remove-Item -LiteralPath $configDirectory -Force -ErrorAction SilentlyContinue
+        }
+    }
+} catch {}
+""" % (
+        _powershell_string_literal(exe_path),
+        _powershell_string_literal(saved_config_path),
+        _powershell_string_literal(config_directory),
+    )
+    try:
+        encoded_script = base64.b64encode(cleanup_script.encode("utf-16le")).decode("ascii")
+        startup_info = subprocess.STARTUPINFO()
+        startup_info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startup_info.wShowWindow = 0
+        subprocess.Popen(
+            [
+                powershell_path,
+                "-NoProfile",
+                "-NonInteractive",
+                "-WindowStyle",
+                "Hidden",
+                "-EncodedCommand",
+                encoded_script,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+            startupinfo=startup_info,
+        )
+    except (OSError, UnicodeError, AttributeError, ValueError, subprocess.SubprocessError):
+        return False
+    return True
+
+
 def _empty_portable_config() -> Dict[str, Any]:
+
     config = {
         "provider": APP_DEFAULT_PROVIDER,
         "api_keys": {},
@@ -2214,12 +2305,14 @@ class WindowsTray:
         events: "queue.Queue[Tuple[Any, ...]]",
         diagnostics_enabled: bool = False,
         settings_enabled: bool = True,
+        lasso1_mode: bool = False,
     ) -> None:
         if os.name != "nt":
             raise RuntimeError("Screen Answer is currently a Windows-only program.")
         self.events = events
         self.diagnostics_enabled = diagnostics_enabled
         self.settings_enabled = settings_enabled
+        self.lasso1_mode = lasso1_mode
         self.hwnd = None
         self._ready = threading.Event()
         self._lock = threading.RLock()
@@ -2288,6 +2381,8 @@ class WindowsTray:
         CMD_OPEN = 102
         CMD_EXIT = 103
         CMD_DIAGNOSTICS = 104
+        CMD_OPEN_CONFIG_FOLDER = 105
+        CMD_SELF_DESTRUCT = 106
         TRAY_UID = 1
 
         class GUID(ctypes.Structure):
@@ -2426,6 +2521,8 @@ class WindowsTray:
                         CMD_OPEN,
                         CMD_EXIT,
                         CMD_DIAGNOSTICS,
+                        CMD_OPEN_CONFIG_FOLDER,
+                        CMD_SELF_DESTRUCT,
                         MF_STRING,
                         MF_SEPARATOR,
                         TPM_RETURNCMD,
@@ -2562,6 +2659,8 @@ class WindowsTray:
         cmd_open: int,
         cmd_exit: int,
         cmd_diagnostics: int,
+        cmd_open_config_folder: int,
+        cmd_self_destruct: int,
         mf_string: int,
         mf_separator: int,
         tpm_returncmd: int,
@@ -2576,8 +2675,23 @@ class WindowsTray:
             user32.AppendMenuW(menu, mf_string, cmd_capture, "Capture and ask  (Ctrl+Alt+S)")
             if self.settings_enabled:
                 user32.AppendMenuW(menu, mf_string, cmd_open, "Open %s" % APP_NAME)
+            elif self.lasso1_mode:
+                user32.AppendMenuW(
+                    menu,
+                    mf_string,
+                    cmd_open_config_folder,
+                    "Open Lasso1 config folder",
+                )
             if self.diagnostics_enabled:
                 user32.AppendMenuW(menu, mf_string, cmd_diagnostics, "Show diagnostics")
+            if self.lasso1_mode:
+                user32.AppendMenuW(menu, mf_separator, 0, None)
+                user32.AppendMenuW(
+                    menu,
+                    mf_string,
+                    cmd_self_destruct,
+                    "Self-destruct Lasso1…",
+                )
             user32.AppendMenuW(menu, mf_separator, 0, None)
             user32.AppendMenuW(menu, mf_string, cmd_exit, "Exit  (Ctrl+Alt+Q)")
             point = point_type()
@@ -2596,6 +2710,10 @@ class WindowsTray:
                 self.events.put(("capture", "tray menu"))
             elif self.settings_enabled and selected == cmd_open:
                 self.events.put(("open",))
+            elif self.lasso1_mode and selected == cmd_open_config_folder:
+                self.events.put(("open_config_folder",))
+            elif self.lasso1_mode and selected == cmd_self_destruct:
+                self.events.put(("self_destruct",))
             elif self.diagnostics_enabled and selected == cmd_diagnostics:
                 self.events.put(("show_diagnostics",))
             elif selected == cmd_exit:
@@ -2873,6 +2991,7 @@ class ScreenAnswerApp:
             self.events,
             diagnostics_enabled=self.diagnostics_enabled,
             settings_enabled=not self.lasso1_mode,
+            lasso1_mode=self.lasso1_mode,
         )
         if not self.lasso1_mode:
             self._build_window()
@@ -3386,6 +3505,60 @@ class ScreenAnswerApp:
         if self.save_settings():
             self._start_capture("settings button")
 
+    def open_lasso1_config_folder(self) -> bool:
+        """Open the per-user folder containing Lasso1's editable config file."""
+        if not self.lasso1_mode:
+            return False
+        folder = os.path.dirname(os.path.abspath(self.config_path))
+        try:
+            os.startfile(folder)
+        except (AttributeError, OSError) as exc:
+            self.tray.show_balloon(
+                APP_NAME,
+                "Could not open the Lasso1 config folder (%s)." % type(exc).__name__,
+            )
+            return False
+        return True
+
+    def _confirm_lasso1_self_destruct(self) -> bool:
+        """Ask for native Yes/No confirmation before deleting Lasso1's own files."""
+        if not self.lasso1_mode:
+            return False
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        message_box = user32.MessageBoxW
+        message_box.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_wchar_p,
+            ctypes.c_wchar_p,
+            ctypes.c_uint,
+        ]
+        message_box.restype = ctypes.c_int
+        message = (
+            "This permanently deletes Lasso1.exe and Lasso1's config.json "
+            "(including its saved OpenRouter key), then closes the app. "
+            "The Lasso1 folder is removed only if it is empty; other files are left alone.\n\n"
+            "This cannot be undone. Continue?"
+        )
+        flags = 0x00000004 | 0x00000030 | 0x00000100 | 0x00010000 | 0x00040000
+        return message_box(None, message, "Confirm Lasso1 self-destruct", flags) == 6
+
+    def self_destruct(self) -> bool:
+        """Confirm, schedule deletion of Lasso1.exe/config.json, and exit."""
+        if not self.lasso1_mode or not self._confirm_lasso1_self_destruct():
+            return False
+        if not schedule_lasso1_self_cleanup(sys.executable, self.config_path):
+            self.tray.show_balloon(
+                APP_NAME,
+                "Cleanup could not be scheduled. Nothing was deleted; Lasso1 is still running.",
+            )
+            return False
+        self.tray.show_balloon(
+            APP_NAME,
+            "Lasso1 is closing. Its EXE and config/key will be deleted shortly.",
+        )
+        self.exit_app()
+        return True
+
     def _start_capture(self, trigger: str = "keyboard shortcut") -> None:
         self._log_diagnostic("Capture requested via %s." % trigger)
         if self.busy:
@@ -3619,6 +3792,11 @@ class ScreenAnswerApp:
                 elif kind == "open":
                     self._log_diagnostic("Settings window requested from the tray.")
                     self.show_window()
+                elif kind == "open_config_folder":
+                    self.open_lasso1_config_folder()
+                elif kind == "self_destruct":
+                    if self.self_destruct():
+                        return
                 elif kind == "show_diagnostics":
                     self.show_diagnostics()
                 elif kind == "exit":

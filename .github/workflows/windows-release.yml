@@ -184,10 +184,13 @@ jobs:
         with:
           name: lasso1
           generate_release_notes: false
+          overwrite_files: true
           body: |
             Lasso1 is a tray-only, OpenRouter-only Windows build.
 
             On first run, it creates `%APPDATA%\Lasso1\config.json`. Paste your OpenRouter API key into `api_keys.openrouter`, review the screenshot-upload notice, and set `allow_screenshot_uploads` to `true` only if you consent. Restart Lasso1 after editing the config. The key is never bundled in the executable.
 
             Capture uses Ctrl+Alt+S; the full virtual desktop is sent to OpenRouter only after explicit config-file consent. Web search and tool execution are disabled.
+
+            Right-click the tray icon to open the config folder or choose the confirmed self-destruct action, which schedules removal of Lasso1.exe and config.json after exit. Other files in the config folder are left untouched.
           files: release-assets/Lasso1.exe
