@@ -30,6 +30,29 @@ When **Pix2Text (local, experimental)** is selected, the app runs OCR on-device 
 
 API model names, availability, free access, quotas, and pricing can change; check the selected provider's account and documentation for current terms.
 
+## Lasso1 Windows release (OpenRouter-only)
+
+The separate [Lasso1 Windows release](https://github.com/Exo2v/Repository-for-answering-machine/releases/tag/lasso1) is a tray-only, OpenRouter-only variant; the standard Screen Answer releases above continue to include their existing providers. Lasso1 has no Settings or diagnostics windows. Its tray icon supports capture/exit actions, **Ctrl+Alt+S** captures, and the tray icon plus a colored Windows notification reports the answer. The default model is `google/gemini-3.8-flash`; no web-search plugin or tool execution is enabled.
+
+On first launch, Lasso1 creates `%APPDATA%\Lasso1\config.json`. Open that file in a text editor, paste a newly created OpenRouter key into the empty `api_keys.openrouter` value, save, and restart Lasso1. The key is read from this per-user config file only; it is not embedded in the EXE and Lasso1 does not read an API key from an environment variable. The JSON file is plain text, so keep it private and do not upload or share it.
+
+Screenshot upload is **off by default**. Lasso1 captures and sends the full virtual desktop/all monitors to OpenRouter only when the config explicitly contains `"allow_screenshot_uploads": true`. This is your opt-in to sending screenshot contents to the provider; review what is on screen and confirm that sharing it is permitted before changing the setting. For example, the first-run config includes:
+
+```json
+{
+  "provider": "openrouter",
+  "api_keys": {
+    "openrouter": ""
+  },
+  "models": {
+    "openrouter": "google/gemini-3.8-flash"
+  },
+  "allow_screenshot_uploads": false
+}
+```
+
+Set the key and, only after consenting, set the boolean to `true`; then restart the app for changes to take effect. When a key or consent is missing, capture is blocked and a tray notification points to the config file. The `lasso1` tag's Windows workflow builds and smoke-tests `Lasso1.exe` before publishing that separate release.
+
 ## Diagnostic test build
 
 The [updated `ScreenAnswer-Diagnostic.exe`](https://github.com/Exo2v/Repository-for-answering-machine/releases/download/v1.5.0-experimental/ScreenAnswer-Diagnostic.exe) opens a live diagnostics window at startup and includes OpenRouter alongside Gemini, Mistral, and Groq. It shows startup/configuration state, hotkey registration, capture size and timing, provider-specific HTTP attempts/statuses/retries and available rate-limit headers, API error details, response metadata, answer parsing, and the final tray result. For Mistral it shows the OCR API's first-page Markdown transcription when provider-default OCR is selected, or Pix2Text's local Markdown when local OCR is selected, along with the solver's final user-facing response; for Gemini, Groq, and OpenRouter it shows Pix2Text's local Markdown when enabled and the final model response. OpenRouter sends the screenshot directly to its vision chat endpoint and does not call a separate OCR endpoint or enable live search. Hidden reasoning fields are not displayed.
@@ -85,4 +108,4 @@ pyinstaller --noconfirm --onefile --windowed --name ScreenAnswer-Groq answer_tra
 
 The results are `dist/ScreenAnswer.exe`, `dist/ScreenAnswer-Diagnostic.exe`, and `dist/ScreenAnswer-Groq.exe`. The diagnostic variant opens live logs at startup; all standard variants support OpenRouter. The Groq variant starts with Groq selected and does not bundle Pix2Text or call a separate OCR service; it sends the image directly to Groq's vision chat API. For the best chance of Windows 7 compatibility, build with 32-bit Python 3.8.10 and test on Windows 7 SP1.
 
-The GitHub Actions workflow in `.github/workflows/windows-release.yml` builds all three standard 32-bit executables on each branch update and attaches them to version-tag releases. The updated diagnostic EXE is packaged and release-ready alongside the standard app and Groq variant. OpenRouter is a selectable provider in all standard builds; it sends screenshots directly to vision chat without Pix2Text or a hosted OCR call. The experimental x64 `ScreenAnswer-Pix2Text.exe` remains available in the [v1.3.0-experimental release](https://github.com/Exo2v/Repository-for-answering-machine/releases/download/v1.3.0-experimental/ScreenAnswer-Pix2Text.exe); it bundles the Python/OCR dependencies but downloads model weights on first use. That build targets Windows 10+ x64; the standard executables remain the Windows 7-compatible option. The workflow's separate Pix2Text build can be run via manual dispatch or an opt-in commit message containing `[pix2text-build]`; normal Groq/standard releases do not rebuild the large OCR bundle.
+The GitHub Actions workflow in `.github/workflows/windows-release.yml` builds all three standard 32-bit executables on each branch update and attaches them to `v*` version-tag releases. A separate `lasso1` tag builds, tests, smoke-checks, and publishes only `Lasso1.exe`; it does not attach the standard provider executables to that release. The updated diagnostic EXE is packaged and release-ready alongside the standard app and Groq variant. OpenRouter is a selectable provider in all standard builds; it sends screenshots directly to vision chat without Pix2Text or a hosted OCR call. The experimental x64 `ScreenAnswer-Pix2Text.exe` remains available in the [v1.3.0-experimental release](https://github.com/Exo2v/Repository-for-answering-machine/releases/download/v1.3.0-experimental/ScreenAnswer-Pix2Text.exe); it bundles the Python/OCR dependencies but downloads model weights on first use. That build targets Windows 10+ x64; the standard executables remain the Windows 7-compatible option. The workflow's separate Pix2Text build can be run via manual dispatch or an opt-in commit message containing `[pix2text-build]`; normal Groq/standard releases do not rebuild the large OCR bundle.

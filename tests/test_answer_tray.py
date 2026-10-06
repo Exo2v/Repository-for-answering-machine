@@ -16,6 +16,7 @@ from answer_tray import (
     DEFAULT_GROQ_MODEL,
     DEFAULT_OPENROUTER_MODEL,
     GROQ_ENDPOINT,
+    ScreenAnswerApp,
     OPENROUTER_ENDPOINT,
     MISTRAL_OCR_ENDPOINT,
     MISTRAL_OCR_MODEL,
@@ -28,9 +29,15 @@ from answer_tray import (
     ask_openrouter,
     default_provider_for_executable,
     diagnostics_mode_enabled,
+    ensure_lasso1_config,
+    is_lasso1_executable,
+    lasso1_config_path,
+    lasso1_config_template,
     main,
     load_portable_config,
     parse_option,
+    provider_labels_for_executable,
+    resolve_api_key,
     pix2text_bundle_importable,
     run_pix2text_ocr,
     save_portable_config,
@@ -45,6 +52,219 @@ class DiagnosticsModeTests(unittest.TestCase):
         )
         self.assertTrue(diagnostics_mode_enabled(("--diagnostics",), "python.exe"))
         self.assertFalse(diagnostics_mode_enabled((), "ScreenAnswer.exe"))
+
+
+class Lasso1ModeTests(unittest.TestCase):
+    def test_lasso1_executable_is_openrouter_only_and_never_enables_diagnostics(self):
+        self.assertTrue(is_lasso1_executable("Lasso1.exe"))
+        self.assertFalse(is_lasso1_executable("ScreenAnswer.exe"))
+        self.assertEqual(
+            provider_labels_for_executable("Lasso1.exe"),
+            {"openrouter": "OpenRouter"},
+        )
+        self.assertEqual(default_provider_for_executable("Lasso1.exe"), "openrouter")
+        self.assertFalse(diagnostics_mode_enabled(("--diagnostics",), "Lasso1.exe"))
+
+    def test_first_run_config_uses_per_user_folder_and_requires_upload_opt_in(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = lasso1_config_path(directory)
+            self.assertEqual(
+                path,
+                os.path.join(directory, "Lasso1", "config.json"),
+            )
+            self.assertTrue(ensure_lasso1_config(path))
+            with open(path, "r", encoding="utf-8") as config_file:
+                config = json.load(config_file)
+
+            self.assertEqual(config, lasso1_config_template())
+            self.assertEqual(config["provider"], "openrouter")
+            self.assertEqual(config["api_keys"], {"openrouter": ""})
+            self.assertEqual(
+                config["models"], {"openrouter": DEFAULT_OPENROUTER_MODEL}
+            )
+            self.assertIs(config["allow_screenshot_uploads"], False)
+            self.assertIn("newly rotated OpenRouter API key", config["_instructions"])
+
+            config["allow_screenshot_uploads"] = True
+            with open(path, "w", encoding="utf-8") as config_file:
+                json.dump(config, config_file)
+            self.assertFalse(ensure_lasso1_config(path))
+            with open(path, "r", encoding="utf-8") as config_file:
+                self.assertIs(json.load(config_file)["allow_screenshot_uploads"], True)
+
+    def test_config_loader_keeps_only_openrouter_and_requires_boolean_consent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "config.json")
+            with patch.multiple(
+                "answer_tray",
+                LASSO1_MODE=True,
+                APP_DEFAULT_PROVIDER="openrouter",
+                PROVIDER_LABELS={"openrouter": "OpenRouter"},
+            ):
+                with open(path, "w", encoding="utf-8") as config_file:
+                    json.dump(
+                        {
+                            "provider": "groq",
+                            "api_keys": {
+                                "openrouter": "config-key",
+                                "gemini": "ignored-key",
+                                "mistral": "ignored-key",
+                                "groq": "ignored-key",
+                            },
+                            "models": {
+                                "openrouter": DEFAULT_OPENROUTER_MODEL,
+                                "gemini": "ignored-model",
+                            },
+                            "allow_screenshot_uploads": True,
+                        },
+                        config_file,
+                    )
+                loaded = load_portable_config(path)
+                self.assertEqual(loaded["provider"], "openrouter")
+                self.assertEqual(loaded["api_keys"], {"openrouter": "config-key"})
+                self.assertEqual(
+                    loaded["models"],
+                    {"openrouter": DEFAULT_OPENROUTER_MODEL},
+                )
+                self.assertIs(loaded["allow_screenshot_uploads"], True)
+
+                with open(path, "w", encoding="utf-8") as config_file:
+                    json.dump(
+                        {"allow_screenshot_uploads": 1},
+                        config_file,
+                    )
+                self.assertIs(
+                    load_portable_config(path)["allow_screenshot_uploads"], False
+                )
+
+    def test_lasso1_uses_config_key_even_when_environment_key_exists(self):
+        configured_key, source = resolve_api_key(
+            "openrouter",
+            {"openrouter": "config-key"},
+            {"OPENROUTER_API_KEY": "environment-key"},
+            lasso1_mode=True,
+        )
+        self.assertEqual(configured_key, "config-key")
+        self.assertEqual(source, "Lasso1 config file")
+        self.assertEqual(
+            resolve_api_key(
+                "openrouter",
+                {},
+                {"OPENROUTER_API_KEY": "environment-key"},
+                lasso1_mode=True,
+            ),
+            ("", "not configured"),
+        )
+        self.assertEqual(
+            resolve_api_key(
+                "openrouter",
+                {"openrouter": "config-key"},
+                {"OPENROUTER_API_KEY": "environment-key"},
+                lasso1_mode=False,
+            ),
+            ("environment-key", "environment variable"),
+        )
+
+    def test_first_run_app_stays_tray_only_and_disables_diagnostics(self):
+        class FakeStringVar:
+            def __init__(self, value=""):
+                self.value = value
+
+            def set(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+        tkinter_module = types.ModuleType("tkinter")
+        tkinter_module.StringVar = FakeStringVar
+        root = MagicMock()
+        tray = MagicMock()
+
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = os.path.join(directory, "Lasso1", "config.json")
+            os.makedirs(os.path.dirname(config_path))
+            with open(config_path, "w", encoding="utf-8") as config_file:
+                json.dump(
+                    {
+                        "provider": "openrouter",
+                        "api_keys": {"openrouter": "config-key"},
+                        "models": {"openrouter": DEFAULT_OPENROUTER_MODEL},
+                        "allow_screenshot_uploads": False,
+                    },
+                    config_file,
+                )
+            with patch.multiple(
+                "answer_tray",
+                LASSO1_MODE=True,
+                APP_NAME="Lasso1",
+                APP_VERSION="lasso1",
+                APP_DEFAULT_PROVIDER="openrouter",
+                PROVIDER_LABELS={"openrouter": "OpenRouter"},
+                API_KEY_ENV_VARS={"openrouter": "OPENROUTER_API_KEY"},
+                DEFAULT_MODELS={"openrouter": DEFAULT_OPENROUTER_MODEL},
+            ):
+                with patch("answer_tray.portable_config_path", return_value=config_path):
+                    with patch("answer_tray.diagnostics_mode_enabled", return_value=True):
+                        with patch("answer_tray.WindowsTray", return_value=tray) as tray_class:
+                            with patch.object(ScreenAnswerApp, "_build_window") as build_window:
+                                with patch.dict(
+                                    "sys.modules", {"tkinter": tkinter_module}
+                                ):
+                                    with patch.dict(
+                                        os.environ,
+                                        {"OPENROUTER_API_KEY": "environment-key"},
+                                    ):
+                                        app = ScreenAnswerApp(root)
+
+        self.assertEqual(app.provider, "openrouter")
+        self.assertEqual(app.api_key, "config-key")
+        self.assertEqual(app.api_key_source, "Lasso1 config file")
+        self.assertFalse(app.privacy_acknowledged)
+        self.assertFalse(app.diagnostics_enabled)
+        build_window.assert_not_called()
+        tray_class.assert_called_once_with(
+            app.events,
+            diagnostics_enabled=False,
+            settings_enabled=False,
+        )
+        tray.show_balloon.assert_called_once()
+        root.deiconify.assert_not_called()
+
+    def test_capture_is_blocked_until_config_consent_is_true(self):
+        app = object.__new__(ScreenAnswerApp)
+        app.lasso1_mode = True
+        app.busy = False
+        app.api_key = "config-key"
+        app.privacy_acknowledged = False
+        app.provider = "openrouter"
+        app.status_var = MagicMock()
+        app.tray = MagicMock()
+        app._log_diagnostic = MagicMock()
+        app.show_window = MagicMock()
+
+        app._start_capture("test")
+
+        self.assertFalse(app.busy)
+        app.tray.show_balloon.assert_called_once()
+        self.assertIn(
+            "allow_screenshot_uploads",
+            app.tray.show_balloon.call_args.args[1],
+        )
+        app.show_window.assert_not_called()
+
+    def test_packaged_lasso1_build_check(self):
+        with patch.multiple(
+            "answer_tray",
+            LASSO1_MODE=True,
+            APP_NAME="Lasso1",
+            APP_DEFAULT_PROVIDER="openrouter",
+            PROVIDER_LABELS={"openrouter": "OpenRouter"},
+            API_KEY_ENV_VARS={"openrouter": "OPENROUTER_API_KEY"},
+            DEFAULT_MODELS={"openrouter": DEFAULT_OPENROUTER_MODEL},
+        ):
+            with patch("sys.argv", ["Lasso1.exe", "--check-lasso1-build"]):
+                self.assertEqual(main(), 0)
 
 
 class Pix2TextOCRTests(unittest.TestCase):

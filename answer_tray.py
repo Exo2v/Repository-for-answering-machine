@@ -28,8 +28,6 @@ import zlib
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Optional, Tuple
 
-APP_NAME = "Screen Answer"
-APP_VERSION = "1.5.0-experimental"
 DEFAULT_MODEL = "gemini-3.8-flash"
 DEFAULT_MISTRAL_MODEL = "mistral-medium-latest"
 DEFAULT_GROQ_MODEL = "qwen/qwen3.8-27b"
@@ -40,25 +38,58 @@ DEFAULT_PROVIDER = "gemini"
 _DEFAULT_EXE_NAME = os.path.splitext(os.path.basename(sys.executable))[0].lower()
 
 
+def is_lasso1_executable(executable_name: Optional[str] = None) -> bool:
+    """Identify the OpenRouter-only, tray-only Lasso1 package by its file name."""
+    name = executable_name or sys.executable
+    name = os.path.splitext(os.path.basename(name))[0].lower()
+    return name == "lasso1"
+
+
+LASSO1_MODE = is_lasso1_executable()
+APP_NAME = "Lasso1" if LASSO1_MODE else "Screen Answer"
+APP_VERSION = "lasso1" if LASSO1_MODE else "1.5.0-experimental"
+
+
 def default_provider_for_executable(executable_name: str) -> str:
-    """Use Groq by default in its dedicated executable variant."""
+    """Select the dedicated provider for a named executable variant."""
     name = os.path.splitext(os.path.basename(executable_name))[0].lower()
+    if name == "lasso1":
+        return "openrouter"
     return "groq" if "groq" in name else DEFAULT_PROVIDER
 
 
 APP_DEFAULT_PROVIDER = default_provider_for_executable(sys.executable)
 DEFAULT_OCR_BACKEND = "pix2text" if "pix2text" in _DEFAULT_EXE_NAME else "provider"
-PROVIDER_LABELS = {
+_ALL_PROVIDER_LABELS = {
     "gemini": "Google Gemini",
     "mistral": "Mistral",
     "groq": "Groq",
     "openrouter": "OpenRouter",
 }
-API_KEY_ENV_VARS = {
+_ALL_API_KEY_ENV_VARS = {
     "gemini": "GEMINI_API_KEY",
     "mistral": "MISTRAL_API_KEY",
     "groq": "GROQ_API_KEY",
     "openrouter": "OPENROUTER_API_KEY",
+}
+_ALL_DEFAULT_MODELS = {
+    "gemini": DEFAULT_MODEL,
+    "mistral": DEFAULT_MISTRAL_MODEL,
+    "groq": DEFAULT_GROQ_MODEL,
+    "openrouter": DEFAULT_OPENROUTER_MODEL,
+}
+
+
+def provider_labels_for_executable(executable_name: str) -> Dict[str, str]:
+    """Expose only OpenRouter in the dedicated Lasso1 build."""
+    if is_lasso1_executable(executable_name):
+        return {"openrouter": _ALL_PROVIDER_LABELS["openrouter"]}
+    return dict(_ALL_PROVIDER_LABELS)
+
+
+PROVIDER_LABELS = provider_labels_for_executable(sys.executable)
+API_KEY_ENV_VARS = {
+    provider: _ALL_API_KEY_ENV_VARS[provider] for provider in PROVIDER_LABELS
 }
 PROVIDER_BY_LABEL = {label: provider for provider, label in PROVIDER_LABELS.items()}
 OCR_BACKEND_LABELS = {
@@ -66,12 +97,7 @@ OCR_BACKEND_LABELS = {
     "pix2text": "Pix2Text (local, experimental)",
 }
 OCR_BACKEND_BY_LABEL = {label: backend for backend, label in OCR_BACKEND_LABELS.items()}
-DEFAULT_MODELS = {
-    "gemini": DEFAULT_MODEL,
-    "mistral": DEFAULT_MISTRAL_MODEL,
-    "groq": DEFAULT_GROQ_MODEL,
-    "openrouter": DEFAULT_OPENROUTER_MODEL,
-}
+DEFAULT_MODELS = {provider: _ALL_DEFAULT_MODELS[provider] for provider in PROVIDER_LABELS}
 
 
 def valid_model_name(provider: str, model: str) -> bool:
@@ -120,6 +146,8 @@ MAX_OCR_CONTEXT_CHARS = 48_000
 MAX_DIAGNOSTIC_TEXT_CHARS = 16_000
 RETRYABLE_HTTP_STATUSES = (500, 502, 503, 504)
 PORTABLE_CONFIG_NAME = "screen_answer_config.json"
+LASSO1_CONFIG_DIRECTORY = "Lasso1"
+LASSO1_CONFIG_FILENAME = "config.json"
 _PIX2TEXT_ENGINE: Any = None
 _PIX2TEXT_ENGINE_LOCK = threading.RLock()
 
@@ -131,6 +159,8 @@ def diagnostics_mode_enabled(
     """Return true for the diagnostic build or an explicit source-run flag."""
     arguments = tuple(sys.argv[1:] if argv is None else argv)
     executable_path = executable or sys.executable
+    if is_lasso1_executable(executable_path):
+        return False
     executable_name = os.path.splitext(os.path.basename(executable_path))[0].lower()
     return "--diagnostics" in arguments or executable_name.endswith("-diagnostic")
 
@@ -145,13 +175,65 @@ def _queue_diagnostic_event(
         events.put(("diagnostic", time.strftime("%Y-%m-%d %H:%M:%S"), str(message)))
 
 
+def lasso1_config_path(app_data_root: Optional[str] = None) -> str:
+    """Return the per-user AppData path for Lasso1's editable, unbundled config."""
+    root = app_data_root or os.environ.get("APPDATA") or os.environ.get("LOCALAPPDATA")
+    if not root:
+        root = os.path.expanduser("~")
+    return os.path.join(root, LASSO1_CONFIG_DIRECTORY, LASSO1_CONFIG_FILENAME)
+
+
 def portable_config_path() -> str:
-    """Return the config sidecar path beside the script or packaged executable."""
+    """Return the provider config path beside the app or in Lasso1's AppData folder."""
+    if LASSO1_MODE:
+        return lasso1_config_path()
     if getattr(sys, "frozen", False):
         app_directory = os.path.dirname(os.path.abspath(sys.executable))
     else:
         app_directory = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(app_directory, PORTABLE_CONFIG_NAME)
+
+
+def lasso1_config_template() -> Dict[str, Any]:
+    """Return a key-free, OpenRouter-only first-run config and explicit upload opt-in."""
+    return {
+        "provider": "openrouter",
+        "api_keys": {"openrouter": ""},
+        "models": {"openrouter": DEFAULT_OPENROUTER_MODEL},
+        "allow_screenshot_uploads": False,
+        "_instructions": (
+            "Paste a newly rotated OpenRouter API key into api_keys.openrouter. "
+            "Set allow_screenshot_uploads to true only if you consent to sending the full "
+            "desktop screenshot to OpenRouter. This file is plain text; keep it private."
+        ),
+    }
+
+
+def ensure_lasso1_config(path: Optional[str] = None) -> bool:
+    """Create Lasso1's AppData folder and empty config on first run; never overwrite."""
+    config_path = path or lasso1_config_path()
+    directory = os.path.dirname(os.path.abspath(config_path))
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    try:
+        with open(config_path, "x", encoding="utf-8") as config_file:
+            json.dump(lasso1_config_template(), config_file, indent=2)
+            config_file.write("\n")
+    except FileExistsError:
+        return False
+    return True
+
+
+def _empty_portable_config() -> Dict[str, Any]:
+    config = {
+        "provider": APP_DEFAULT_PROVIDER,
+        "api_keys": {},
+        "models": {},
+        "ocr_backend": DEFAULT_OCR_BACKEND,
+    }
+    if LASSO1_MODE:
+        config["allow_screenshot_uploads"] = False
+    return config
 
 
 def load_portable_config(path: Optional[str] = None) -> Dict[str, Any]:
@@ -161,19 +243,9 @@ def load_portable_config(path: Optional[str] = None) -> Dict[str, Any]:
         with open(config_path, "r", encoding="utf-8") as config_file:
             raw_config = json.load(config_file)
     except (OSError, ValueError):
-        return {
-            "provider": APP_DEFAULT_PROVIDER,
-            "api_keys": {},
-            "models": {},
-            "ocr_backend": DEFAULT_OCR_BACKEND,
-        }
+        return _empty_portable_config()
     if not isinstance(raw_config, dict):
-        return {
-            "provider": APP_DEFAULT_PROVIDER,
-            "api_keys": {},
-            "models": {},
-            "ocr_backend": DEFAULT_OCR_BACKEND,
-        }
+        return _empty_portable_config()
 
     # Keep migrating pre-provider Gemini-only config files as Gemini, even when
     # the app was started through the dedicated Groq-default executable.
@@ -223,12 +295,38 @@ def load_portable_config(path: Optional[str] = None) -> Dict[str, Any]:
     if not isinstance(ocr_backend, str) or ocr_backend not in OCR_BACKEND_LABELS:
         ocr_backend = DEFAULT_OCR_BACKEND
 
-    return {
+    config = {
         "provider": provider,
         "api_keys": api_keys,
         "models": models,
         "ocr_backend": ocr_backend,
     }
+    if LASSO1_MODE:
+        config["allow_screenshot_uploads"] = raw_config.get("allow_screenshot_uploads") is True
+    return config
+
+
+def resolve_api_key(
+    provider: str,
+    stored_keys: Dict[str, Any],
+    environment: Optional[Dict[str, str]] = None,
+    lasso1_mode: Optional[bool] = None,
+) -> Tuple[str, str]:
+    """Resolve a key and source; Lasso1 deliberately ignores environment keys."""
+    use_lasso1_rules = LASSO1_MODE if lasso1_mode is None else lasso1_mode
+    saved_key = stored_keys.get(provider, "")
+    if not isinstance(saved_key, str):
+        saved_key = ""
+    saved_key = saved_key.strip()
+    if use_lasso1_rules:
+        return (saved_key, "Lasso1 config file" if saved_key else "not configured")
+
+    env = os.environ if environment is None else environment
+    env_name = API_KEY_ENV_VARS.get(provider)
+    environment_key = env.get(env_name, "").strip() if env_name else ""
+    if environment_key:
+        return environment_key, "environment variable"
+    return (saved_key, "portable config sidecar" if saved_key else "not configured")
 
 
 def save_portable_config(
@@ -2115,11 +2213,13 @@ class WindowsTray:
         self,
         events: "queue.Queue[Tuple[Any, ...]]",
         diagnostics_enabled: bool = False,
+        settings_enabled: bool = True,
     ) -> None:
         if os.name != "nt":
             raise RuntimeError("Screen Answer is currently a Windows-only program.")
         self.events = events
         self.diagnostics_enabled = diagnostics_enabled
+        self.settings_enabled = settings_enabled
         self.hwnd = None
         self._ready = threading.Event()
         self._lock = threading.RLock()
@@ -2308,8 +2408,15 @@ class WindowsTray:
                     return 0
             elif message == WM_TRAY:
                 event = int(lparam) & 0xFFFF
-                if event in (WM_LBUTTONUP, WM_LBUTTONDBLCLK):
-                    self.events.put(("open",))
+                if event == WM_LBUTTONUP:
+                    if self.settings_enabled:
+                        self.events.put(("open",))
+                    return 0
+                if event == WM_LBUTTONDBLCLK:
+                    if self.settings_enabled:
+                        self.events.put(("open",))
+                    else:
+                        self.events.put(("capture", "tray icon"))
                     return 0
                 if event in (WM_RBUTTONUP, WM_CONTEXTMENU):
                     self._show_context_menu(
@@ -2394,7 +2501,7 @@ class WindowsTray:
         self._nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
         self._nid.uCallbackMessage = WM_TRAY
         self._nid.hIcon = self._create_icon(NEUTRAL_RGB)
-        self._nid.szTip = "Screen Answer — ready"
+        self._nid.szTip = "%s — ready" % APP_NAME
         if not shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(self._nid)):
             error_code = ctypes.get_last_error()
             _queue_diagnostic_event(
@@ -2467,7 +2574,8 @@ class WindowsTray:
             return
         try:
             user32.AppendMenuW(menu, mf_string, cmd_capture, "Capture and ask  (Ctrl+Alt+S)")
-            user32.AppendMenuW(menu, mf_string, cmd_open, "Open Screen Answer")
+            if self.settings_enabled:
+                user32.AppendMenuW(menu, mf_string, cmd_open, "Open %s" % APP_NAME)
             if self.diagnostics_enabled:
                 user32.AppendMenuW(menu, mf_string, cmd_diagnostics, "Show diagnostics")
             user32.AppendMenuW(menu, mf_separator, 0, None)
@@ -2486,7 +2594,7 @@ class WindowsTray:
             )
             if selected == cmd_capture:
                 self.events.put(("capture", "tray menu"))
-            elif selected == cmd_open:
+            elif self.settings_enabled and selected == cmd_open:
                 self.events.put(("open",))
             elif self.diagnostics_enabled and selected == cmd_diagnostics:
                 self.events.put(("show_diagnostics",))
@@ -2680,6 +2788,7 @@ class ScreenAnswerApp:
     def __init__(self, root: Any) -> None:
         import tkinter as tk
 
+        self.lasso1_mode = LASSO1_MODE
         self.root = root
         self.root.withdraw()
         self.root.title(APP_NAME)
@@ -2687,13 +2796,18 @@ class ScreenAnswerApp:
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
 
         self.events: "queue.Queue[Tuple[Any, ...]]" = queue.Queue()
-        self.diagnostics_enabled = diagnostics_mode_enabled()
+        self.diagnostics_enabled = diagnostics_mode_enabled() and not self.lasso1_mode
         self.diagnostic_lines = []
         self.diagnostics_window = None
         self.diagnostics_text = None
         self.diagnostics_status_var = None
+        self.api_entry = None
+        self.privacy_var = None
+        self.status_var = tk.StringVar(value="Lasso1 is starting." if self.lasso1_mode else "Ready.")
 
         self.config_path = portable_config_path()
+        if self.lasso1_mode:
+            ensure_lasso1_config(self.config_path)
         self.portable_config = load_portable_config(self.config_path)
         stored_keys = self.portable_config.get("api_keys", {})
         stored_models = self.portable_config.get("models", {})
@@ -2702,20 +2816,21 @@ class ScreenAnswerApp:
         self.models: Dict[str, str] = {}
         self.api_key_sources: Dict[str, str] = {}
         for provider in PROVIDER_LABELS:
-            environment_key = os.environ.get(API_KEY_ENV_VARS[provider], "").strip()
-            saved_key = stored_keys.get(provider, "")
-            self.api_keys[provider] = environment_key or saved_key
-            if environment_key:
-                self.api_key_sources[provider] = "environment variable"
-            elif saved_key:
-                self.api_key_sources[provider] = "portable config sidecar"
-            else:
-                self.api_key_sources[provider] = "not configured"
+            # Lasso1 intentionally reads its sole credential from the editable
+            # per-user config file, never from the EXE or process environment.
+            self.api_keys[provider], self.api_key_sources[provider] = resolve_api_key(
+                provider,
+                stored_keys,
+                lasso1_mode=self.lasso1_mode,
+            )
             self.models[provider] = stored_models.get(provider, DEFAULT_MODELS[provider])
 
-        self.provider = self.portable_config.get("provider", APP_DEFAULT_PROVIDER)
-        if self.provider not in PROVIDER_LABELS:
-            self.provider = APP_DEFAULT_PROVIDER
+        if self.lasso1_mode:
+            self.provider = "openrouter"
+        else:
+            self.provider = self.portable_config.get("provider", APP_DEFAULT_PROVIDER)
+            if self.provider not in PROVIDER_LABELS:
+                self.provider = APP_DEFAULT_PROVIDER
         self.form_provider = self.provider
         self.ocr_backend = self.portable_config.get("ocr_backend", DEFAULT_OCR_BACKEND)
         if self.ocr_backend not in OCR_BACKEND_LABELS:
@@ -2724,14 +2839,18 @@ class ScreenAnswerApp:
         self.api_key = self.api_keys[self.provider]
         self.api_key_source = self.api_key_sources[self.provider]
         self.model = self.models[self.provider]
-        self.privacy_acknowledged = False
+        self.privacy_acknowledged = (
+            self.portable_config.get("allow_screenshot_uploads", False) is True
+            if self.lasso1_mode
+            else False
+        )
         self.busy = False
         self._result_generation = 0
         self._fade_job: Optional[str] = None
 
         self._log_diagnostic(
-            "Starting Screen Answer %s%s."
-            % (APP_VERSION, " diagnostic build" if self.diagnostics_enabled else "")
+            "Starting %s %s%s."
+            % (APP_NAME, APP_VERSION, " diagnostic build" if self.diagnostics_enabled else "")
         )
         self._log_diagnostic(
             "Runtime: Python %s, %d-bit process."
@@ -2746,12 +2865,40 @@ class ScreenAnswerApp:
             % OCR_BACKEND_LABELS[self.ocr_backend]
         )
         self._log_diagnostic(
-            "Upload consent is not yet active; captures remain blocked until acknowledged in Settings."
+            "Upload consent is active." if self.privacy_acknowledged else
+            "Upload consent is not yet active; captures remain blocked."
         )
 
-        self.tray = WindowsTray(self.events, diagnostics_enabled=self.diagnostics_enabled)
-        self._build_window()
-        self.tray.set_state(NEUTRAL_RGB, "Screen Answer — ready; Ctrl+Alt+S to capture")
+        self.tray = WindowsTray(
+            self.events,
+            diagnostics_enabled=self.diagnostics_enabled,
+            settings_enabled=not self.lasso1_mode,
+        )
+        if not self.lasso1_mode:
+            self._build_window()
+        if self.lasso1_mode:
+            if not self.api_key:
+                tooltip = "Lasso1 — add OpenRouter key in config"
+                self.tray.show_balloon(
+                    APP_NAME,
+                    "Paste a newly rotated key into api_keys.openrouter in %s, then restart."
+                    % self.config_path,
+                )
+            elif not self.privacy_acknowledged:
+                tooltip = "Lasso1 — upload consent required in config"
+                self.tray.show_balloon(
+                    APP_NAME,
+                    "Review the upload notice in config.json and set allow_screenshot_uploads to true, then restart.",
+                )
+            else:
+                tooltip = "Lasso1 — ready; Ctrl+Alt+S to capture"
+                self.tray.show_balloon(
+                    APP_NAME,
+                    "Ready. Ctrl+Alt+S captures the full desktop and sends it to OpenRouter.",
+                )
+        else:
+            tooltip = "%s — ready; Ctrl+Alt+S to capture" % APP_NAME
+        self.tray.set_state(NEUTRAL_RGB, tooltip)
         self._log_diagnostic("Application ready; tray icon initialized.")
         self.root.after(100, self._poll_events)
         if self.diagnostics_enabled:
@@ -3127,6 +3274,8 @@ class ScreenAnswerApp:
             )
 
     def show_window(self) -> None:
+        if self.lasso1_mode:
+            return
         self.root.deiconify()
         self.root.lift()
         self.root.focus_force()
@@ -3139,6 +3288,12 @@ class ScreenAnswerApp:
         self.root.withdraw()
 
     def save_settings(self) -> bool:
+        if self.lasso1_mode:
+            self.tray.show_balloon(
+                APP_NAME,
+                "Settings are managed in %s; restart Lasso1 after editing." % self.config_path,
+            )
+            return False
         self._remember_form_settings()
         provider = self.form_provider
         provider_label = PROVIDER_LABELS[provider]
@@ -3224,7 +3379,7 @@ class ScreenAnswerApp:
             % (provider_label, model, OCR_BACKEND_LABELS[ocr_backend], self.api_key_source)
         )
         self.status_var.set(save_message + " Press Ctrl+Alt+S to capture.")
-        self.tray.set_state(NEUTRAL_RGB, "Screen Answer — ready; Ctrl+Alt+S to capture")
+        self.tray.set_state(NEUTRAL_RGB, "%s — ready; Ctrl+Alt+S to capture" % APP_NAME)
         self.hide_window()
         return True
     def save_and_capture(self) -> None:
@@ -3242,14 +3397,32 @@ class ScreenAnswerApp:
                 "Capture blocked: no %s API key is configured." % PROVIDER_LABELS[self.provider]
             )
             self.privacy_acknowledged = False
-            self.status_var.set("Set an API key and acknowledge the upload notice before capturing.")
-            self.show_window()
+            if self.lasso1_mode:
+                self.status_var.set("Add an OpenRouter key in config.json, then restart.")
+                self.tray.show_balloon(
+                    APP_NAME,
+                    "Add your newly rotated OpenRouter key to %s, then restart."
+                    % self.config_path,
+                )
+            else:
+                self.status_var.set("Set an API key and acknowledge the upload notice before capturing.")
+                self.show_window()
             return
-        if not self.privacy_acknowledged or not self.privacy_var.get():
+        upload_consent_active = self.privacy_acknowledged
+        if not self.lasso1_mode:
+            upload_consent_active = upload_consent_active and self.privacy_var.get()
+        if not upload_consent_active:
             self._log_diagnostic("Capture blocked: full-screen upload consent is not active.")
             self.privacy_acknowledged = False
-            self.status_var.set("Set an API key and acknowledge the upload notice before capturing.")
-            self.show_window()
+            if self.lasso1_mode:
+                self.status_var.set("Enable upload consent in config.json, then restart.")
+                self.tray.show_balloon(
+                    APP_NAME,
+                    "Review config.json and set allow_screenshot_uploads to true only if you consent, then restart.",
+                )
+            else:
+                self.status_var.set("Set an API key and acknowledge the upload notice before capturing.")
+                self.show_window()
             return
 
         self.busy = True
@@ -3266,7 +3439,7 @@ class ScreenAnswerApp:
         self.status_var.set("Capturing the full desktop and sending it to %s…" % provider_label)
         # The tooltip changes immediately. The balloon is shown only after the
         # screenshot is captured so it cannot cover part of the user's screen.
-        self.tray.set_state(NEUTRAL_RGB, "Screen Answer — capturing desktop for %s" % provider_label)
+        self.tray.set_state(NEUTRAL_RGB, "%s — capturing desktop for %s" % (APP_NAME, provider_label))
         self._log_diagnostic(
             "Background worker starting; capture includes all connected monitors; provider=%s; "
             "OCR backend=%s."
@@ -3385,7 +3558,7 @@ class ScreenAnswerApp:
 
         if option not in OPTION_RGB:
             self._log_diagnostic("Final result: no reliable multiple-choice option was recognized.")
-            self.tray.set_state(NEUTRAL_RGB, "Screen Answer — neutral; no reliable answer")
+            self.tray.set_state(NEUTRAL_RGB, "%s — neutral; no reliable answer" % APP_NAME)
             self.tray.show_balloon(APP_NAME, "No reliable answer found; the tray icon is grey.")
             self.status_var.set("Neutral — no reliable answer. The tray icon is grey.")
             return
@@ -3393,7 +3566,7 @@ class ScreenAnswerApp:
         name = OPTION_NAMES[option]
         color = OPTION_RGB[option]
         self._log_diagnostic("Final result: option %d (%s); tray icon updated." % (option, name))
-        self.tray.set_state(color, "Screen Answer — Option %d (%s)" % (option, name))
+        self.tray.set_state(color, "%s — Option %d (%s)" % (APP_NAME, option, name))
         self.tray.show_balloon(APP_NAME, "Option %d — %s" % (option, name))
         self.status_var.set("Option %d — %s. It will fade to grey after 10 seconds." % (option, name))
         self._fade_job = self.root.after(
@@ -3405,7 +3578,7 @@ class ScreenAnswerApp:
         if generation != self._result_generation or option not in OPTION_RGB:
             return
         if step > FADE_STEPS:
-            self.tray.set_state(NEUTRAL_RGB, "Screen Answer — ready; Ctrl+Alt+S to capture")
+            self.tray.set_state(NEUTRAL_RGB, "%s — ready; Ctrl+Alt+S to capture" % APP_NAME)
             self.status_var.set("Ready — the previous answer has faded to grey.")
             self._fade_job = None
             return
@@ -3415,7 +3588,7 @@ class ScreenAnswerApp:
             int(round(channel * (1.0 - amount) + grey * amount))
             for channel, grey in zip(start, NEUTRAL_RGB)
         )
-        self.tray.set_state(color, "Screen Answer — Option %d fading to grey" % option)
+        self.tray.set_state(color, "%s — Option %d fading to grey" % (APP_NAME, option))
         self._fade_job = self.root.after(
             FADE_INTERVAL_MS,
             lambda: self._fade_step(option, generation, step + 1),
@@ -3459,7 +3632,7 @@ class ScreenAnswerApp:
                 elif kind == "failure":
                     self._log_diagnostic("Request failed: %s" % event[1])
                     self.busy = False
-                    self.tray.set_state(NEUTRAL_RGB, "Screen Answer — request failed; neutral")
+                    self.tray.set_state(NEUTRAL_RGB, "%s — request failed; neutral" % APP_NAME)
                     self.tray.show_balloon(APP_NAME, event[1][:200])
                     self.status_var.set("Request failed — " + event[1])
                 elif kind == "hotkey_error":
@@ -3470,8 +3643,11 @@ class ScreenAnswerApp:
                     )
                 elif kind == "fatal":
                     self._log_diagnostic("Fatal tray error: %s" % event[1])
-                    self.show_window()
-                    self._show_error(event[1])
+                    if self.lasso1_mode:
+                        self.tray.show_balloon(APP_NAME, event[1][:200])
+                    else:
+                        self.show_window()
+                        self._show_error(event[1])
                     self.exit_app()
                     return
         except queue.Empty:
@@ -3498,8 +3674,18 @@ def main() -> int:
             and valid_model_name("openrouter", DEFAULT_OPENROUTER_MODEL)
             and OPENROUTER_ENDPOINT == "https://openrouter.ai/api/v1/chat/completions"
         ) else 1
+    if "--check-lasso1-build" in sys.argv[1:]:
+        return 0 if (
+            LASSO1_MODE
+            and APP_NAME == "Lasso1"
+            and APP_DEFAULT_PROVIDER == "openrouter"
+            and tuple(PROVIDER_LABELS) == ("openrouter",)
+            and tuple(API_KEY_ENV_VARS) == ("openrouter",)
+            and tuple(DEFAULT_MODELS) == ("openrouter",)
+            and diagnostics_mode_enabled(("--diagnostics",), "Lasso1.exe") is False
+        ) else 1
     if os.name != "nt":
-        print("Screen Answer runs on Windows 7/10 and later.", file=sys.stderr)
+        print("%s runs on Windows 7/10 and later." % APP_NAME, file=sys.stderr)
         return 1
     # Set this before Tk creates a window so screenshot coordinates match the
     # actual virtual-desktop pixel dimensions (including on scaled displays).
@@ -3521,12 +3707,15 @@ def main() -> int:
         ScreenAnswerApp(root)
         root.mainloop()
     except Exception as exc:
-        try:
-            from tkinter import messagebox
+        if LASSO1_MODE:
+            print("%s could not start: %s" % (APP_NAME, exc), file=sys.stderr)
+        else:
+            try:
+                from tkinter import messagebox
 
-            messagebox.showerror(APP_NAME, str(exc))
-        except Exception:
-            print(str(exc), file=sys.stderr)
+                messagebox.showerror(APP_NAME, str(exc))
+            except Exception:
+                print(str(exc), file=sys.stderr)
         try:
             root.destroy()
         except Exception:
