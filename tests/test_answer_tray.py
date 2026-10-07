@@ -38,7 +38,6 @@ from answer_tray import (
     is_lassv7_executable,
     hotkey_specs_for_variant,
     hotkey_event_for_id,
-    model_entry_options_for_variant,
     lasso_config_directory_for_executable,
     lasso1_config_path,
     lasso1_config_template,
@@ -86,7 +85,7 @@ class Lasso1ModeTests(unittest.TestCase):
         self.assertFalse(diagnostics_mode_enabled(("--diagnostics",), "Lasso1.exe"))
         self.assertFalse(diagnostics_mode_enabled(("--diagnostics",), "LassV7.exe"))
 
-    def test_lasso_only_delete_hotkey_and_lassv7_model_masking(self):
+    def test_lasso_only_delete_hotkey_and_config_only_model_default(self):
         ordinary_hotkeys = hotkey_specs_for_variant(False)
         lasso_hotkeys = hotkey_specs_for_variant(True)
         self.assertEqual([spec[1] for spec in ordinary_hotkeys], ["Ctrl+Alt+S", "Ctrl+Alt+Q"])
@@ -94,13 +93,12 @@ class Lasso1ModeTests(unittest.TestCase):
             [spec[1] for spec in lasso_hotkeys],
             ["Ctrl+Alt+S", "Ctrl+Alt+Q", "Ctrl+Alt+O"],
         )
-        self.assertEqual(model_entry_options_for_variant(False), {})
-        self.assertEqual(model_entry_options_for_variant(True), {"show": "*"})
+        self.assertEqual(lasso1_config_template()["models"]["openrouter"], DEFAULT_OPENROUTER_MODEL)
         self.assertEqual(hotkey_event_for_id(3, True), ("silent_delete",))
         self.assertIsNone(hotkey_event_for_id(3, False))
         self.assertEqual(hotkey_event_for_id(1, True), ("capture", "Ctrl+Alt+S"))
 
-    def test_first_run_config_uses_variant_folder_with_blank_key_and_model(self):
+    def test_first_run_config_uses_variant_folder_with_default_model_and_blank_key(self):
         with tempfile.TemporaryDirectory() as directory:
             path = lasso1_config_path(directory)
             self.assertEqual(path, os.path.join(directory, "Lasso1", "config.json"))
@@ -115,7 +113,9 @@ class Lasso1ModeTests(unittest.TestCase):
             self.assertEqual(config, lasso1_config_template())
             self.assertEqual(config["provider"], "openrouter")
             self.assertEqual(config["api_keys"], {"openrouter": ""})
-            self.assertEqual(config["models"], {"openrouter": ""})
+            self.assertEqual(
+                config["models"], {"openrouter": DEFAULT_OPENROUTER_MODEL}
+            )
             self.assertIs(config["allow_screenshot_uploads"], False)
             self.assertNotIn("_instructions", config)
 
@@ -126,7 +126,61 @@ class Lasso1ModeTests(unittest.TestCase):
             with open(path, "r", encoding="utf-8") as config_file:
                 self.assertIs(json.load(config_file)["allow_screenshot_uploads"], True)
 
-    def test_blank_model_stays_blank_and_old_default_is_cleared_without_losing_custom_values(self):
+    def test_lasso_settings_window_has_no_model_control(self):
+        labels = []
+
+        class FakeWidget:
+            def pack(self, *args, **kwargs):
+                return None
+
+            def winfo_reqwidth(self):
+                return 440
+
+            def winfo_reqheight(self):
+                return 320
+
+        class FakeVariable:
+            def __init__(self, value=None):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+            def set(self, value):
+                self.value = value
+
+        def make_widget(*args, **kwargs):
+            if "text" in kwargs:
+                labels.append(str(kwargs["text"]))
+            return FakeWidget()
+
+        fake_tkinter = types.ModuleType("tkinter")
+        fake_tkinter.Frame = make_widget
+        fake_tkinter.Label = make_widget
+        fake_tkinter.Entry = make_widget
+        fake_tkinter.Checkbutton = make_widget
+        fake_tkinter.Button = make_widget
+        fake_tkinter.StringVar = FakeVariable
+        fake_tkinter.BooleanVar = FakeVariable
+
+        app = object.__new__(ScreenAnswerApp)
+        app.root = MagicMock()
+        app.root.winfo_screenwidth.return_value = 1024
+        app.root.winfo_screenheight.return_value = 768
+        app.api_key = ""
+        app.config_path = "Lasso1/config.json"
+        app.privacy_acknowledged = False
+        app.save_settings = MagicMock()
+        app.hide_window = MagicMock()
+        app._privacy_changed = MagicMock()
+
+        with patch.dict("sys.modules", {"tkinter": fake_tkinter}):
+            app._build_lasso1_window()
+
+        self.assertFalse(hasattr(app, "model_var"))
+        self.assertNotIn("model", " ".join(labels).lower())
+
+    def test_blank_or_missing_model_is_defaulted_and_custom_values_are_preserved(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "Lasso1", "config.json")
             os.makedirs(os.path.dirname(path))
@@ -140,23 +194,44 @@ class Lasso1ModeTests(unittest.TestCase):
                 json.dump(blank_config, config_file)
             self.assertFalse(ensure_lasso1_config(path))
             with open(path, "r", encoding="utf-8") as config_file:
-                unchanged = json.load(config_file)
-            self.assertEqual(unchanged["models"], {"openrouter": ""})
+                migrated_blank = json.load(config_file)
+            self.assertEqual(
+                migrated_blank["models"]["openrouter"], DEFAULT_OPENROUTER_MODEL
+            )
+            self.assertEqual(migrated_blank["api_keys"]["openrouter"], "")
+            self.assertIs(migrated_blank["allow_screenshot_uploads"], False)
 
-            prefilled_config = {
+            default_config = {
                 "provider": "openrouter",
                 "api_keys": {"openrouter": "saved-key"},
                 "models": {"openrouter": DEFAULT_OPENROUTER_MODEL},
                 "allow_screenshot_uploads": True,
             }
             with open(path, "w", encoding="utf-8") as config_file:
-                json.dump(prefilled_config, config_file)
+                json.dump(default_config, config_file)
             self.assertFalse(ensure_lasso1_config(path))
             with open(path, "r", encoding="utf-8") as config_file:
-                cleared = json.load(config_file)
-            self.assertEqual(cleared["models"], {"openrouter": ""})
-            self.assertEqual(cleared["api_keys"]["openrouter"], "saved-key")
-            self.assertIs(cleared["allow_screenshot_uploads"], True)
+                retained_default = json.load(config_file)
+            self.assertEqual(
+                retained_default["models"]["openrouter"], DEFAULT_OPENROUTER_MODEL
+            )
+
+            legacy_custom_config = {
+                "provider": "openrouter",
+                "api_key": "saved-key",
+                "model": "custom/legacy-vision-model",
+                "allow_screenshot_uploads": True,
+            }
+            with open(path, "w", encoding="utf-8") as config_file:
+                json.dump(legacy_custom_config, config_file)
+            self.assertFalse(ensure_lasso1_config(path))
+            with open(path, "r", encoding="utf-8") as config_file:
+                migrated_legacy = json.load(config_file)
+            self.assertEqual(
+                migrated_legacy["models"]["openrouter"],
+                "custom/legacy-vision-model",
+            )
+            self.assertEqual(migrated_legacy["api_key"], "saved-key")
 
             custom_config = {
                 "provider": "openrouter",
@@ -214,8 +289,11 @@ class Lasso1ModeTests(unittest.TestCase):
                         {"allow_screenshot_uploads": 1},
                         config_file,
                     )
-                self.assertIs(
-                    load_portable_config(path)["allow_screenshot_uploads"], False
+                loaded_blank = load_portable_config(path)
+                self.assertIs(loaded_blank["allow_screenshot_uploads"], False)
+                self.assertEqual(
+                    loaded_blank["models"],
+                    {"openrouter": DEFAULT_OPENROUTER_MODEL},
                 )
 
     def test_lasso1_uses_config_key_even_when_environment_key_exists(self):
@@ -297,7 +375,7 @@ class Lasso1ModeTests(unittest.TestCase):
         self.assertEqual(app.provider, "openrouter")
         self.assertEqual(app.api_key, "")
         self.assertEqual(app.api_key_source, "not configured")
-        self.assertEqual(app.model, "")
+        self.assertEqual(app.model, DEFAULT_OPENROUTER_MODEL)
         self.assertFalse(app.privacy_acknowledged)
         self.assertFalse(app.diagnostics_enabled)
         lasso_window.assert_called_once_with()
@@ -320,8 +398,6 @@ class Lasso1ModeTests(unittest.TestCase):
             app.lasso1_mode = True
             app.api_key_var = MagicMock()
             app.api_key_var.get.return_value = "saved-openrouter-key"
-            app.model_var = MagicMock()
-            app.model_var.get.return_value = DEFAULT_OPENROUTER_MODEL
             app.privacy_var = MagicMock()
             app.privacy_var.get.return_value = False
             app.config_path = path
@@ -344,6 +420,9 @@ class Lasso1ModeTests(unittest.TestCase):
                 saved = json.load(config_file)
             self.assertEqual(
                 saved["api_keys"], {"openrouter": "saved-openrouter-key"}
+            )
+            self.assertEqual(
+                saved["models"], {"openrouter": DEFAULT_OPENROUTER_MODEL}
             )
             self.assertIs(saved["allow_screenshot_uploads"], False)
 
@@ -389,25 +468,33 @@ class Lasso1ModeTests(unittest.TestCase):
         self.assertIn("consent", app.tray.show_balloon.call_args.args[1])
         app.show_window.assert_not_called()
 
-    def test_capture_is_blocked_until_lasso_model_is_configured(self):
+    def test_capture_falls_back_to_default_for_a_blank_lasso_model_without_prompting(self):
         app = object.__new__(ScreenAnswerApp)
         app.lasso1_mode = True
+        app.lassv7_mode = False
         app.busy = False
         app.api_key = "config-key"
         app.model = ""
+        app.models = {"openrouter": ""}
         app.privacy_acknowledged = True
         app.provider = "openrouter"
+        app.ocr_backend = "provider"
+        app.diagnostics_enabled = False
         app.status_var = MagicMock()
         app.tray = MagicMock()
+        app.root = MagicMock()
+        app._result_generation = 0
+        app._fade_job = None
         app._log_diagnostic = MagicMock()
-        app.show_window = MagicMock()
 
-        app._start_capture("test")
+        with patch("answer_tray.threading.Thread") as thread_class:
+            app._start_capture("test")
 
-        self.assertFalse(app.busy)
-        app.tray.show_balloon.assert_called_once()
-        self.assertIn("OpenRouter model", app.tray.show_balloon.call_args.args[1])
-        app.show_window.assert_not_called()
+        self.assertTrue(app.busy)
+        self.assertEqual(app.model, DEFAULT_OPENROUTER_MODEL)
+        self.assertEqual(app.models["openrouter"], DEFAULT_OPENROUTER_MODEL)
+        app.tray.show_balloon.assert_not_called()
+        thread_class.return_value.start.assert_called_once_with()
 
     def test_lasso1_context_menu_exposes_config_file_folder_and_self_destruct_actions(self):
         app_name_patch = patch("answer_tray.APP_NAME", "Lasso1")
@@ -525,6 +612,7 @@ class Lasso1ModeTests(unittest.TestCase):
 
         tray = object.__new__(WindowsTray)
         tray.lassv7_mode = True
+        tray.suppress_tray_feedback = True
         tray.hwnd = 1
         tray._nid = NotifyIconData()
         tray._nid_type = NotifyIconData
@@ -541,6 +629,7 @@ class Lasso1ModeTests(unittest.TestCase):
         tray._shell32.Shell_NotifyIconW.assert_not_called()
 
         tray.lassv7_mode = False
+        tray.suppress_tray_feedback = False
         tray._nid = NotifyIconData()
         tray.set_state((67, 160, 71), "Option 3")
         self.assertEqual(tray._nid.uFlags, 0x00000001 | 0x00000002 | 0x00000004)

@@ -34,9 +34,9 @@ API model names, availability, free access, quotas, and pricing can change; chec
 
 The separate [Lasso1 Windows release](https://github.com/Exo2v/Repository-for-answering-machine/releases/tag/lasso1) is tray-only and OpenRouter-only; the standard Screen Answer releases above keep their existing providers. It includes `Lasso1.exe` and a dedicated 32-bit `LassV7.exe` build for Windows 7, packaged with Python 3.8.10 and PyInstaller 5.13.2. CI builds and smoke-checks both. Neither opens a GUI at startup: right-click the tray and choose **Open** to show Settings; **Save** writes the config and closes the window. **Ctrl+Alt+S** captures only after upload consent is enabled. Live web search and tool execution are disabled.
 
-Each executable has its own per-user config: `Lasso1.exe` uses `%APPDATA%\Lasso1\config.json`, while `LassV7.exe` uses `%APPDATA%\LassV7\config.json`. New configs have a blank API-key value and a blank model value; no credential is bundled. Screenshot-upload consent is off. Enter the API key and model in Settings, and enable consent only if you agree to upload screenshots. LassV7 masks the model field so its model name is not visible in the GUI. To edit JSON directly, right-click and choose the matching **Open ... config file** action; restart the app after direct edits.
+Each executable has its own per-user config: `Lasso1.exe` uses `%APPDATA%\Lasso1\config.json`, while `LassV7.exe` uses `%APPDATA%\LassV7\config.json`. New configs leave the API-key value blank and put the default OpenRouter vision model in the JSON; no credential is bundled. Screenshot-upload consent is off. The Lasso Settings GUI has no model field or model value—model selection is exclusively in the matching config file. Enter the API key and enable consent in Settings only if you agree to upload screenshots. To change the model, right-click and choose the matching **Open ... config file** action, edit `models.openrouter`, then restart the app.
 
-LassV7 shows no tray popups and no hover tooltip. While it works, the tray icon's color is the only runtime feedback. **Ctrl+Alt+O** silently closes either Lasso build and schedules removal of only that build's EXE and matching `config.json`. The tray-menu self-destruct action still asks for confirmation. The config directory is removed only if empty; unexpected files are left alone. If cleanup cannot be scheduled, the app stays open.
+LassV7 sends no Windows notification-area balloons and does not register tray hover tooltips. While it works, the tray icon's color is the only runtime feedback. **Ctrl+Alt+O** silently closes either Lasso build and schedules removal of only that build's EXE and matching `config.json`. The tray-menu self-destruct action still asks for confirmation. The config directory is removed only if empty; unexpected files are left alone. If cleanup cannot be scheduled, the app stays open.
 
 Screenshot upload is **off by default**. A fresh config looks like:
 
@@ -47,13 +47,13 @@ Screenshot upload is **off by default**. A fresh config looks like:
     "openrouter": ""
   },
   "models": {
-    "openrouter": ""
+    "openrouter": "google/gemini-3.8-flash"
   },
   "allow_screenshot_uploads": false
 }
 ```
 
-Older configs that contain the former built-in model value are cleared on startup; saved API keys, custom model names, and consent are preserved. The ordinary Lasso1 model field remains editable; LassV7 masks it. Both executables use the per-user config paths above, and neither reads credentials from the download folder.
+Existing configs with a missing or blank model are filled with the default at startup; custom model values and saved API keys/consent are preserved. Both Lasso executables use the model from their separate per-user config files and do not show model settings in the GUI. Standard Screen Answer model settings and behavior are unchanged. Neither Lasso executable reads credentials from the download folder.
 
 To download LassV7 to a new folder under Downloads from PowerShell, run:
 

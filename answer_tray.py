@@ -162,11 +162,6 @@ def hotkey_event_for_id(hotkey_id: int, lasso1_mode: bool) -> Optional[Tuple[Any
     return None
 
 
-def model_entry_options_for_variant(lassv7_mode: bool) -> Dict[str, str]:
-    """Mask the model value in the Windows 7 settings window only."""
-    return {"show": "*"} if lassv7_mode else {}
-
-
 GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 MISTRAL_ENDPOINT = "https://api.mistral.ai/v1/chat/completions"
 MISTRAL_OCR_ENDPOINT = "https://api.mistral.ai/v1/ocr"
@@ -247,11 +242,11 @@ def portable_config_path() -> str:
 
 
 def lasso1_config_template() -> Dict[str, Any]:
-    """Return a blank-key, blank-model OpenRouter config with uploads disabled."""
+    """Return a blank-key OpenRouter config with a default model and uploads disabled."""
     return {
         "provider": "openrouter",
         "api_keys": {"openrouter": ""},
-        "models": {"openrouter": ""},
+        "models": {"openrouter": DEFAULT_OPENROUTER_MODEL},
         "allow_screenshot_uploads": False,
     }
 
@@ -291,6 +286,8 @@ def save_lasso1_config(
     config_path = path or lasso1_config_path()
     key = api_key.strip() if isinstance(api_key, str) else ""
     selected_model = model.strip() if isinstance(model, str) else ""
+    if not selected_model:
+        selected_model = DEFAULT_OPENROUTER_MODEL
     if not key:
         raise ValueError("An OpenRouter API key is required.")
     if not valid_model_name("openrouter", selected_model):
@@ -304,8 +301,8 @@ def save_lasso1_config(
     return config_path
 
 
-def _clear_lasso1_preinstalled_model(config_path: str) -> bool:
-    """Remove the former built-in model value without touching custom settings."""
+def _migrate_lasso1_config_defaults(config_path: str) -> bool:
+    """Fill a missing model default while preserving custom config values."""
     try:
         with open(config_path, "r", encoding="utf-8") as config_file:
             config = json.load(config_file)
@@ -315,14 +312,19 @@ def _clear_lasso1_preinstalled_model(config_path: str) -> bool:
         return False
 
     stored_models = config.get("models")
-    if not isinstance(stored_models, dict):
-        stored_models = {}
-    model = stored_models.get("openrouter")
+    if isinstance(stored_models, dict):
+        updated_models = dict(stored_models)
+    else:
+        updated_models = {}
+    model = updated_models.get("openrouter")
     changed = False
-    if isinstance(model, str) and model.strip() == DEFAULT_OPENROUTER_MODEL:
-        stored_models = dict(stored_models)
-        stored_models["openrouter"] = ""
-        config["models"] = stored_models
+    if not isinstance(model, str) or not model.strip():
+        legacy_model = config.get("model")
+        if isinstance(legacy_model, str) and legacy_model.strip():
+            updated_models["openrouter"] = legacy_model.strip()
+        else:
+            updated_models["openrouter"] = DEFAULT_OPENROUTER_MODEL
+        config["models"] = updated_models
         changed = True
     if "_instructions" in config:
         config.pop("_instructions", None)
@@ -338,7 +340,7 @@ def _clear_lasso1_preinstalled_model(config_path: str) -> bool:
 
 
 def ensure_lasso1_config(path: Optional[str] = None) -> bool:
-    """Create Lasso's AppData config with blank key/model fields and no upload consent."""
+    """Create Lasso's AppData config with a default model, blank key, and no consent."""
     config_path = path or lasso1_config_path()
     directory = os.path.dirname(os.path.abspath(config_path))
     if directory:
@@ -348,7 +350,7 @@ def ensure_lasso1_config(path: Optional[str] = None) -> bool:
             json.dump(lasso1_config_template(), config_file, indent=2)
             config_file.write("\n")
     except FileExistsError:
-        _clear_lasso1_preinstalled_model(config_path)
+        _migrate_lasso1_config_defaults(config_path)
         return False
     return True
 
@@ -510,6 +512,10 @@ def load_portable_config(path: Optional[str] = None) -> Dict[str, Any]:
     # Custom model names remain untouched.
     if models.get("mistral") == LEGACY_MISTRAL_MODEL:
         models["mistral"] = DEFAULT_MISTRAL_MODEL
+    if LASSO1_MODE:
+        openrouter_model = models.get("openrouter")
+        if not isinstance(openrouter_model, str) or not openrouter_model.strip():
+            models["openrouter"] = DEFAULT_OPENROUTER_MODEL
 
     ocr_backend = raw_config.get("ocr_backend", DEFAULT_OCR_BACKEND)
     if not isinstance(ocr_backend, str) or ocr_backend not in OCR_BACKEND_LABELS:
@@ -2445,6 +2451,9 @@ class WindowsTray:
         self.settings_enabled = settings_enabled
         self.lasso1_mode = lasso1_mode
         self.lassv7_mode = lassv7_mode
+        # LassV7 is the Windows 7 target: suppress both shell balloons (NIF_INFO)
+        # and hover tooltips (NIF_TIP) through this single tray-feedback policy.
+        self.suppress_tray_feedback = bool(lassv7_mode)
         self.hwnd = None
         self._ready = threading.Event()
         self._lock = threading.RLock()
@@ -2726,11 +2735,11 @@ class WindowsTray:
         self._nid.hWnd = hwnd
         self._nid.uID = TRAY_UID
         self._nid.uFlags = NIF_MESSAGE | NIF_ICON
-        if not self.lassv7_mode:
+        if not self.suppress_tray_feedback:
             self._nid.uFlags |= NIF_TIP
         self._nid.uCallbackMessage = WM_TRAY
         self._nid.hIcon = self._create_icon(NEUTRAL_RGB)
-        if not self.lassv7_mode:
+        if not self.suppress_tray_feedback:
             self._nid.szTip = "%s — ready" % APP_NAME
         if not shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(self._nid)):
             error_code = ctypes.get_last_error()
@@ -3012,13 +3021,13 @@ class WindowsTray:
         with self._lock:
             self._nid.hIcon = icon
             self._nid.uFlags = 0x00000001 | 0x00000002  # MESSAGE|ICON
-            if not self.lassv7_mode:
+            if not self.suppress_tray_feedback:
                 self._nid.uFlags |= 0x00000004  # NIF_TIP
                 self._nid.szTip = tooltip[:127]
             self._shell32.Shell_NotifyIconW(0x00000001, ctypes.byref(self._nid))  # NIM_MODIFY
 
     def show_balloon(self, title: str, message: str) -> None:
-        if self.lassv7_mode or not self.hwnd or not self._nid:
+        if self.suppress_tray_feedback or not self.hwnd or not self._nid:
             return
         nid_type = self._nid_type
         from ctypes import wintypes as wt
@@ -3084,8 +3093,12 @@ class ScreenAnswerApp:
                 stored_keys,
                 lasso1_mode=self.lasso1_mode,
             )
-            default_model = "" if self.lasso1_mode else DEFAULT_MODELS[provider]
+            default_model = DEFAULT_MODELS[provider]
             stored_model = stored_models.get(provider, default_model)
+            if self.lasso1_mode and (
+                not isinstance(stored_model, str) or not stored_model.strip()
+            ):
+                stored_model = default_model
             self.models[provider] = stored_model if isinstance(stored_model, str) else default_model
 
         if self.lasso1_mode:
@@ -3144,11 +3157,11 @@ class ScreenAnswerApp:
         else:
             self._build_window()
         if self.lasso1_mode:
-            if not self.api_key or not self.model:
+            if not self.api_key:
                 tooltip = "%s — right-click tray and choose Open to configure" % APP_NAME
                 self.tray.show_balloon(
                     APP_NAME,
-                    "Right-click the tray icon and choose Open to enter an OpenRouter key and model. Config: %s"
+                    "Right-click the tray icon and choose Open to enter your OpenRouter API key. Config: %s"
                     % self.config_path,
                 )
             elif not self.privacy_acknowledged:
@@ -3369,16 +3382,6 @@ class ScreenAnswerApp:
             wraplength=500,
             anchor="w",
         ).pack(fill="x", pady=(0, 10))
-
-        tk.Label(outer, text="OpenRouter model:", anchor="w").pack(fill="x")
-        self.model_var = tk.StringVar(value=self.model)
-        model_entry_options = model_entry_options_for_variant(LASSOV7_MODE)
-        tk.Entry(
-            outer,
-            textvariable=self.model_var,
-            width=50,
-            **model_entry_options
-        ).pack(fill="x", pady=(3, 10))
 
         self.privacy_var = tk.BooleanVar(value=self.privacy_acknowledged)
         self.privacy_checkbutton = tk.Checkbutton(
@@ -3649,7 +3652,10 @@ class ScreenAnswerApp:
 
     def _save_lasso1_settings(self) -> bool:
         key = self.api_key_var.get().strip()
-        model = self.model_var.get().strip()
+        model = self.models.get("openrouter", DEFAULT_OPENROUTER_MODEL)
+        model = model.strip() if isinstance(model, str) else ""
+        if not model:
+            model = DEFAULT_OPENROUTER_MODEL
         allow_screenshot_uploads = self.privacy_var.get() is True
         if not key:
             self.show_window()
@@ -3911,13 +3917,10 @@ class ScreenAnswerApp:
         if self.lasso1_mode and (
             not isinstance(getattr(self, "model", None), str) or not self.model.strip()
         ):
-            self._log_diagnostic("Capture blocked: no OpenRouter model is configured.")
-            self.status_var.set("Right-click the tray icon and choose Open to enter an OpenRouter model.")
-            self.tray.show_balloon(
-                APP_NAME,
-                "Right-click the tray icon and choose Open to enter an OpenRouter model, then Save.",
-            )
-            return
+            self.model = DEFAULT_OPENROUTER_MODEL
+            stored_models = getattr(self, "models", None)
+            if isinstance(stored_models, dict):
+                stored_models["openrouter"] = DEFAULT_OPENROUTER_MODEL
 
         self.busy = True
         self._result_generation += 1

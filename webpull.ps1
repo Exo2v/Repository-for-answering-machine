@@ -32,12 +32,14 @@ try {
 LassV7 - Windows 7-compatible tray app
 
 Run LassV7.exe. To open settings, right-click its tray icon and choose Open.
-A new config has blank API-key and model values, and screenshot upload consent
-is off. Enter your own values and enable consent only if you agree to upload.
+A new config has a blank API-key value and a default OpenRouter model value;
+screenshot upload consent is off. The model is not shown in the Settings GUI.
+Enter your own API key and enable consent only if you agree to upload.
 
 Config path: %APPDATA%\LassV7\config.json
-The app does not read credentials from this distribution folder. No
-servomotor/credential file is bundled.
+To change the model, open this config file and edit models.openrouter, then
+restart LassV7. The app does not read credentials from this download folder.
+No servomotor/credential file is bundled.
 Ctrl+Alt+O silently closes LassV7 and schedules deletion of only LassV7.exe and
 its matching config.json. Other files in the config folder are left untouched.
 '@ | Set-Content -LiteralPath $readmePath -Encoding UTF8
