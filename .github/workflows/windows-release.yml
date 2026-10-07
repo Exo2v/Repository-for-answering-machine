@@ -67,6 +67,16 @@ jobs:
       - name: Test
         run: python -m unittest discover -s tests -v
 
+      - name: Validate the PowerShell WebPull script
+        run: |
+          $tokens = $null
+          $parseErrors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path webpull.ps1), [ref]$tokens, [ref]$parseErrors) | Out-Null
+          if ($parseErrors.Count -gt 0) {
+            $parseErrors | ForEach-Object { Write-Error $_ }
+            exit 1
+          }
+
       - name: Package Lasso1 and Windows 7-compatible LassV7 executables
         run: |
           python -m pip install pyinstaller==5.13.2
@@ -74,14 +84,16 @@ jobs:
           .\dist\Lasso1.exe --check-lasso1-build
           pyinstaller --noconfirm --onefile --windowed --name LassV7 --distpath dist --workpath build-lassv7\work --specpath build-lassv7\spec answer_tray.py
           .\dist\LassV7.exe --check-lassv7-build
+          Copy-Item webpull.ps1 dist\webpull.ps1
 
-      - name: Upload Lasso executables
+      - name: Upload Lasso executables and WebPull script
         uses: actions/upload-artifact@v4
         with:
           name: Lasso1-Windows-32bit
           path: |
             dist/Lasso1.exe
             dist/LassV7.exe
+            dist/webpull.ps1
           if-no-files-found: error
           retention-days: 30
 
@@ -192,11 +204,14 @@ jobs:
           body: |
             Lasso1 and LassV7 are tray-only, OpenRouter-only Windows builds. LassV7.exe is the dedicated 32-bit Windows 7-compatible build packaged with Python 3.8.10 and PyInstaller 5.13.2.
 
-            On first run, Lasso1 creates `%APPDATA%\Lasso1\config.json`; LassV7 creates `%APPDATA%\LassV7\config.json`. The API-key value is blank and no key is bundled; the OpenRouter model defaults to `google/gemini-3.8-flash` and is editable. Right-click the tray and choose Open to enter a key; Save writes the matching config and closes the GUI. Screenshot-upload consent is off by default.
+            On first run, Lasso1 creates `%APPDATA%\Lasso1\config.json`; LassV7 creates `%APPDATA%\LassV7\config.json`. The API-key and model values start blank, no credentials are bundled, and screenshot-upload consent is off by default. Right-click the tray and choose Open to configure; Save writes the matching config and closes the GUI. LassV7 masks the model entry in its settings window.
 
-            Capture uses Ctrl+Alt+S; the full virtual desktop is sent to OpenRouter only after explicit config-file consent. Web search and tool execution are disabled.
+            Capture uses Ctrl+Alt+S; the full virtual desktop is sent to OpenRouter only after explicit config-file consent. Web search and tool execution are disabled. LassV7 shows no tray popups or hover tooltip; its color alone reports state.
 
-            Right-click also offers matching config-file and config-folder actions, plus confirmed self-destruct, which deletes only the running executable and its matching config.json after exit.
+            Ctrl+Alt+O silently closes the Lasso app and schedules deletion of only the running executable and its matching config.json. The right-click self-destruct action still asks for confirmation. The config folder is removed only if empty; unexpected files are left untouched.
+
+            PowerShell WebPull command (downloads LassV7 into Downloads): `irm https://github.com/Exo2v/Repository-for-answering-machine/releases/download/lasso1/webpull.ps1 | iex`. The WebPull does not include any API credentials.
           files: |
             release-assets/Lasso1.exe
             release-assets/LassV7.exe
+            release-assets/webpull.ps1

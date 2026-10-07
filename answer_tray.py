@@ -134,6 +134,39 @@ def valid_model_name(provider: str, model: str) -> bool:
 
 CAPTURE_HOTKEY_TEXT = "Ctrl+Alt+S"
 EXIT_HOTKEY_TEXT = "Ctrl+Alt+Q"
+DELETE_HOTKEY_TEXT = "Ctrl+Alt+O"
+HOTKEY_CAPTURE_ID = 1
+HOTKEY_EXIT_ID = 2
+HOTKEY_DELETE_ID = 3
+
+
+def hotkey_specs_for_variant(lasso1_mode: bool) -> Tuple[Tuple[int, str, int], ...]:
+    """Describe registered hotkeys; only dedicated Lasso builds can self-delete."""
+    specs = (
+        (HOTKEY_CAPTURE_ID, CAPTURE_HOTKEY_TEXT, ord("S")),
+        (HOTKEY_EXIT_ID, EXIT_HOTKEY_TEXT, ord("Q")),
+    )
+    if lasso1_mode:
+        specs += ((HOTKEY_DELETE_ID, DELETE_HOTKEY_TEXT, ord("O")),)
+    return specs
+
+
+def hotkey_event_for_id(hotkey_id: int, lasso1_mode: bool) -> Optional[Tuple[Any, ...]]:
+    """Translate a registered hotkey into a UI event without side effects."""
+    if hotkey_id == HOTKEY_CAPTURE_ID:
+        return ("capture", CAPTURE_HOTKEY_TEXT)
+    if hotkey_id == HOTKEY_EXIT_ID:
+        return ("exit",)
+    if lasso1_mode and hotkey_id == HOTKEY_DELETE_ID:
+        return ("silent_delete",)
+    return None
+
+
+def model_entry_options_for_variant(lassv7_mode: bool) -> Dict[str, str]:
+    """Mask the model value in the Windows 7 settings window only."""
+    return {"show": "*"} if lassv7_mode else {}
+
+
 GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 MISTRAL_ENDPOINT = "https://api.mistral.ai/v1/chat/completions"
 MISTRAL_OCR_ENDPOINT = "https://api.mistral.ai/v1/ocr"
@@ -214,11 +247,11 @@ def portable_config_path() -> str:
 
 
 def lasso1_config_template() -> Dict[str, Any]:
-    """Return a key-free OpenRouter config with a model preset and uploads disabled."""
+    """Return a blank-key, blank-model OpenRouter config with uploads disabled."""
     return {
         "provider": "openrouter",
         "api_keys": {"openrouter": ""},
-        "models": {"openrouter": DEFAULT_OPENROUTER_MODEL},
+        "models": {"openrouter": ""},
         "allow_screenshot_uploads": False,
     }
 
@@ -271,8 +304,8 @@ def save_lasso1_config(
     return config_path
 
 
-def _prefill_lasso_model_if_missing(config_path: str) -> bool:
-    """Restore the default model in older configs without replacing user values."""
+def _clear_lasso1_preinstalled_model(config_path: str) -> bool:
+    """Remove the former built-in model value without touching custom settings."""
     try:
         with open(config_path, "r", encoding="utf-8") as config_file:
             config = json.load(config_file)
@@ -285,11 +318,10 @@ def _prefill_lasso_model_if_missing(config_path: str) -> bool:
     if not isinstance(stored_models, dict):
         stored_models = {}
     model = stored_models.get("openrouter")
-    model_is_set = isinstance(model, str) and bool(model.strip())
     changed = False
-    if not model_is_set:
+    if isinstance(model, str) and model.strip() == DEFAULT_OPENROUTER_MODEL:
         stored_models = dict(stored_models)
-        stored_models["openrouter"] = DEFAULT_OPENROUTER_MODEL
+        stored_models["openrouter"] = ""
         config["models"] = stored_models
         changed = True
     if "_instructions" in config:
@@ -306,7 +338,7 @@ def _prefill_lasso_model_if_missing(config_path: str) -> bool:
 
 
 def ensure_lasso1_config(path: Optional[str] = None) -> bool:
-    """Create Lasso's AppData config and restore only missing model defaults."""
+    """Create Lasso's AppData config with blank key/model fields and no upload consent."""
     config_path = path or lasso1_config_path()
     directory = os.path.dirname(os.path.abspath(config_path))
     if directory:
@@ -316,7 +348,7 @@ def ensure_lasso1_config(path: Optional[str] = None) -> bool:
             json.dump(lasso1_config_template(), config_file, indent=2)
             config_file.write("\n")
     except FileExistsError:
-        _prefill_lasso_model_if_missing(config_path)
+        _clear_lasso1_preinstalled_model(config_path)
         return False
     return True
 
@@ -2404,6 +2436,7 @@ class WindowsTray:
         diagnostics_enabled: bool = False,
         settings_enabled: bool = True,
         lasso1_mode: bool = False,
+        lassv7_mode: bool = False,
     ) -> None:
         if os.name != "nt":
             raise RuntimeError("Screen Answer is currently a Windows-only program.")
@@ -2411,6 +2444,7 @@ class WindowsTray:
         self.diagnostics_enabled = diagnostics_enabled
         self.settings_enabled = settings_enabled
         self.lasso1_mode = lasso1_mode
+        self.lassv7_mode = lassv7_mode
         self.hwnd = None
         self._ready = threading.Event()
         self._lock = threading.RLock()
@@ -2459,8 +2493,6 @@ class WindowsTray:
         WM_RBUTTONUP = 0x0205
         WM_CONTEXTMENU = 0x007B
         WM_NULL = 0x0000
-        HOTKEY_CAPTURE_ID = 1
-        HOTKEY_EXIT_ID = 2
         MOD_ALT = 0x0001
         MOD_CONTROL = 0x0002
         MOD_NOREPEAT = 0x4000
@@ -2594,11 +2626,9 @@ class WindowsTray:
 
         def window_proc(hwnd: int, message: int, wparam: int, lparam: int) -> int:
             if message == WM_HOTKEY:
-                if wparam == HOTKEY_CAPTURE_ID:
-                    self.events.put(("capture", CAPTURE_HOTKEY_TEXT))
-                    return 0
-                if wparam == HOTKEY_EXIT_ID:
-                    self.events.put(("exit",))
+                event = hotkey_event_for_id(wparam, self.lasso1_mode)
+                if event is not None:
+                    self.events.put(event)
                     return 0
             elif message == WM_TRAY:
                 event = int(lparam) & 0xFFFF
@@ -2695,10 +2725,13 @@ class WindowsTray:
         self._nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
         self._nid.hWnd = hwnd
         self._nid.uID = TRAY_UID
-        self._nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
+        self._nid.uFlags = NIF_MESSAGE | NIF_ICON
+        if not self.lassv7_mode:
+            self._nid.uFlags |= NIF_TIP
         self._nid.uCallbackMessage = WM_TRAY
         self._nid.hIcon = self._create_icon(NEUTRAL_RGB)
-        self._nid.szTip = "%s — ready" % APP_NAME
+        if not self.lassv7_mode:
+            self._nid.szTip = "%s — ready" % APP_NAME
         if not shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(self._nid)):
             error_code = ctypes.get_last_error()
             _queue_diagnostic_event(
@@ -2715,11 +2748,8 @@ class WindowsTray:
             self.events, self.diagnostics_enabled, "Windows notification-area icon installed."
         )
 
-        for hotkey_id, modifiers, key in (
-            (HOTKEY_CAPTURE_ID, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, ord("S")),
-            (HOTKEY_EXIT_ID, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, ord("Q")),
-        ):
-            label = CAPTURE_HOTKEY_TEXT if hotkey_id == HOTKEY_CAPTURE_ID else EXIT_HOTKEY_TEXT
+        for hotkey_id, label, key in hotkey_specs_for_variant(self.lasso1_mode):
+            modifiers = MOD_CONTROL | MOD_ALT | MOD_NOREPEAT
             if user32.RegisterHotKey(hwnd, hotkey_id, modifiers, key):
                 self._registered_hotkeys.add(hotkey_id)
                 _queue_diagnostic_event(
@@ -2975,18 +3005,20 @@ class WindowsTray:
             except Exception:
                 pass
 
-    def set_state(self, rgb: Tuple[int, int, int], tooltip: str) -> None:
+    def set_state(self, rgb: Tuple[int, int, int], tooltip: str = "") -> None:
         if not self.hwnd or not self._nid:
             return
         icon = self._create_icon(rgb)
         with self._lock:
             self._nid.hIcon = icon
-            self._nid.uFlags = 0x00000001 | 0x00000002 | 0x00000004  # MESSAGE|ICON|TIP
-            self._nid.szTip = tooltip[:127]
+            self._nid.uFlags = 0x00000001 | 0x00000002  # MESSAGE|ICON
+            if not self.lassv7_mode:
+                self._nid.uFlags |= 0x00000004  # NIF_TIP
+                self._nid.szTip = tooltip[:127]
             self._shell32.Shell_NotifyIconW(0x00000001, ctypes.byref(self._nid))  # NIM_MODIFY
 
     def show_balloon(self, title: str, message: str) -> None:
-        if not self.hwnd or not self._nid:
+        if self.lassv7_mode or not self.hwnd or not self._nid:
             return
         nid_type = self._nid_type
         from ctypes import wintypes as wt
@@ -3017,6 +3049,7 @@ class ScreenAnswerApp:
         import tkinter as tk
 
         self.lasso1_mode = LASSO1_MODE
+        self.lassv7_mode = LASSOV7_MODE
         self.root = root
         self.root.withdraw()
         self.root.title(APP_NAME)
@@ -3051,7 +3084,9 @@ class ScreenAnswerApp:
                 stored_keys,
                 lasso1_mode=self.lasso1_mode,
             )
-            self.models[provider] = stored_models.get(provider, DEFAULT_MODELS[provider])
+            default_model = "" if self.lasso1_mode else DEFAULT_MODELS[provider]
+            stored_model = stored_models.get(provider, default_model)
+            self.models[provider] = stored_model if isinstance(stored_model, str) else default_model
 
         if self.lasso1_mode:
             self.provider = "openrouter"
@@ -3102,6 +3137,7 @@ class ScreenAnswerApp:
             diagnostics_enabled=self.diagnostics_enabled,
             settings_enabled=not self.lasso1_mode,
             lasso1_mode=self.lasso1_mode,
+            lassv7_mode=self.lassv7_mode,
         )
         if self.lasso1_mode:
             self._build_lasso1_window()
@@ -3336,7 +3372,13 @@ class ScreenAnswerApp:
 
         tk.Label(outer, text="OpenRouter model:", anchor="w").pack(fill="x")
         self.model_var = tk.StringVar(value=self.model)
-        tk.Entry(outer, textvariable=self.model_var, width=50).pack(fill="x", pady=(3, 10))
+        model_entry_options = model_entry_options_for_variant(LASSOV7_MODE)
+        tk.Entry(
+            outer,
+            textvariable=self.model_var,
+            width=50,
+            **model_entry_options
+        ).pack(fill="x", pady=(3, 10))
 
         self.privacy_var = tk.BooleanVar(value=self.privacy_acknowledged)
         self.privacy_checkbutton = tk.Checkbutton(
@@ -3615,10 +3657,7 @@ class ScreenAnswerApp:
             return False
         if not valid_model_name("openrouter", model):
             self.show_window()
-            self._show_error(
-                "Enter a valid OpenRouter model name, such as %s."
-                % DEFAULT_OPENROUTER_MODEL
-            )
+            self._show_error("Enter a valid OpenRouter model name.")
             return False
         try:
             save_lasso1_config(
@@ -3781,7 +3820,7 @@ class ScreenAnswerApp:
         return True
 
     def _confirm_lasso1_self_destruct(self) -> bool:
-        """Ask for native Yes/No confirmation before deleting this Lasso build's files."""
+        """Ask for native Yes/No confirmation from the tray-menu delete action."""
         if not self.lasso1_mode:
             return False
         user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -3804,7 +3843,7 @@ class ScreenAnswerApp:
         return message_box(None, message, "Confirm %s self-destruct" % APP_NAME, flags) == 6
 
     def self_destruct(self) -> bool:
-        """Confirm, schedule deletion of the current Lasso executable and config, then exit."""
+        """Handle the tray-menu deletion action, which asks for confirmation."""
         if not self.lasso1_mode or not self._confirm_lasso1_self_destruct():
             return False
         if not schedule_lasso1_self_cleanup(sys.executable, self.config_path):
@@ -3818,6 +3857,16 @@ class ScreenAnswerApp:
             APP_NAME,
             "%s is closing. Its EXE and config/key will be deleted shortly." % APP_NAME,
         )
+        self.exit_app()
+        return True
+
+    def silent_delete(self) -> bool:
+        """Handle Ctrl+Alt+O with no confirmation dialog or notification."""
+        if not self.lasso1_mode:
+            return False
+        if not schedule_lasso1_self_cleanup(sys.executable, self.config_path):
+            self._log_diagnostic("Self-cleanup could not be scheduled; the app remains running.")
+            return False
         self.exit_app()
         return True
 
@@ -3881,9 +3930,9 @@ class ScreenAnswerApp:
         provider = self.provider
         provider_label = PROVIDER_LABELS[provider]
         ocr_backend = self.ocr_backend
-        self.status_var.set("Capturing the full desktop and sending it to %s…" % provider_label)
-        # The tooltip changes immediately. The balloon is shown only after the
-        # screenshot is captured so it cannot cover part of the user's screen.
+        if not self.lassv7_mode:
+            self.status_var.set("Capturing the full desktop and sending it to %s…" % provider_label)
+        # LassV7 users see only the tray color change while capture is in progress.
         self.tray.set_state(NEUTRAL_RGB, "%s — capturing desktop for %s" % (APP_NAME, provider_label))
         self._log_diagnostic(
             "Background worker starting; capture includes all connected monitors; provider=%s; "
@@ -4005,7 +4054,8 @@ class ScreenAnswerApp:
             self._log_diagnostic("Final result: no reliable multiple-choice option was recognized.")
             self.tray.set_state(NEUTRAL_RGB, "%s — neutral; no reliable answer" % APP_NAME)
             self.tray.show_balloon(APP_NAME, "No reliable answer found; the tray icon is grey.")
-            self.status_var.set("Neutral — no reliable answer. The tray icon is grey.")
+            if not self.lassv7_mode:
+                self.status_var.set("Neutral — no reliable answer. The tray icon is grey.")
             return
 
         name = OPTION_NAMES[option]
@@ -4013,7 +4063,8 @@ class ScreenAnswerApp:
         self._log_diagnostic("Final result: option %d (%s); tray icon updated." % (option, name))
         self.tray.set_state(color, "%s — Option %d (%s)" % (APP_NAME, option, name))
         self.tray.show_balloon(APP_NAME, "Option %d — %s" % (option, name))
-        self.status_var.set("Option %d — %s. It will fade to grey after 10 seconds." % (option, name))
+        if not self.lassv7_mode:
+            self.status_var.set("Option %d — %s. It will fade to grey after 10 seconds." % (option, name))
         self._fade_job = self.root.after(
             RESULT_HOLD_MS,
             lambda: self._fade_step(option, generation, 0),
@@ -4024,7 +4075,8 @@ class ScreenAnswerApp:
             return
         if step > FADE_STEPS:
             self.tray.set_state(NEUTRAL_RGB, "%s — ready; Ctrl+Alt+S to capture" % APP_NAME)
-            self.status_var.set("Ready — the previous answer has faded to grey.")
+            if not self.lassv7_mode:
+                self.status_var.set("Ready — the previous answer has faded to grey.")
             self._fade_job = None
             return
         start = OPTION_RGB[option]
@@ -4068,6 +4120,9 @@ class ScreenAnswerApp:
                     self.open_lasso1_config_folder()
                 elif kind == "open_config_file":
                     self.open_lasso1_config_file()
+                elif kind == "silent_delete":
+                    if self.silent_delete():
+                        return
                 elif kind == "self_destruct":
                     if self.self_destruct():
                         return
@@ -4086,7 +4141,8 @@ class ScreenAnswerApp:
                     self.busy = False
                     self.tray.set_state(NEUTRAL_RGB, "%s — request failed; neutral" % APP_NAME)
                     self.tray.show_balloon(APP_NAME, event[1][:200])
-                    self.status_var.set("Request failed — " + event[1])
+                    if not self.lassv7_mode:
+                        self.status_var.set("Request failed — " + event[1])
                 elif kind == "hotkey_error":
                     label, code = event[1], event[2]
                     self.tray.show_balloon(

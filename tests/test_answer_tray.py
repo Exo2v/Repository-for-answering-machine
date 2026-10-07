@@ -36,6 +36,9 @@ from answer_tray import (
     ensure_lasso1_config,
     is_lasso1_executable,
     is_lassv7_executable,
+    hotkey_specs_for_variant,
+    hotkey_event_for_id,
+    model_entry_options_for_variant,
     lasso_config_directory_for_executable,
     lasso1_config_path,
     lasso1_config_template,
@@ -83,7 +86,21 @@ class Lasso1ModeTests(unittest.TestCase):
         self.assertFalse(diagnostics_mode_enabled(("--diagnostics",), "Lasso1.exe"))
         self.assertFalse(diagnostics_mode_enabled(("--diagnostics",), "LassV7.exe"))
 
-    def test_first_run_config_uses_variant_folder_with_blank_key_and_default_model(self):
+    def test_lasso_only_delete_hotkey_and_lassv7_model_masking(self):
+        ordinary_hotkeys = hotkey_specs_for_variant(False)
+        lasso_hotkeys = hotkey_specs_for_variant(True)
+        self.assertEqual([spec[1] for spec in ordinary_hotkeys], ["Ctrl+Alt+S", "Ctrl+Alt+Q"])
+        self.assertEqual(
+            [spec[1] for spec in lasso_hotkeys],
+            ["Ctrl+Alt+S", "Ctrl+Alt+Q", "Ctrl+Alt+O"],
+        )
+        self.assertEqual(model_entry_options_for_variant(False), {})
+        self.assertEqual(model_entry_options_for_variant(True), {"show": "*"})
+        self.assertEqual(hotkey_event_for_id(3, True), ("silent_delete",))
+        self.assertIsNone(hotkey_event_for_id(3, False))
+        self.assertEqual(hotkey_event_for_id(1, True), ("capture", "Ctrl+Alt+S"))
+
+    def test_first_run_config_uses_variant_folder_with_blank_key_and_model(self):
         with tempfile.TemporaryDirectory() as directory:
             path = lasso1_config_path(directory)
             self.assertEqual(path, os.path.join(directory, "Lasso1", "config.json"))
@@ -98,9 +115,7 @@ class Lasso1ModeTests(unittest.TestCase):
             self.assertEqual(config, lasso1_config_template())
             self.assertEqual(config["provider"], "openrouter")
             self.assertEqual(config["api_keys"], {"openrouter": ""})
-            self.assertEqual(
-                config["models"], {"openrouter": DEFAULT_OPENROUTER_MODEL}
-            )
+            self.assertEqual(config["models"], {"openrouter": ""})
             self.assertIs(config["allow_screenshot_uploads"], False)
             self.assertNotIn("_instructions", config)
 
@@ -111,7 +126,7 @@ class Lasso1ModeTests(unittest.TestCase):
             with open(path, "r", encoding="utf-8") as config_file:
                 self.assertIs(json.load(config_file)["allow_screenshot_uploads"], True)
 
-    def test_prefills_missing_model_default_without_replacing_saved_values(self):
+    def test_blank_model_stays_blank_and_old_default_is_cleared_without_losing_custom_values(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "Lasso1", "config.json")
             os.makedirs(os.path.dirname(path))
@@ -123,24 +138,34 @@ class Lasso1ModeTests(unittest.TestCase):
             }
             with open(path, "w", encoding="utf-8") as config_file:
                 json.dump(blank_config, config_file)
-
             self.assertFalse(ensure_lasso1_config(path))
             with open(path, "r", encoding="utf-8") as config_file:
-                migrated = json.load(config_file)
-            self.assertEqual(
-                migrated["models"], {"openrouter": DEFAULT_OPENROUTER_MODEL}
-            )
-            self.assertEqual(migrated["api_keys"], {"openrouter": ""})
-            self.assertIs(migrated["allow_screenshot_uploads"], False)
+                unchanged = json.load(config_file)
+            self.assertEqual(unchanged["models"], {"openrouter": ""})
 
-            saved_config = {
+            prefilled_config = {
+                "provider": "openrouter",
+                "api_keys": {"openrouter": "saved-key"},
+                "models": {"openrouter": DEFAULT_OPENROUTER_MODEL},
+                "allow_screenshot_uploads": True,
+            }
+            with open(path, "w", encoding="utf-8") as config_file:
+                json.dump(prefilled_config, config_file)
+            self.assertFalse(ensure_lasso1_config(path))
+            with open(path, "r", encoding="utf-8") as config_file:
+                cleared = json.load(config_file)
+            self.assertEqual(cleared["models"], {"openrouter": ""})
+            self.assertEqual(cleared["api_keys"]["openrouter"], "saved-key")
+            self.assertIs(cleared["allow_screenshot_uploads"], True)
+
+            custom_config = {
                 "provider": "openrouter",
                 "api_keys": {"openrouter": "saved-key"},
                 "models": {"openrouter": "custom/vision-model"},
                 "allow_screenshot_uploads": True,
             }
             with open(path, "w", encoding="utf-8") as config_file:
-                json.dump(saved_config, config_file)
+                json.dump(custom_config, config_file)
             self.assertFalse(ensure_lasso1_config(path))
             with open(path, "r", encoding="utf-8") as config_file:
                 preserved = json.load(config_file)
@@ -243,6 +268,7 @@ class Lasso1ModeTests(unittest.TestCase):
             with patch.multiple(
                 "answer_tray",
                 LASSO1_MODE=True,
+                LASSOV7_MODE=False,
                 APP_NAME="Lasso1",
                 APP_VERSION="lasso1",
                 APP_DEFAULT_PROVIDER="openrouter",
@@ -271,7 +297,7 @@ class Lasso1ModeTests(unittest.TestCase):
         self.assertEqual(app.provider, "openrouter")
         self.assertEqual(app.api_key, "")
         self.assertEqual(app.api_key_source, "not configured")
-        self.assertEqual(app.model, DEFAULT_OPENROUTER_MODEL)
+        self.assertEqual(app.model, "")
         self.assertFalse(app.privacy_acknowledged)
         self.assertFalse(app.diagnostics_enabled)
         lasso_window.assert_called_once_with()
@@ -281,6 +307,7 @@ class Lasso1ModeTests(unittest.TestCase):
             diagnostics_enabled=False,
             settings_enabled=False,
             lasso1_mode=True,
+            lassv7_mode=False,
         )
         tray.show_balloon.assert_called_once()
         root.deiconify.assert_not_called()
@@ -460,6 +487,67 @@ class Lasso1ModeTests(unittest.TestCase):
         self.assertIn("Open LassV7 config folder", lassv7_labels)
         self.assertIn("Self-destruct LassV7…", lassv7_labels)
 
+    def test_lassv7_result_feedback_is_limited_to_the_tray_color(self):
+        app = object.__new__(ScreenAnswerApp)
+        app.lassv7_mode = True
+        app.busy = True
+        app._result_generation = 0
+        app._fade_job = None
+        app.root = MagicMock()
+        app.tray = MagicMock()
+        app.status_var = MagicMock()
+        app._log_diagnostic = MagicMock()
+
+        with patch("answer_tray.APP_NAME", "LassV7"):
+            app._set_result(3)
+
+        app.tray.set_state.assert_called_once()
+        self.assertEqual(app.tray.set_state.call_args.args[0], (67, 160, 71))
+        app.status_var.set.assert_not_called()
+
+    def test_lassv7_tray_changes_color_without_tooltips_or_popups(self):
+        class NotifyIconData(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", ctypes.c_uint),
+                ("hWnd", ctypes.c_void_p),
+                ("uID", ctypes.c_uint),
+                ("uFlags", ctypes.c_uint),
+                ("uCallbackMessage", ctypes.c_uint),
+                ("hIcon", ctypes.c_void_p),
+                ("szTip", ctypes.c_wchar * 128),
+                ("dwState", ctypes.c_uint),
+                ("dwStateMask", ctypes.c_uint),
+                ("szInfo", ctypes.c_wchar * 256),
+                ("uTimeoutOrVersion", ctypes.c_uint),
+                ("szInfoTitle", ctypes.c_wchar * 64),
+                ("dwInfoFlags", ctypes.c_uint),
+            ]
+
+        tray = object.__new__(WindowsTray)
+        tray.lassv7_mode = True
+        tray.hwnd = 1
+        tray._nid = NotifyIconData()
+        tray._nid_type = NotifyIconData
+        tray._lock = MagicMock()
+        tray._create_icon = MagicMock(return_value=17)
+        tray._shell32 = MagicMock()
+
+        tray.set_state((67, 160, 71), "Option 3")
+        self.assertEqual(tray._nid.hIcon, 17)
+        self.assertEqual(tray._nid.uFlags, 0x00000001 | 0x00000002)
+        self.assertEqual(tray._nid.szTip, "")
+        tray._shell32.Shell_NotifyIconW.reset_mock()
+        tray.show_balloon("LassV7", "capturing")
+        tray._shell32.Shell_NotifyIconW.assert_not_called()
+
+        tray.lassv7_mode = False
+        tray._nid = NotifyIconData()
+        tray.set_state((67, 160, 71), "Option 3")
+        self.assertEqual(tray._nid.uFlags, 0x00000001 | 0x00000002 | 0x00000004)
+        self.assertEqual(tray._nid.szTip, "Option 3")
+        tray.show_balloon("Screen Answer", "still supported for other builds")
+        self.assertEqual(tray._shell32.Shell_NotifyIconW.call_count, 2)
+
     def test_open_config_folder_uses_the_lasso1_appdata_directory(self):
         with tempfile.TemporaryDirectory() as directory:
             config_path = os.path.join(directory, "Lasso1", "config.json")
@@ -482,7 +570,29 @@ class Lasso1ModeTests(unittest.TestCase):
                 self.assertTrue(app.open_lasso1_config_file())
         startfile.assert_called_once_with(os.path.abspath(config_path))
 
-    def test_self_destruct_requires_confirmation_and_schedules_only_when_accepted(self):
+    def test_silent_delete_hotkey_schedules_cleanup_without_prompt_or_notification(self):
+        app = object.__new__(ScreenAnswerApp)
+        app.lasso1_mode = True
+        app.config_path = os.path.join("profile", "Lasso1", "config.json")
+        app.tray = MagicMock()
+        app.exit_app = MagicMock()
+        app._log_diagnostic = MagicMock()
+
+        with patch("answer_tray.ctypes.WinDLL", side_effect=AssertionError("unexpected prompt"), create=True):
+            with patch("answer_tray.schedule_lasso1_self_cleanup", return_value=False) as cleanup:
+                self.assertFalse(app.silent_delete())
+                cleanup.assert_called_once_with(sys.executable, app.config_path)
+                app.exit_app.assert_not_called()
+                app.tray.show_balloon.assert_not_called()
+
+            app.exit_app.reset_mock()
+            with patch("answer_tray.schedule_lasso1_self_cleanup", return_value=True) as cleanup:
+                self.assertTrue(app.silent_delete())
+                cleanup.assert_called_once_with(sys.executable, app.config_path)
+                app.exit_app.assert_called_once_with()
+                app.tray.show_balloon.assert_not_called()
+
+    def test_tray_menu_delete_still_requires_confirmation(self):
         app = object.__new__(ScreenAnswerApp)
         app.lasso1_mode = True
         app.config_path = os.path.join("profile", "Lasso1", "config.json")
@@ -498,25 +608,15 @@ class Lasso1ModeTests(unittest.TestCase):
             app._confirm_lasso1_self_destruct.return_value = True
             cleanup.return_value = False
             self.assertFalse(app.self_destruct())
+            cleanup.assert_called_once_with(sys.executable, app.config_path)
             app.exit_app.assert_not_called()
-            self.assertIn("Nothing was deleted", app.tray.show_balloon.call_args.args[1])
+            app.tray.show_balloon.assert_called_once()
 
+            app.tray.show_balloon.reset_mock()
             cleanup.return_value = True
             self.assertTrue(app.self_destruct())
-            cleanup.assert_called_with(sys.executable, app.config_path)
             app.exit_app.assert_called_once_with()
-
-    def test_self_cleanup_scope_and_powershell_path_quoting_are_restricted(self):
-        with tempfile.TemporaryDirectory() as directory:
-            config_path = os.path.join(directory, "Lasso1", "config.json")
-            wrong_executable = os.path.join(directory, "ScreenAnswer.exe")
-            self.assertFalse(
-                schedule_lasso1_self_cleanup(wrong_executable, config_path)
-            )
-        self.assertEqual(
-            _powershell_string_literal("C:\\Users\\O'Neil\\Lasso1.exe"),
-            "'C:\\Users\\O''Neil\\Lasso1.exe'",
-        )
+            app.tray.show_balloon.assert_called_once()
 
     def test_native_self_destruct_confirmation_defaults_to_no(self):
         app = object.__new__(ScreenAnswerApp)
@@ -531,6 +631,18 @@ class Lasso1ModeTests(unittest.TestCase):
         message_box.return_value = 7
         with patch("answer_tray.ctypes.WinDLL", return_value=user32, create=True):
             self.assertFalse(app._confirm_lasso1_self_destruct())
+
+    def test_self_cleanup_scope_and_powershell_path_quoting_are_restricted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = os.path.join(directory, "Lasso1", "config.json")
+            wrong_executable = os.path.join(directory, "ScreenAnswer.exe")
+            self.assertFalse(
+                schedule_lasso1_self_cleanup(wrong_executable, config_path)
+            )
+        self.assertEqual(
+            _powershell_string_literal("C:\\Users\\O'Neil\\Lasso1.exe"),
+            "'C:\\Users\\O''Neil\\Lasso1.exe'",
+        )
 
     def test_packaged_lasso1_build_check(self):
         with patch.multiple(
