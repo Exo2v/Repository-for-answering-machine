@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Screen Answer v1 — GUI + Tray + Diagnostics</title>
+<style>
+  :root { --bg:#12151a; --panel:#1b2028; --line:#2a323d; --text:#e8edf2; --dim:#93a1af; --accent:#4c9aff; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.5 "Segoe UI",system-ui,sans-serif; background:var(--bg); color:var(--text); }
+  header { display:flex; align-items:center; gap:14px; padding:14px 20px; background:var(--panel); border-bottom:1px solid var(--line); }
+  h1 { font-size:17px; margin:0; font-weight:600; }
+  .badge { font-size:11px; color:var(--dim); border:1px solid var(--line); border-radius:20px; padding:2px 10px; }
+  .tray { margin-left:auto; display:flex; align-items:center; gap:10px; background:#0d1014; border:1px solid var(--line); border-radius:10px; padding:8px 14px; }
+  .tray-icon { width:22px; height:22px; border-radius:50%; background:#808080; box-shadow:0 0 10px rgba(255,255,255,.15) inset, 0 0 6px rgba(0,0,0,.6); transition: background .25s; }
+  .tray-tip { font-size:12px; color:var(--dim); max-width:280px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  main { display:grid; grid-template-columns: 400px 1fr; gap:16px; padding:16px 20px; }
+  @media (max-width: 960px) { main { grid-template-columns: 1fr; } }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px; }
+  .card h2 { font-size:13px; text-transform:uppercase; letter-spacing:.08em; color:var(--dim); margin:0 0 12px; }
+  label { display:block; font-size:12px; color:var(--dim); margin:10px 0 4px; }
+  input[type=text] { width:100%; padding:8px 10px; border-radius:8px; border:1px solid var(--line); background:#0d1014; color:var(--text); font-family:Consolas,monospace; font-size:12px; }
+  .row { display:flex; align-items:center; gap:8px; margin:10px 0; }
+  .row input { accent-color:var(--accent); }
+  .notice { font-size:11px; color:var(--dim); background:#0d1014; border:1px solid var(--line); border-radius:8px; padding:8px 10px; margin:8px 0; }
+  button { cursor:pointer; border:0; border-radius:8px; padding:9px 14px; font-weight:600; font-size:13px; }
+  .primary { background:var(--accent); color:#041022; width:100%; margin-top:12px; }
+  .primary:disabled { opacity:.55; cursor:wait; }
+  .ghost { background:transparent; color:var(--dim); border:1px solid var(--line); }
+  .menu { display:flex; flex-direction:column; gap:1px; background:var(--line); border:1px solid var(--line); border-radius:10px; overflow:hidden; margin-top:12px; }
+  .menu div { background:#141920; padding:8px 12px; font-size:12.5px; }
+  .menu div:hover { background:#1c232c; }
+  .menu .sep { padding:0; height:1px; background:var(--line); }
+  .menu kbd { float:right; color:var(--dim); font-size:10px; }
+  #console { background:#0a0d11; border:1px solid var(--line); border-radius:10px; height: 520px; overflow:auto; padding:12px 14px; font:12px/1.55 Consolas,Menlo,monospace; white-space:pre-wrap; word-break:break-word; }
+  .log-dim { color:#5d6b78; }
+  .log-ok { color:#57d9a3; }
+  .log-warn { color:#e8c257; }
+  .log-err { color:#ff7b72; }
+  .status { margin-top:10px; font-size:12px; color:var(--dim); }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#3a4652; margin-right:6px; }
+  .dot.on { background:#57d9a3; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Screen Answer — version 1</h1>
+  <span class="badge">GUI · tray · diagnostics console</span>
+  <div class="tray" title="Notification-area tray">
+    <div class="tray-icon" id="trayIcon"></div>
+    <div class="tray-tip" id="trayTip">Screen Answer (ready)</div>
+  </div>
+</header>
+<main>
+  <section>
+    <div class="card">
+      <h2>Settings</h2>
+      <label>Gateway endpoint (FreeLLMAPI / OpenAI-compatible)</label>
+      <input type="text" id="endpoint" value="http://127.0.0.1:3001/v1">
+      <label>Model (auto, auto:reliable, auto:search, or pinned ID)</label>
+      <input type="text" id="model" value="auto:reliable">
+      <div class="row"><input type="checkbox" id="webSearch" checked><span>Enable live web search (google_search grounding)</span></div>
+      <div class="notice">Web search: question-derived query text may be sent to the search upstream through the gateway. The screenshot goes only to the vision solver.</div>
+      <div class="row"><input type="checkbox" id="consent" checked><span>I allow sending screenshots to the configured endpoint</span></div>
+      <div class="notice">Data path: the full desktop PNG is held in memory and posted to the gateway. Consent resets when the route changes.</div>
+      <button class="primary" id="captureBtn">Capture &amp; ask now &nbsp;(Ctrl+Alt+S)</button>
+      <div class="status"><span class="dot" id="busyDot"></span><span id="statusText">Ready.</span></div>
+      <div class="menu" title="Tray menu">
+        <div>Capture &amp; ask <kbd>Ctrl+Alt+S</kbd></div>
+        <div>Settings</div>
+        <div>Diagnostics</div>
+        <div class="sep"></div>
+        <div>Exit <kbd>Ctrl+Alt+Q</kbd></div>
+      </div>
+    </div>
+  </section>
+  <section class="card">
+    <h2>Diagnostics console</h2>
+    <div id="console"></div>
+  </section>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const consoleEl = $("console");
+let lastLogCount = 0;
+
+function color(rgb) { return `rgb(${rgb[0]},${rgb[1]},${rgb[2]})`; }
+
+function classify(line) {
+  if (/FAIL|error|failed|rejected|blocked/i.test(line)) return "log-err";
+  if (/retry|rate limit|waiting|neutral|no reliable|consent/i.test(line)) return "log-warn";
+  if (/ANSWER:|Gateway OK|PASS|grounding/i.test(line)) return "log-ok";
+  return "";
+}
+
+async function poll() {
+  try {
+    const state = await (await fetch("/api/state")).json();
+    $("trayIcon").style.background = color(state.tray);
+    $("trayTip").textContent = state.tooltip;
+    $("busyDot").className = "dot" + (state.busy ? " on" : "");
+    if (state.logs.length > lastLogCount) {
+      for (let i = lastLogCount; i < state.logs.length; i++) {
+        const span = document.createElement("div");
+        span.className = classify(state.logs[i]);
+        span.textContent = state.logs[i];
+        consoleEl.appendChild(span);
+      }
+      lastLogCount = state.logs.length;
+      consoleEl.scrollTop = consoleEl.scrollHeight;
+    }
+  } catch (e) { /* server restarting */ }
+}
+
+$("captureBtn").addEventListener("click", async () => {
+  $("captureBtn").disabled = true;
+  $("statusText").textContent = "Capturing…";
+  await fetch("/api/capture", { method: "POST", headers: {"Content-Type": "application/json"}, body: "{}" });
+  setTimeout(() => { $("captureBtn").disabled = false; $("statusText").textContent = "Ready."; }, 2500);
+});
+
+for (const id of ["endpoint", "model", "webSearch", "consent"]) {
+  $(id).addEventListener("change", async () => {
+    await fetch("/api/settings", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        endpoint: $("endpoint").value,
+        model: $("model").value,
+        web_search: $("webSearch").checked,
+        allow_uploads: $("consent").checked,
+      }),
+    });
+    $("statusText").textContent = "Settings saved.";
+  });
+}
+
+setInterval(poll, 600);
+poll();
+</script>
+</body>
+</html>
