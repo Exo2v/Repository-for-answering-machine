@@ -15,6 +15,7 @@ Product spec for v1:
 
 from __future__ import annotations
 
+import ctypes
 import os
 import queue
 import threading
@@ -28,6 +29,41 @@ HOTKEY_DELETE_ID = 2
 RESULT_HOLD_MS = 10_000
 FADE_DURATION_MS = 1_500
 FADE_INTERVAL_MS = 300
+
+# ---------------------------------------------------------------------------
+# Win32 constants shared by the message thread and the helper methods.
+# They live at module scope on purpose: methods like set_state() and
+# _show_context_menu() must see them too (a function-scope constant is a
+# NameError waiting to happen at click time).
+# ---------------------------------------------------------------------------
+WM_TRAY = 0x8000 + 41
+WM_HOTKEY = 0x0312
+WM_CLOSE = 0x0010
+WM_DESTROY = 0x0002
+WM_LBUTTONUP = 0x0202
+WM_LBUTTONDBLCLK = 0x0203
+WM_RBUTTONUP = 0x0205
+MOD_ALT = 0x0001
+MOD_CONTROL = 0x0002
+MOD_NOREPEAT = 0x4000
+NIM_ADD = 0x00000000
+NIM_MODIFY = 0x00000001
+NIM_DELETE = 0x00000002
+NIF_MESSAGE = 0x00000001
+NIF_ICON = 0x00000002
+WS_POPUP = 0x80000000
+MF_STRING = 0x00000000
+TPM_RETURNCMD = 0x0100
+TPM_RIGHTBUTTON = 0x0002
+CMD_OPEN = 102
+CMD_DIAGNOSTICS = 104
+TRAY_UID = 1
+
+
+class POINT(ctypes.Structure):
+    """Cursor position (Windows POINT). Module scope so every user shares one type."""
+
+    _fields_ = [("x", ctypes.c_int32), ("y", ctypes.c_int32)]
 
 
 class ShellBase:
@@ -101,35 +137,11 @@ class WindowsTray(ShellBase):
                 self.events.put(("fatal", "Windows tray stopped unexpectedly: %s" % exc))
 
     def _message_thread(self) -> None:
-        import ctypes
         from ctypes import wintypes as wt
 
         LRESULT = ctypes.c_ssize_t
         WPARAM = ctypes.c_size_t
         LPARAM = ctypes.c_ssize_t
-        WM_APP = 0x8000
-        WM_TRAY = WM_APP + 41
-        WM_HOTKEY = 0x0312
-        WM_CLOSE = 0x0010
-        WM_DESTROY = 0x0002
-        WM_LBUTTONUP = 0x0202
-        WM_LBUTTONDBLCLK = 0x0203
-        WM_RBUTTONUP = 0x0205
-        MOD_ALT = 0x0001
-        MOD_CONTROL = 0x0002
-        MOD_NOREPEAT = 0x4000
-        NIM_ADD = 0x00000000
-        NIM_MODIFY = 0x00000001
-        NIM_DELETE = 0x00000002
-        NIF_MESSAGE = 0x00000001
-        NIF_ICON = 0x00000002
-        WS_POPUP = 0x80000000
-        MF_STRING = 0x00000000
-        TPM_RETURNCMD = 0x0100
-        TPM_RIGHTBUTTON = 0x0002
-        CMD_OPEN = 102
-        CMD_DIAGNOSTICS = 104
-        TRAY_UID = 1
 
         class GUID(ctypes.Structure):
             _fields_ = [
@@ -157,9 +169,6 @@ class WindowsTray(ShellBase):
                 ("guidItem", GUID),
                 ("hBalloonIcon", wt.HICON),
             ]
-
-        class POINT(ctypes.Structure):
-            _fields_ = [("x", wt.LONG), ("y", wt.LONG)]
 
         WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wt.HWND, wt.UINT, WPARAM, LPARAM)
 
@@ -223,7 +232,7 @@ class WindowsTray(ShellBase):
         user32.AppendMenuW.argtypes = [wt.HMENU, wt.UINT, ctypes.c_size_t, wt.LPCWSTR]
         user32.AppendMenuW.restype = wt.BOOL
         user32.TrackPopupMenu.argtypes = [wt.HMENU, wt.UINT, ctypes.c_int, ctypes.c_int, ctypes.c_int, wt.HWND, ctypes.c_void_p]
-        user32.TrackPopupMenu.restype = wt.c_uint
+        user32.TrackPopupMenu.restype = ctypes.c_uint
         user32.DestroyMenu.argtypes = [wt.HMENU]
         user32.GetCursorPos.argtypes = [ctypes.POINTER(POINT)]
         user32.SetForegroundWindow.argtypes = [wt.HWND]

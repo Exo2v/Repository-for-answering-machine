@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import queue
 import sys
 from typing import Any, Tuple
@@ -112,7 +113,27 @@ def _run_app(show_diagnostics: bool) -> int:
         app.handle_event(("exit",))
         root.after(200, root.destroy)
 
-    shell = create_shell(events)
+    shell = None
+    try:
+        shell = create_shell(events)
+    except Exception as exc:
+        diagnostics.log(
+            "Tray could not start (%s): %s — continuing without the tray."
+            % (type(exc).__name__, exc)
+        )
+        try:
+            from tkinter import messagebox
+
+            messagebox.showwarning(
+                "Screen Answer",
+                "The tray icon could not start:\n\n%s\n\n"
+                "The app will continue without it (GUI + diagnostics only)." % exc,
+            )
+        except Exception:
+            pass
+        from .tray import NullShell
+
+        shell = NullShell()
 
     window = SettingsWindow(
         settings,
@@ -156,6 +177,31 @@ def _run_app(show_diagnostics: bool) -> int:
     return 0
 
 
+def _run_smoke_tray() -> int:
+    """Exercise the real ctypes tray: create the icon, cycle colors, exit.
+
+    Used by CI (and `--selftest` on Windows) so the Win32 layer is actually
+    executed in the build, not only linted.
+    """
+    import queue as queue_module
+
+    from .parser import NEUTRAL_RGB, OPTION_RGB
+    from .tray import create_shell
+
+    events: "queue_module.Queue" = queue_module.Queue()
+    try:
+        shell = create_shell(events)
+        for rgb in list(OPTION_RGB.values()) + [NEUTRAL_RGB]:
+            shell.set_state(rgb)
+        shell.show_balloon("smoke", "silent shell ignores this")
+        shell.stop()
+    except Exception as exc:
+        print("tray smoke failed: %s: %s" % (type(exc).__name__, exc))
+        return 1
+    print("tray smoke OK")
+    return 0
+
+
 def main(argv=None) -> int:
     # Frozen `--windowed` builds have no console: sys.stdout/sys.stderr can be
     # None. Never crash on output (print/argparse) in that mode.
@@ -177,6 +223,11 @@ def main(argv=None) -> int:
         "--selftest", action="store_true", help="run headless smoke checks and exit"
     )
     parser.add_argument(
+        "--smoke-tray",
+        action="store_true",
+        help="create the real tray, cycle colors, exit (Win32 smoke check)",
+    )
+    parser.add_argument(
         "--config",
         metavar="PATH",
         help="portable config path (default: ./screen_answer_config.json)",
@@ -184,10 +235,15 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     if args.selftest:
-        return _run_selftest()
+        code = _run_selftest()
+        if code == 0 and os.name == "nt":
+            # Frozen/windowed or not — on Windows the selftest must also prove
+            # the real tray initializes (the otter release shipped without this).
+            code = _run_smoke_tray()
+        return code
+    if args.smoke_tray:
+        return _run_smoke_tray()
     if args.config:
-        import os
-
         os.environ["SCREENANSWER_CONFIG"] = args.config  # informational
         from . import config as config_module
 
