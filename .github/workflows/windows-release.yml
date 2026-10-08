@@ -9,6 +9,7 @@ on:
       - "v*"
       - "lasso1"
       - "lasso2"
+      - "lasso3"
 
 permissions:
   contents: write
@@ -16,7 +17,7 @@ permissions:
 jobs:
   build-standard:
     name: Build legacy-compatible Windows executables
-    if: github.ref != 'refs/tags/lasso1' && github.ref != 'refs/tags/lasso2'
+    if: github.ref != 'refs/tags/lasso1' && github.ref != 'refs/tags/lasso2' && github.ref != 'refs/tags/lasso3'
     runs-on: windows-2022
     steps:
       - name: Check out source
@@ -140,6 +141,68 @@ jobs:
             dist/LassoV2.exe
             dist/LassV27.exe
             dist/webpull.ps1
+          if-no-files-found: error
+          retention-days: 30
+
+  build-lasso3-win11:
+    name: Build new Lasso for Windows 11 (x64)
+    if: github.ref == 'refs/tags/lasso3' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && contains(github.event.head_commit.message, '[lasso3-build]'))
+    runs-on: windows-2022
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up 64-bit Python 3.11 (Windows 11 target)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: "x64"
+
+      - name: Test
+        run: python -m unittest discover -s tests -v
+
+      - name: Package new Lasso for Windows 11
+        run: |
+          python -m pip install pyinstaller==5.13.2
+          pyinstaller --noconfirm --clean --onefile --windowed --name Lasso answer_tray.py
+          .\dist\Lasso.exe --check-lasso-build
+
+      - name: Upload Windows 11 executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: New-Lasso-Windows-11-x64
+          path: dist/Lasso.exe
+          if-no-files-found: error
+          retention-days: 30
+
+  build-lasso3-win7:
+    name: Build new Lasso for Windows 7 (x86)
+    if: github.ref == 'refs/tags/lasso3' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && contains(github.event.head_commit.message, '[lasso3-build]'))
+    runs-on: windows-2022
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up 32-bit Python 3.8.10 (Windows 7 target)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.8.10"
+          architecture: "x86"
+
+      - name: Test
+        run: python -m unittest discover -s tests -v
+
+      - name: Package new Lasso for Windows 7
+        run: |
+          python -m pip install pyinstaller==5.13.2
+          pyinstaller --noconfirm --clean --onefile --windowed --name LassoWin7 answer_tray.py
+          .\dist\LassoWin7.exe --check-lassowin7-build
+
+      - name: Upload Windows 7 executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: New-Lasso-Windows-7-x86
+          path: dist/LassoWin7.exe
           if-no-files-found: error
           retention-days: 30
 
@@ -294,3 +357,41 @@ jobs:
             release-assets/LassoV2.exe
             release-assets/LassV27.exe
             release-assets/webpull.ps1
+
+  release-lasso3:
+    name: Publish new Lasso Windows release
+    if: github.ref == 'refs/tags/lasso3'
+    needs:
+      - build-lasso3-win11
+      - build-lasso3-win7
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Windows 11 executable
+        uses: actions/download-artifact@v4
+        with:
+          name: New-Lasso-Windows-11-x64
+          path: release-assets
+
+      - name: Download Windows 7 executable
+        uses: actions/download-artifact@v4
+        with:
+          name: New-Lasso-Windows-7-x86
+          path: release-assets
+
+      - name: Attach new Lasso executables to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Lasso APInex and OpenRouter
+          generate_release_notes: false
+          overwrite_files: true
+          body: |
+            New Lasso family: `Lasso.exe` targets 64-bit Windows 11 using Python 3.11; `LassoWin7.exe` targets 32-bit Windows 7 using Python 3.8.10. Existing Lasso1/LassV7 and LassoV2/LassV27 families are separate and unchanged.
+
+            First-run settings are stored separately in `%APPDATA%\Lasso\config.json` or `%APPDATA%\LassoWin7\config.json`. Both API keys start blank, no configured user files or credentials are bundled, and screenshot-upload consent is off. On first launch without the selected provider's key, Settings opens automatically; after a key is saved it is available on request. Save closes it. Choose APInex or OpenRouter and enter that provider's key. The Settings GUI intentionally has no model field; model selection is limited to curated IDs in the matching config file.
+
+            APInex uses `https://api.apinex.bond/v1/chat/completions`, defaults to `free/gemini-3.8-flash`, and permits `free/gemini-3.1-pro` as a config-only alternative; the GPT-6 Luna option remains confined to standard Screen Answer. OpenRouter uses `https://openrouter.ai/api/v1/chat/completions` and is restricted to `google/gemma-4-31b-it:free` or `google/gemma-4-26b-a4b-it:free`. No paid or cross-provider fallback is used. Provider catalogs and quota/pricing terms can change; check your APInex account before use and do not assume guaranteed free or unlimited access.
+
+            Capture uses Ctrl+Alt+S. Ctrl+Alt+O silently closes the app and schedules cleanup of only the running Lasso executable and its matching config; unexpected files are left alone. Diagnostics start only after you explicitly choose Open diagnostic console; the separate console log may include OCR/model text and provider errors, but omits API keys and screenshot pixels. LassoWin7 suppresses app-generated balloons and hover tooltips; tray color reports runtime status.
+          files: |
+            release-assets/Lasso.exe
+            release-assets/LassoWin7.exe

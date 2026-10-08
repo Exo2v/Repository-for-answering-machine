@@ -40,6 +40,11 @@ APINEX_FREE_VISION_MODELS = frozenset(
         "free/gpt-6-luna",
     )
 )
+# Keep the new Lasso family's model allowlist narrower than standard Screen Answer;
+# GPT-6 Luna remains an optional APInex choice only in the standard app.
+LASSO_APINEX_VISION_MODELS = frozenset(
+    (DEFAULT_APINEX_MODEL, "free/gemini-3.1-pro")
+)
 # Keep OpenRouter on explicitly priced :free variants, not openrouter/free (whose
 # model selection is dynamic) or an unqualified model ID that could be paid.
 OPENROUTER_FREE_VISION_REASONING_MODELS = frozenset(
@@ -55,6 +60,8 @@ LASSO1_CONFIG_DIRECTORY = "Lasso1"
 LASSV7_CONFIG_DIRECTORY = "LassV7"
 LASSOV2_CONFIG_DIRECTORY = "LassoV2"
 LASSV27_CONFIG_DIRECTORY = "LassV27"
+LASSO_CONFIG_DIRECTORY = "Lasso"
+LASSOWIN7_CONFIG_DIRECTORY = "LassoWin7"
 LASSO1_CONFIG_FILENAME = "config.json"
 _DEFAULT_EXE_NAME = os.path.splitext(os.path.basename(sys.executable))[0].lower()
 _LASSO_CONFIG_DIRECTORIES = {
@@ -62,50 +69,75 @@ _LASSO_CONFIG_DIRECTORIES = {
     "lassv7": LASSV7_CONFIG_DIRECTORY,
     "lassov2": LASSOV2_CONFIG_DIRECTORY,
     "lassv27": LASSV27_CONFIG_DIRECTORY,
+    "lasso": LASSO_CONFIG_DIRECTORY,
+    "lassowin7": LASSOWIN7_CONFIG_DIRECTORY,
 }
 _LASSO_APP_NAMES = {
     "lasso1": "Lasso1",
     "lassv7": "LassV7",
     "lassov2": "LassoV2",
     "lassv27": "LassV27",
+    "lasso": "Lasso",
+    "lassowin7": "Lasso",
 }
+
+
+def _normalized_executable_name(executable_name: Optional[str] = None) -> str:
+    name = executable_name or sys.executable
+    return os.path.splitext(os.path.basename(name))[0].lower()
 
 
 def lasso_config_directory_for_executable(executable_name: Optional[str] = None) -> Optional[str]:
     """Return the private config directory for a dedicated Lasso executable."""
-    name = executable_name or sys.executable
-    name = os.path.splitext(os.path.basename(name))[0].lower()
-    return _LASSO_CONFIG_DIRECTORIES.get(name)
+    return _LASSO_CONFIG_DIRECTORIES.get(_normalized_executable_name(executable_name))
 
 
 def lasso_app_name_for_executable(executable_name: Optional[str] = None) -> Optional[str]:
     """Return the display name for a supported legacy or current Lasso executable."""
-    name = executable_name or sys.executable
-    name = os.path.splitext(os.path.basename(name))[0].lower()
-    return _LASSO_APP_NAMES.get(name)
+    return _LASSO_APP_NAMES.get(_normalized_executable_name(executable_name))
 
 
 def is_lasso1_executable(executable_name: Optional[str] = None) -> bool:
-    """Identify any dedicated OpenRouter-only, tray-only Lasso executable."""
+    """Identify a dedicated tray-only Lasso executable, including legacy variants."""
     return lasso_config_directory_for_executable(executable_name) is not None
+
+
+def is_lasso_multi_provider_executable(executable_name: Optional[str] = None) -> bool:
+    """Identify the new APInex/OpenRouter Lasso family."""
+    return _normalized_executable_name(executable_name) in ("lasso", "lassowin7")
+
+
+def is_lasso_openrouter_only_executable(executable_name: Optional[str] = None) -> bool:
+    """Identify existing Lasso builds that intentionally remain OpenRouter-only."""
+    return is_lasso1_executable(executable_name) and not is_lasso_multi_provider_executable(
+        executable_name
+    )
 
 
 def is_lassv7_executable(executable_name: Optional[str] = None) -> bool:
     """Identify the Python 3.8 / Windows 7-compatible Lasso packages."""
-    name = executable_name or sys.executable
-    return os.path.splitext(os.path.basename(name))[0].lower() in ("lassv7", "lassv27")
+    return _normalized_executable_name(executable_name) in (
+        "lassv7",
+        "lassv27",
+        "lassowin7",
+    )
 
 
 LASSOV7_MODE = is_lassv7_executable()
 LASSO1_MODE = is_lasso1_executable()
+LASSO_MULTI_PROVIDER_MODE = is_lasso_multi_provider_executable()
+LASSO_OPENROUTER_ONLY_MODE = is_lasso_openrouter_only_executable()
+LASSO_DIAGNOSTIC_CONSOLE_MODE = LASSO_MULTI_PROVIDER_MODE
 APP_NAME = lasso_app_name_for_executable() or "Screen Answer"
 APP_VERSION = APP_NAME.lower() if LASSO1_MODE else "1.7.0-experimental"
 
 
 def default_provider_for_executable(executable_name: str) -> str:
     """Select a provider default for a named executable variant."""
-    name = os.path.splitext(os.path.basename(executable_name))[0].lower()
-    if is_lasso1_executable(name):
+    name = _normalized_executable_name(executable_name)
+    if is_lasso_multi_provider_executable(name):
+        return "apinex"
+    if is_lasso_openrouter_only_executable(name):
         return "openrouter"
     if "ollama" in name:
         return "ollama"
@@ -136,9 +168,14 @@ _ALL_DEFAULT_MODELS = {
 
 
 def provider_labels_for_executable(executable_name: str) -> Dict[str, str]:
-    """Expose only OpenRouter in either dedicated Lasso executable."""
-    if is_lasso1_executable(executable_name):
+    """Expose only the providers supported by each standalone executable family."""
+    if is_lasso_openrouter_only_executable(executable_name):
         return {"openrouter": _ALL_PROVIDER_LABELS["openrouter"]}
+    if is_lasso_multi_provider_executable(executable_name):
+        return {
+            provider: _ALL_PROVIDER_LABELS[provider]
+            for provider in ("apinex", "openrouter")
+        }
     return dict(_ALL_PROVIDER_LABELS)
 
 
@@ -173,6 +210,18 @@ def valid_model_name(provider: str, model: str) -> bool:
         return model in OPENROUTER_FREE_VISION_REASONING_MODELS
     if provider == "mistral":
         return bool(re.fullmatch(r"[A-Za-z0-9._-]{1,100}", model))
+    return False
+
+
+def valid_lasso_multi_provider_model(provider: str, model: str) -> bool:
+    """Validate the smaller model allowlist for the new APInex/OpenRouter Lasso."""
+    if not isinstance(provider, str) or not isinstance(model, str):
+        return False
+    normalized_provider = provider.lower()
+    if normalized_provider == "apinex":
+        return model in LASSO_APINEX_VISION_MODELS
+    if normalized_provider == "openrouter":
+        return valid_model_name("openrouter", model)
     return False
 
 
@@ -265,10 +314,27 @@ def diagnostics_page_available(
     argv: Optional[Tuple[str, ...]] = None,
     executable: Optional[str] = None,
 ) -> bool:
-    """Expose diagnostics on demand in Lasso builds or in diagnostic builds."""
+    """Expose the diagnostics page in legacy Lasso and standard diagnostic builds."""
     executable_path = executable or sys.executable
-    return is_lasso1_executable(executable_path) or diagnostics_mode_enabled(
+    return is_lasso_openrouter_only_executable(executable_path) or diagnostics_mode_enabled(
         argv, executable_path
+    )
+
+
+def diagnostic_console_available_for_executable(
+    executable_name: Optional[str] = None,
+) -> bool:
+    """Offer a separate Windows diagnostic console only in the new Lasso family."""
+    return is_lasso_multi_provider_executable(executable_name)
+
+
+def should_open_lasso_settings_on_startup(
+    lasso_multi_provider_mode: bool,
+    selected_api_key: Any,
+) -> bool:
+    """Prompt for a missing new-Lasso key at startup, not on configured launches."""
+    return bool(lasso_multi_provider_mode) and not (
+        isinstance(selected_api_key, str) and bool(selected_api_key.strip())
     )
 
 
@@ -280,6 +346,45 @@ def _queue_diagnostic_event(
     """Send a timestamped, content-free diagnostic line to the UI thread."""
     if enabled:
         events.put(("diagnostic", time.strftime("%Y-%m-%d %H:%M:%S"), str(message)))
+
+
+def _run_diagnostic_console_child() -> int:
+    """Render parent-supplied diagnostic lines in a new console process on Windows."""
+    if os.name != "nt":
+        return 1
+    try:
+        import msvcrt
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        # Preserve the parent's stdin pipe before AllocConsole resets standard
+        # handles to the newly attached console. The pipe carries log lines.
+        kernel32.GetStdHandle.argtypes = [ctypes.c_uint32]
+        kernel32.GetStdHandle.restype = ctypes.c_void_p
+        input_handle = kernel32.GetStdHandle(0xFFFFFFF6)  # STD_INPUT_HANDLE
+        invalid_handle = ctypes.c_void_p(-1).value
+        if not input_handle or input_handle == invalid_handle:
+            return 1
+        kernel32.AllocConsole.argtypes = []
+        kernel32.AllocConsole.restype = ctypes.c_int
+        if not kernel32.AllocConsole():
+            return 1
+        kernel32.SetConsoleTitleW.argtypes = [ctypes.c_wchar_p]
+        kernel32.SetConsoleTitleW("Lasso — Diagnostic Console")
+        input_fd = msvcrt.open_osfhandle(int(input_handle), os.O_RDONLY | getattr(os, "O_BINARY", 0))
+        input_stream = os.fdopen(input_fd, "r", encoding="utf-8", errors="replace")
+        output_stream = open("CONOUT$", "w", encoding="utf-8", errors="replace", buffering=1)
+        output_stream.write(
+            "Lasso diagnostic console opened on request.\n"
+            "Logs may contain OCR/model text and provider errors; API keys and screenshot pixels are omitted.\n\n"
+        )
+        for line in input_stream:
+            output_stream.write(line)
+        output_stream.flush()
+        input_stream.close()
+        output_stream.close()
+        return 0
+    except (OSError, AttributeError, ValueError):
+        return 1
 
 
 def lasso1_config_path(
@@ -314,6 +419,19 @@ def lasso1_config_template() -> Dict[str, Any]:
         "provider": "openrouter",
         "api_keys": {"openrouter": ""},
         "models": {"openrouter": DEFAULT_OPENROUTER_MODEL},
+        "allow_screenshot_uploads": False,
+    }
+
+
+def lasso_multi_provider_config_template() -> Dict[str, Any]:
+    """Return a new Lasso config with both hosted keys blank and consent disabled."""
+    return {
+        "provider": "apinex",
+        "api_keys": {"apinex": "", "openrouter": ""},
+        "models": {
+            "apinex": DEFAULT_APINEX_MODEL,
+            "openrouter": DEFAULT_OPENROUTER_MODEL,
+        },
         "allow_screenshot_uploads": False,
     }
 
@@ -368,6 +486,53 @@ def save_lasso1_config(
     return config_path
 
 
+def save_lasso_multi_provider_config(
+    path: Optional[str],
+    provider: str,
+    api_keys: Dict[str, str],
+    models: Dict[str, str],
+    allow_screenshot_uploads: bool,
+) -> str:
+    """Atomically save APInex/OpenRouter settings without exposing models in the GUI."""
+    config_path = path or lasso1_config_path()
+    selected_provider = provider.lower() if isinstance(provider, str) else ""
+    if selected_provider not in ("apinex", "openrouter"):
+        raise ValueError("Choose APInex or OpenRouter.")
+
+    selected_key = api_keys.get(selected_provider, "") if isinstance(api_keys, dict) else ""
+    if not isinstance(selected_key, str) or not selected_key.strip():
+        raise ValueError("An %s API key is required." % PROVIDER_LABELS[selected_provider])
+
+    safe_keys = {"apinex": "", "openrouter": ""}
+    for key_provider, key_value in (api_keys or {}).items():
+        if (
+            isinstance(key_provider, str)
+            and key_provider in safe_keys
+            and isinstance(key_value, str)
+        ):
+            safe_keys[key_provider] = key_value.strip()
+    safe_models = {}
+    for model_provider, default_model in (
+        ("apinex", DEFAULT_APINEX_MODEL),
+        ("openrouter", DEFAULT_OPENROUTER_MODEL),
+    ):
+        model_value = models.get(model_provider, default_model) if isinstance(models, dict) else default_model
+        if not isinstance(model_value, str) or not valid_lasso_multi_provider_model(
+            model_provider, model_value.strip()
+        ):
+            raise ValueError("The %s model is not in its allowed vision-model list." % PROVIDER_LABELS[model_provider])
+        safe_models[model_provider] = model_value.strip()
+
+    config = {
+        "provider": selected_provider,
+        "api_keys": safe_keys,
+        "models": safe_models,
+        "allow_screenshot_uploads": allow_screenshot_uploads is True,
+    }
+    _write_lasso1_json_atomically(config_path, config)
+    return config_path
+
+
 def _migrate_lasso1_config_defaults(config_path: str) -> bool:
     """Migrate missing/unapproved IDs to free vision choices and retain allowed variants."""
     try:
@@ -414,7 +579,7 @@ def _migrate_lasso1_config_defaults(config_path: str) -> bool:
 
 
 def ensure_lasso1_config(path: Optional[str] = None) -> bool:
-    """Create Lasso's AppData config with a default model, blank key, and no consent."""
+    """Create a legacy Lasso config with one blank key and no upload consent."""
     config_path = path or lasso1_config_path()
     directory = os.path.dirname(os.path.abspath(config_path))
     if directory:
@@ -427,6 +592,92 @@ def ensure_lasso1_config(path: Optional[str] = None) -> bool:
         _migrate_lasso1_config_defaults(config_path)
         return False
     return True
+
+
+def _migrate_lasso_multi_provider_config_defaults(config_path: str) -> bool:
+    """Normalize the new Lasso's provider, keys, models, and consent fail-closed."""
+    try:
+        with open(config_path, "r", encoding="utf-8") as config_file:
+            raw_config = json.load(config_file)
+    except (OSError, ValueError):
+        return False
+    if not isinstance(raw_config, dict):
+        return False
+
+    provider = raw_config.get("provider")
+    if not isinstance(provider, str) or provider.lower() not in ("apinex", "openrouter"):
+        provider = "apinex"
+        provider_changed = True
+    else:
+        provider = provider.lower()
+        provider_changed = provider != raw_config.get("provider")
+
+    stored_keys = raw_config.get("api_keys")
+    if not isinstance(stored_keys, dict):
+        stored_keys = {}
+    api_keys = {}
+    for key_provider in ("apinex", "openrouter"):
+        key_value = stored_keys.get(key_provider, "")
+        api_keys[key_provider] = key_value.strip() if isinstance(key_value, str) else ""
+
+    stored_models = raw_config.get("models")
+    if not isinstance(stored_models, dict):
+        stored_models = {}
+    defaults = {
+        "apinex": DEFAULT_APINEX_MODEL,
+        "openrouter": DEFAULT_OPENROUTER_MODEL,
+    }
+    models = {}
+    model_changed = False
+    for model_provider, default_model in defaults.items():
+        model_value = stored_models.get(model_provider)
+        if not isinstance(model_value, str) or not valid_lasso_multi_provider_model(
+            model_provider, model_value.strip()
+        ):
+            models[model_provider] = default_model
+            model_changed = model_changed or model_value != default_model
+        else:
+            models[model_provider] = model_value.strip()
+
+    consent = raw_config.get("allow_screenshot_uploads") is True
+    if provider_changed or model_changed:
+        consent = False
+    config = {
+        "provider": provider,
+        "api_keys": api_keys,
+        "models": models,
+        "allow_screenshot_uploads": consent,
+    }
+    if config == raw_config:
+        return False
+    try:
+        _write_lasso1_json_atomically(config_path, config)
+    except OSError:
+        return False
+    return True
+
+
+def ensure_lasso_multi_provider_config(path: Optional[str] = None) -> bool:
+    """Create/migrate the APInex + OpenRouter Lasso sidecar with blank keys."""
+    config_path = path or lasso1_config_path()
+    directory = os.path.dirname(os.path.abspath(config_path))
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    try:
+        with open(config_path, "x", encoding="utf-8") as config_file:
+            json.dump(lasso_multi_provider_config_template(), config_file, indent=2)
+            config_file.write("\n")
+    except FileExistsError:
+        _migrate_lasso_multi_provider_config_defaults(config_path)
+        return False
+    return True
+
+
+def ensure_lasso_config(path: Optional[str] = None) -> bool:
+    """Create/migrate the configuration for whichever dedicated Lasso EXE is running."""
+    if LASSO_MULTI_PROVIDER_MODE:
+        return ensure_lasso_multi_provider_config(path)
+    return ensure_lasso1_config(path)
 
 
 def _powershell_string_literal(value: str) -> str:
@@ -522,14 +773,20 @@ try {
 
 
 def _empty_portable_config() -> Dict[str, Any]:
-
     config = {
         "provider": APP_DEFAULT_PROVIDER,
         "api_keys": {},
         "models": {},
         "ocr_backend": DEFAULT_OCR_BACKEND,
     }
-    if LASSO1_MODE:
+    if LASSO_MULTI_PROVIDER_MODE:
+        config["api_keys"] = {"apinex": "", "openrouter": ""}
+        config["models"] = {
+            "apinex": DEFAULT_APINEX_MODEL,
+            "openrouter": DEFAULT_OPENROUTER_MODEL,
+        }
+        config["allow_screenshot_uploads"] = False
+    elif LASSO1_MODE:
         config["allow_screenshot_uploads"] = False
     return config
 
@@ -607,7 +864,13 @@ def load_portable_config(path: Optional[str] = None) -> Dict[str, Any]:
         stored_model = models.get(restricted_provider)
         if stored_model is not None and not valid_model_name(restricted_provider, stored_model):
             models[restricted_provider] = default_model
-    if LASSO1_MODE and not valid_model_name(
+    if LASSO_MULTI_PROVIDER_MODE:
+        for lasso_provider in ("apinex", "openrouter"):
+            if not valid_lasso_multi_provider_model(
+                lasso_provider, models.get(lasso_provider, "")
+            ):
+                models[lasso_provider] = DEFAULT_MODELS[lasso_provider]
+    elif LASSO1_MODE and not valid_model_name(
         "openrouter", models.get("openrouter", "")
     ):
         models["openrouter"] = DEFAULT_OPENROUTER_MODEL
@@ -671,7 +934,10 @@ def resolve_api_key(
         saved_key = ""
     saved_key = saved_key.strip()
     if use_lasso1_rules:
-        config_source = "LassV7 config file" if LASSOV7_MODE else "Lasso1 config file"
+        if LASSO_MULTI_PROVIDER_MODE:
+            config_source = "Lasso config file"
+        else:
+            config_source = "LassV7 config file" if LASSOV7_MODE else "Lasso1 config file"
         return (saved_key, config_source if saved_key else "not configured")
 
     env = os.environ if environment is None else environment
@@ -2396,6 +2662,7 @@ class WindowsTray:
         settings_enabled: bool = True,
         lasso1_mode: bool = False,
         lassv7_mode: bool = False,
+        diagnostic_console_enabled: bool = False,
     ) -> None:
         if os.name != "nt":
             raise RuntimeError("Screen Answer is currently a Windows-only program.")
@@ -2404,6 +2671,7 @@ class WindowsTray:
         self.settings_enabled = settings_enabled
         self.lasso1_mode = lasso1_mode
         self.lassv7_mode = lassv7_mode
+        self.diagnostic_console_enabled = diagnostic_console_enabled
         # LassV7 is the Windows 7 target: suppress both shell balloons (NIF_INFO)
         # and hover tooltips (NIF_TIP) through this single tray-feedback policy.
         self.suppress_tray_feedback = bool(lassv7_mode)
@@ -2476,6 +2744,7 @@ class WindowsTray:
         CMD_OPEN_CONFIG_FOLDER = 105
         CMD_SELF_DESTRUCT = 106
         CMD_OPEN_CONFIG_FILE = 107
+        CMD_DIAGNOSTICS_CONSOLE = 108
         TRAY_UID = 1
 
         class GUID(ctypes.Structure):
@@ -2620,6 +2889,7 @@ class WindowsTray:
                         TPM_RETURNCMD,
                         TPM_RIGHTBUTTON,
                         WM_NULL,
+                        CMD_DIAGNOSTICS_CONSOLE,
                     )
                     return 0
             elif message == WM_CLOSE:
@@ -2759,6 +3029,7 @@ class WindowsTray:
         tpm_returncmd: int,
         tpm_rightbutton: int,
         wm_null: int,
+        cmd_diagnostics_console: Optional[int] = None,
     ) -> None:
         user32 = self._user32
         menu = user32.CreatePopupMenu()
@@ -2782,8 +3053,16 @@ class WindowsTray:
                     cmd_open_config_folder,
                     "Open %s config folder" % APP_NAME,
                 )
-            if self.diagnostics_enabled:
+            if self.diagnostics_enabled and not getattr(self, "diagnostic_console_enabled", False):
                 user32.AppendMenuW(menu, mf_string, cmd_diagnostics, "Show diagnostics")
+            if getattr(self, "diagnostic_console_enabled", False):
+                console_command = cmd_diagnostics_console if cmd_diagnostics_console is not None else 108
+                user32.AppendMenuW(
+                    menu,
+                    mf_string,
+                    console_command,
+                    "Open diagnostic console",
+                )
             if self.lasso1_mode:
                 user32.AppendMenuW(menu, mf_separator, 0, None)
                 user32.AppendMenuW(
@@ -2816,8 +3095,17 @@ class WindowsTray:
                 self.events.put(("open_config_file",))
             elif self.lasso1_mode and selected == cmd_self_destruct:
                 self.events.put(("self_destruct",))
-            elif self.diagnostics_enabled and selected == cmd_diagnostics:
+            elif (
+                self.diagnostics_enabled
+                and not getattr(self, "diagnostic_console_enabled", False)
+                and selected == cmd_diagnostics
+            ):
                 self.events.put(("show_diagnostics",))
+            elif (
+                getattr(self, "diagnostic_console_enabled", False)
+                and selected == (cmd_diagnostics_console if cmd_diagnostics_console is not None else 108)
+            ):
+                self.events.put(("open_diagnostic_console",))
             elif selected == cmd_exit:
                 self.events.put(("exit",))
             user32.PostMessageW(hwnd, wm_null, 0, 0)
@@ -3011,6 +3299,7 @@ class ScreenAnswerApp:
         import tkinter as tk
 
         self.lasso1_mode = LASSO1_MODE
+        self.lasso_multi_provider_mode = LASSO_MULTI_PROVIDER_MODE
         self.lassv7_mode = LASSOV7_MODE
         self.root = root
         self.root.withdraw()
@@ -3019,22 +3308,25 @@ class ScreenAnswerApp:
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
 
         self.events: "queue.Queue[Tuple[Any, ...]]" = queue.Queue()
-        # Lasso builds keep diagnostics in memory for the on-demand Diagnostics page,
-        # but never open that page at startup. The standard diagnostic build retains
-        # its existing automatic-open behavior.
+        # Lasso builds keep diagnostics in memory; legacy variants expose a page on
+        # demand, while the new family offers a separate console. Neither autostarts
+        # diagnostics. The standard diagnostic build retains its existing behavior.
         self.diagnostics_auto_open = diagnostics_mode_enabled() and not self.lasso1_mode
         self.diagnostics_enabled = self.lasso1_mode or self.diagnostics_auto_open
         self.diagnostic_lines = []
         self.diagnostics_window = None
         self.diagnostics_text = None
         self.diagnostics_status_var = None
+        self.diagnostic_console_process = None
+        self.diagnostic_console_messages: "queue.Queue[str]" = queue.Queue(maxsize=2000)
+        self.diagnostic_console_lock = threading.RLock()
         self.api_entry = None
         self.privacy_var = None
         self.status_var = tk.StringVar(value="%s is starting." % APP_NAME if self.lasso1_mode else "Ready.")
 
         self.config_path = portable_config_path()
         if self.lasso1_mode:
-            ensure_lasso1_config(self.config_path)
+            ensure_lasso_config(self.config_path)
         self.portable_config = load_portable_config(self.config_path)
         stored_keys = self.portable_config.get("api_keys", {})
         stored_models = self.portable_config.get("models", {})
@@ -3058,7 +3350,7 @@ class ScreenAnswerApp:
                 stored_model = default_model
             self.models[provider] = stored_model if isinstance(stored_model, str) else default_model
 
-        if self.lasso1_mode:
+        if LASSO_OPENROUTER_ONLY_MODE:
             self.provider = "openrouter"
         else:
             self.provider = self.portable_config.get("provider", APP_DEFAULT_PROVIDER)
@@ -3072,6 +3364,9 @@ class ScreenAnswerApp:
         self.api_key = self.api_keys[self.provider]
         self.api_key_source = self.api_key_sources[self.provider]
         self.model = self.models[self.provider]
+        self.prompt_for_lasso_api_key = should_open_lasso_settings_on_startup(
+            self.lasso_multi_provider_mode, self.api_key
+        )
         self.privacy_acknowledged = (
             self.portable_config.get("allow_screenshot_uploads", False) is True
             if self.lasso1_mode
@@ -3112,19 +3407,26 @@ class ScreenAnswerApp:
             settings_enabled=not self.lasso1_mode,
             lasso1_mode=self.lasso1_mode,
             lassv7_mode=self.lassv7_mode,
+            diagnostic_console_enabled=self.lasso_multi_provider_mode,
         )
-        if self.lasso1_mode:
+        if self.lasso_multi_provider_mode:
+            self._build_lasso_multi_provider_window()
+        elif self.lasso1_mode:
             self._build_lasso1_window()
         else:
             self._build_window()
         if self.lasso1_mode:
+            provider_label = PROVIDER_LABELS[self.provider]
             if not self.api_key:
-                tooltip = "%s — right-click tray and choose Open to configure" % APP_NAME
-                self.tray.show_balloon(
-                    APP_NAME,
-                    "Right-click the tray icon and choose Open to enter your OpenRouter API key. Config: %s"
-                    % self.config_path,
-                )
+                if self.lasso_multi_provider_mode:
+                    tooltip = "%s — enter the API key in the Settings window" % APP_NAME
+                else:
+                    tooltip = "%s — right-click tray and choose Open to configure" % APP_NAME
+                    self.tray.show_balloon(
+                        APP_NAME,
+                        "Right-click the tray icon and choose Open to enter your %s API key. Config: %s"
+                        % (provider_label, self.config_path),
+                    )
             elif not self.privacy_acknowledged:
                 tooltip = "%s — upload consent required" % APP_NAME
                 self.tray.show_balloon(
@@ -3135,14 +3437,16 @@ class ScreenAnswerApp:
                 tooltip = "%s — ready; Ctrl+Alt+S to capture" % APP_NAME
                 self.tray.show_balloon(
                     APP_NAME,
-                    "Ready. Ctrl+Alt+S captures the full desktop and sends it to OpenRouter.",
+                    "Ready. Ctrl+Alt+S captures the full desktop and sends it to %s." % provider_label,
                 )
         else:
             tooltip = "%s — ready; Ctrl+Alt+S to capture" % APP_NAME
         self.tray.set_state(NEUTRAL_RGB, tooltip)
         self._log_diagnostic("Application ready; tray icon initialized.")
         self.root.after(100, self._poll_events)
-        if self.diagnostics_auto_open:
+        if self.prompt_for_lasso_api_key:
+            self.root.after(0, self.show_window)
+        elif self.diagnostics_auto_open:
             self.root.after(0, self.show_diagnostics)
 
     def _log_diagnostic(self, message: str) -> None:
@@ -3160,8 +3464,137 @@ class ScreenAnswerApp:
                 text = text.replace(secret, "[REDACTED API KEY]")
         _queue_diagnostic_event(self.events, True, text)
 
+    def open_diagnostic_console(self) -> bool:
+        """Start the separate console only after an explicit tray/UI request."""
+        if not getattr(self, "lasso_multi_provider_mode", False) or not self.diagnostics_enabled:
+            return False
+        with self.diagnostic_console_lock:
+            current_process = self.diagnostic_console_process
+            if current_process is not None and current_process.poll() is None:
+                return True
+            self.diagnostic_console_process = None
+            command = [sys.executable]
+            if not getattr(sys, "frozen", False):
+                command.append(os.path.abspath(__file__))
+            command.append("--diagnostic-console-child")
+            try:
+                process = subprocess.Popen(
+                    command,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    close_fds=True,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
+                )
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                self._log_diagnostic(
+                    "Could not open the requested diagnostic console (%s)." % type(exc).__name__
+                )
+                if getattr(self, "status_var", None) is not None:
+                    self.status_var.set("Could not open the diagnostic console; see diagnostics.")
+                return False
+
+            self.diagnostic_console_process = process
+            messages: "queue.Queue[str]" = queue.Queue(maxsize=2000)
+            self.diagnostic_console_messages = messages
+            messages.put_nowait(
+                "Console opened on request at %s. Logs may contain OCR, final answer text, "
+                "and provider error details; API keys and screenshot pixels are omitted."
+                % time.strftime("%Y-%m-%d %H:%M:%S")
+            )
+            for line in self.diagnostic_lines[-200:]:
+                try:
+                    messages.put_nowait(line)
+                except queue.Full:
+                    break
+            writer = threading.Thread(
+                target=self._diagnostic_console_writer,
+                args=(process, messages),
+                name="LassoDiagnosticConsole",
+                daemon=True,
+            )
+            writer.start()
+        self._log_diagnostic("Separate diagnostic console opened on request.")
+        return True
+
+    def _diagnostic_console_writer(
+        self,
+        process: Any,
+        messages: "queue.Queue[str]",
+    ) -> None:
+        """Forward already-redacted diagnostic lines to the child console process."""
+        try:
+            while process.poll() is None:
+                try:
+                    line = messages.get(timeout=0.25)
+                except queue.Empty:
+                    continue
+                if process.stdin is None:
+                    break
+                process.stdin.write(str(line) + "\n")
+                process.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+        finally:
+            try:
+                if process.stdin is not None:
+                    process.stdin.close()
+            except (OSError, ValueError):
+                pass
+            with self.diagnostic_console_lock:
+                if self.diagnostic_console_process is process:
+                    self.diagnostic_console_process = None
+
+    def _queue_diagnostic_console_line(self, line: str) -> None:
+        process = getattr(self, "diagnostic_console_process", None)
+        if process is None:
+            return
+        try:
+            if process.poll() is not None:
+                return
+            messages = self.diagnostic_console_messages
+            try:
+                messages.put_nowait(line)
+            except queue.Full:
+                try:
+                    messages.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    messages.put_nowait("[older console log line dropped]")
+                    messages.put_nowait(line)
+                except queue.Full:
+                    pass
+        except (AttributeError, OSError, ValueError):
+            return
+
+    def _close_diagnostic_console(self) -> None:
+        with self.diagnostic_console_lock:
+            process = self.diagnostic_console_process
+            self.diagnostic_console_process = None
+        if process is None:
+            return
+        try:
+            if process.stdin is not None:
+                process.stdin.close()
+        except (OSError, ValueError):
+            pass
+        try:
+            process.wait(timeout=2)
+        except Exception:
+            try:
+                process.terminate()
+                process.wait(timeout=1)
+            except Exception:
+                pass
+
     def _append_diagnostic_line(self, line: str) -> None:
         self.diagnostic_lines.append(line)
+        self._queue_diagnostic_console_line(line)
         if len(self.diagnostic_lines) > 3000:
             del self.diagnostic_lines[: len(self.diagnostic_lines) - 3000]
         widget = self.diagnostics_text
@@ -3175,7 +3608,7 @@ class ScreenAnswerApp:
                 self.diagnostics_text = None
 
     def show_diagnostics(self) -> None:
-        if not self.diagnostics_enabled:
+        if not self.diagnostics_enabled or getattr(self, "lasso_multi_provider_mode", False):
             return
         import tkinter as tk
         from tkinter.scrolledtext import ScrolledText
@@ -3302,6 +3735,151 @@ class ScreenAnswerApp:
             self.diagnostics_text.configure(state="disabled")
         if self.diagnostics_status_var is not None:
             self.diagnostics_status_var.set("Log cleared; new events will appear here.")
+
+    def _build_lasso_multi_provider_window(self) -> None:
+        """Build the new Lasso settings UI with provider choice but config-only models."""
+        import tkinter as tk
+
+        self.root.title("Lasso Settings")
+        outer = tk.Frame(self.root, padx=18, pady=16)
+        outer.pack(fill="both", expand=True)
+
+        tk.Label(
+            outer,
+            text="Lasso",
+            font=("Segoe UI", 16, "bold"),
+            anchor="w",
+        ).pack(fill="x")
+        tk.Label(
+            outer,
+            text=(
+                "Tray app for explicit full-desktop capture. Ctrl+Alt+S captures and sends the "
+                "image through the selected API gateway. Live web search and tool execution are disabled."
+            ),
+            justify="left",
+            wraplength=500,
+            anchor="w",
+        ).pack(fill="x", pady=(6, 12))
+
+        tk.Label(outer, text="AI provider:", anchor="w").pack(fill="x")
+        self.provider_var = tk.StringVar(value=PROVIDER_LABELS[self.form_provider])
+        self.provider_menu = tk.OptionMenu(
+            outer,
+            self.provider_var,
+            *PROVIDER_LABELS.values(),
+            command=self._lasso_multi_provider_changed,
+        )
+        self.provider_menu.pack(fill="x", pady=(3, 8))
+
+        self.api_key_label = tk.Label(
+            outer,
+            text="%s API key:" % PROVIDER_LABELS[self.form_provider],
+            anchor="w",
+        )
+        self.api_key_label.pack(fill="x")
+        self.api_key_var = tk.StringVar(value=self.api_key)
+        self.api_entry = tk.Entry(outer, textvariable=self.api_key_var, show="*", width=64)
+        self.api_entry.pack(fill="x", pady=(3, 4))
+        tk.Label(
+            outer,
+            text=(
+                "The key is saved in plain text in %s. It is not read from environment variables "
+                "or included in the executable; keep this file private."
+                % self.config_path
+            ),
+            fg="#555555",
+            justify="left",
+            wraplength=500,
+            anchor="w",
+        ).pack(fill="x", pady=(0, 10))
+
+        tk.Label(
+            outer,
+            text=(
+                "Model IDs are deliberately not shown or editable here. To change a model, use "
+                "Open config file and edit the matching entry under `models`; restart Lasso afterward. "
+                "Only the provider-specific vision allowlists are accepted."
+            ),
+            fg="#555555",
+            justify="left",
+            wraplength=500,
+            anchor="w",
+        ).pack(fill="x", pady=(0, 10))
+
+        self.privacy_var = tk.BooleanVar(value=self.privacy_acknowledged)
+        self.privacy_checkbutton = tk.Checkbutton(
+            outer,
+            text=self._consent_text(self.form_provider),
+            variable=self.privacy_var,
+            wraplength=500,
+            justify="left",
+            anchor="w",
+            command=self._privacy_changed,
+        )
+        self.privacy_checkbutton.pack(fill="x", pady=(2, 8))
+
+        tk.Label(
+            outer,
+            text=(
+                "APInex's free-category allowance and its catalog price for some models may conflict; "
+                "check your account's quota and billing before use. No APInex model is guaranteed free or unlimited. "
+                "The diagnostic console opens only when requested; its log may include OCR and final answer text, "
+                "but omits API keys and screenshot pixels."
+            ),
+            fg="#7A4A00",
+            justify="left",
+            wraplength=500,
+            anchor="w",
+        ).pack(fill="x", pady=(0, 10))
+
+        self.status_var = tk.StringVar(value="Lasso is ready in the tray; capture uses Ctrl+Alt+S.")
+        tk.Label(
+            outer,
+            textvariable=self.status_var,
+            anchor="w",
+            justify="left",
+            wraplength=500,
+        ).pack(fill="x", pady=(0, 10))
+
+        buttons = tk.Frame(outer)
+        buttons.pack(fill="x")
+        tk.Button(buttons, text="Save", command=self.save_settings).pack(side="left")
+        tk.Button(
+            buttons,
+            text="Open config file",
+            command=self.open_lasso1_config_file,
+        ).pack(side="left", padx=(6, 0))
+        tk.Button(
+            buttons,
+            text="Open diagnostic console",
+            command=self.open_diagnostic_console,
+        ).pack(side="left", padx=(6, 0))
+        tk.Button(buttons, text="Cancel", command=self.hide_window).pack(side="right")
+
+        self.root.update_idletasks()
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        width = min(max(520, outer.winfo_reqwidth() + 40), max(440, screen_width - 40))
+        height = min(max(500, outer.winfo_reqheight() + 36), max(400, screen_height - 80))
+        self.root.geometry("%dx%d" % (width, height))
+        self.root.minsize(min(480, width), min(420, height))
+
+    def _lasso_multi_provider_changed(self, selected_label: str) -> None:
+        provider = PROVIDER_BY_LABEL.get(selected_label)
+        if provider is None or provider == self.form_provider:
+            return
+        old_provider = self.form_provider
+        self.api_keys[old_provider] = self.api_key_var.get().strip()
+        self.form_provider = provider
+        self.api_key_var.set(self.api_keys.get(provider, ""))
+        self.api_key_label.configure(text="%s API key:" % PROVIDER_LABELS[provider])
+        self.privacy_var.set(False)
+        self.privacy_acknowledged = False
+        self.privacy_checkbutton.configure(text=self._consent_text(provider))
+        self._log_diagnostic(
+            "Settings provider changed from %s to %s; new upload consent is required."
+            % (PROVIDER_LABELS[old_provider], PROVIDER_LABELS[provider])
+        )
 
     def _build_lasso1_window(self) -> None:
         """Build Lasso1's compact settings window without showing it at startup."""
@@ -3670,6 +4248,60 @@ class ScreenAnswerApp:
     def hide_window(self) -> None:
         self.root.withdraw()
 
+    def _save_lasso_multi_provider_settings(self) -> bool:
+        """Save the new Lasso provider/key/consent while keeping model IDs config-only."""
+        provider = self.form_provider
+        if provider not in ("apinex", "openrouter"):
+            self.show_window()
+            self._show_error("Choose APInex or OpenRouter.")
+            return False
+        key = self.api_key_var.get().strip()
+        self.api_keys[provider] = key
+        provider_label = PROVIDER_LABELS[provider]
+        if not key:
+            self.show_window()
+            self._show_error("Enter a %s API key before saving." % provider_label)
+            return False
+
+        allow_screenshot_uploads = self.privacy_var.get() is True
+        try:
+            save_lasso_multi_provider_config(
+                self.config_path,
+                provider,
+                self.api_keys,
+                self.models,
+                allow_screenshot_uploads,
+            )
+        except (OSError, ValueError) as exc:
+            self.show_window()
+            self._show_error("Could not save Lasso settings: %s" % exc)
+            return False
+
+        self.provider = provider
+        self.api_key = key
+        self.model = self.models[provider]
+        self.api_key_source = "Lasso config file"
+        self.api_key_sources[provider] = self.api_key_source
+        self.privacy_acknowledged = allow_screenshot_uploads
+        self.portable_config["provider"] = provider
+        self.portable_config["api_keys"] = dict(self.api_keys)
+        self.portable_config["models"] = dict(self.models)
+        self.portable_config["allow_screenshot_uploads"] = allow_screenshot_uploads
+        self._config_has_key = True
+        if allow_screenshot_uploads:
+            self.status_var.set(
+                "Saved. Ready — Ctrl+Alt+S captures the full desktop for %s." % provider_label
+            )
+            tooltip = "%s — ready; Ctrl+Alt+S to capture" % APP_NAME
+        else:
+            self.status_var.set(
+                "Saved. Captures remain blocked until screenshot-upload consent is enabled."
+            )
+            tooltip = "%s — upload consent required; right-click and Open to review" % APP_NAME
+        self.tray.set_state(NEUTRAL_RGB, tooltip)
+        self.hide_window()
+        return True
+
     def _save_lasso1_settings(self) -> bool:
         key = self.api_key_var.get().strip()
         model = self.models.get("openrouter", DEFAULT_OPENROUTER_MODEL)
@@ -3722,6 +4354,8 @@ class ScreenAnswerApp:
 
     def save_settings(self) -> bool:
         if self.lasso1_mode:
+            if getattr(self, "lasso_multi_provider_mode", False):
+                return self._save_lasso_multi_provider_settings()
             return self._save_lasso1_settings()
         self._remember_form_settings()
         provider = self.form_provider
@@ -3889,7 +4523,7 @@ class ScreenAnswerApp:
             )
         message = (
             "This permanently deletes %s.exe and %s's config.json "
-            "(including its saved OpenRouter key), then closes the app. "
+            "(including saved API key(s)), then closes the app. "
             "The %s folder is removed only if it is empty; other files are left alone.\n\n"
             "This cannot be undone. Continue?"
         ) % (APP_NAME, APP_NAME, config_directory)
@@ -3936,10 +4570,14 @@ class ScreenAnswerApp:
             )
             self.privacy_acknowledged = False
             if self.lasso1_mode:
-                self.status_var.set("Right-click the tray icon and choose Open to add an OpenRouter key.")
+                provider_label = PROVIDER_LABELS[self.provider]
+                self.status_var.set(
+                    "Right-click the tray icon and choose Open to add a %s key." % provider_label
+                )
                 self.tray.show_balloon(
                     APP_NAME,
-                    "Right-click the tray icon and choose Open to add an OpenRouter key, then Save.",
+                    "Right-click the tray icon and choose Open to add a %s key, then Save."
+                    % provider_label,
                 )
             else:
                 self.status_var.set("Set an API key and acknowledge the upload notice before capturing.")
@@ -3965,10 +4603,11 @@ class ScreenAnswerApp:
         if self.lasso1_mode and (
             not isinstance(getattr(self, "model", None), str) or not self.model.strip()
         ):
-            self.model = DEFAULT_OPENROUTER_MODEL
+            fallback_model = DEFAULT_MODELS.get(self.provider, DEFAULT_OPENROUTER_MODEL)
+            self.model = fallback_model
             stored_models = getattr(self, "models", None)
             if isinstance(stored_models, dict):
-                stored_models["openrouter"] = DEFAULT_OPENROUTER_MODEL
+                stored_models[self.provider] = fallback_model
 
         self.busy = True
         self._result_generation += 1
@@ -4179,6 +4818,8 @@ class ScreenAnswerApp:
                         return
                 elif kind == "show_diagnostics":
                     self.show_diagnostics()
+                elif kind == "open_diagnostic_console":
+                    self.open_diagnostic_console()
                 elif kind == "exit":
                     self._log_diagnostic("Exit requested.")
                     self.exit_app()
@@ -4215,12 +4856,15 @@ class ScreenAnswerApp:
 
     def exit_app(self) -> None:
         try:
+            self._close_diagnostic_console()
             self.tray.stop()
         finally:
             self.root.destroy()
 
 
 def main() -> int:
+    if "--diagnostic-console-child" in sys.argv[1:]:
+        return _run_diagnostic_console_child()
     if "--check-pix2text" in sys.argv[1:]:
         return 0 if pix2text_bundle_importable() else 1
     if "--check-apinex-ollama" in sys.argv[1:]:
@@ -4310,6 +4954,53 @@ def main() -> int:
             and struct.calcsize("P") == 4
             and diagnostics_page_available((), "LassV27.exe")
             and diagnostics_mode_enabled(("--diagnostics",), "LassV27.exe") is False
+        ) else 1
+    if "--check-lasso-build" in sys.argv[1:]:
+        return 0 if (
+            LASSO1_MODE
+            and LASSO_MULTI_PROVIDER_MODE
+            and not LASSOV7_MODE
+            and APP_NAME == "Lasso"
+            and APP_DEFAULT_PROVIDER == "apinex"
+            and tuple(PROVIDER_LABELS) == ("apinex", "openrouter")
+            and tuple(API_KEY_ENV_VARS) == ("apinex", "openrouter")
+            and tuple(DEFAULT_MODELS) == ("apinex", "openrouter")
+            and DEFAULT_MODELS["apinex"] == DEFAULT_APINEX_MODEL
+            and DEFAULT_MODELS["openrouter"] == DEFAULT_OPENROUTER_MODEL
+            and valid_lasso_multi_provider_model("apinex", DEFAULT_APINEX_MODEL)
+            and not valid_lasso_multi_provider_model("apinex", "free/gpt-6-luna")
+            and valid_lasso_multi_provider_model("openrouter", DEFAULT_OPENROUTER_MODEL)
+            and APINEX_ENDPOINT == "https://api.apinex.bond/v1/chat/completions"
+            and OPENROUTER_ENDPOINT == "https://openrouter.ai/api/v1/chat/completions"
+            and lasso_config_directory_for_executable("Lasso.exe") == LASSO_CONFIG_DIRECTORY
+            and diagnostic_console_available_for_executable("Lasso.exe")
+            and not diagnostics_page_available((), "Lasso.exe")
+            and diagnostics_mode_enabled(("--diagnostics",), "Lasso.exe") is False
+            and sys.version_info[:2] == (3, 11)
+            and struct.calcsize("P") == 8
+        ) else 1
+    if "--check-lassowin7-build" in sys.argv[1:]:
+        return 0 if (
+            LASSO1_MODE
+            and LASSO_MULTI_PROVIDER_MODE
+            and LASSOV7_MODE
+            and APP_NAME == "Lasso"
+            and APP_DEFAULT_PROVIDER == "apinex"
+            and tuple(PROVIDER_LABELS) == ("apinex", "openrouter")
+            and tuple(API_KEY_ENV_VARS) == ("apinex", "openrouter")
+            and tuple(DEFAULT_MODELS) == ("apinex", "openrouter")
+            and valid_lasso_multi_provider_model("apinex", DEFAULT_APINEX_MODEL)
+            and not valid_lasso_multi_provider_model("apinex", "free/gpt-6-luna")
+            and valid_lasso_multi_provider_model("openrouter", DEFAULT_OPENROUTER_MODEL)
+            and APINEX_ENDPOINT == "https://api.apinex.bond/v1/chat/completions"
+            and OPENROUTER_ENDPOINT == "https://openrouter.ai/api/v1/chat/completions"
+            and lasso_config_directory_for_executable("LassoWin7.exe")
+            == LASSOWIN7_CONFIG_DIRECTORY
+            and diagnostic_console_available_for_executable("LassoWin7.exe")
+            and not diagnostics_page_available((), "LassoWin7.exe")
+            and diagnostics_mode_enabled(("--diagnostics",), "LassoWin7.exe") is False
+            and sys.version_info[:3] == (3, 8, 10)
+            and struct.calcsize("P") == 4
         ) else 1
     if os.name != "nt":
         print("%s runs on Windows 7/10 and later." % APP_NAME, file=sys.stderr)

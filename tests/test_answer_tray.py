@@ -3,6 +3,7 @@ import ctypes
 import io
 import json
 import os
+import queue
 import struct
 import sys
 import tempfile
@@ -21,13 +22,17 @@ from answer_tray import (
     DEFAULT_OLLAMA_MODEL,
     DEFAULT_MISTRAL_MODEL,
     DEFAULT_OPENROUTER_MODEL,
+    LASSO_APINEX_VISION_MODELS,
+    LASSO_CONFIG_DIRECTORY,
     LASSOV2_CONFIG_DIRECTORY,
+    LASSOWIN7_CONFIG_DIRECTORY,
     LASSV27_CONFIG_DIRECTORY,
     OLLAMA_ENDPOINT,
     OPENROUTER_FREE_VISION_REASONING_MODELS,
     ScreenAnswerApp,
     WindowsTray,
     _powershell_string_literal,
+    _run_diagnostic_console_child,
     OPENROUTER_ENDPOINT,
     MISTRAL_OCR_ENDPOINT,
     MISTRAL_OCR_MODEL,
@@ -38,9 +43,11 @@ from answer_tray import (
     ask_ollama,
     ask_openrouter,
     default_provider_for_executable,
+    diagnostic_console_available_for_executable,
     diagnostics_mode_enabled,
     diagnostics_page_available,
     ensure_lasso1_config,
+    ensure_lasso_multi_provider_config,
     is_lasso1_executable,
     is_lassv7_executable,
     hotkey_specs_for_variant,
@@ -49,6 +56,8 @@ from answer_tray import (
     lasso_config_directory_for_executable,
     lasso1_config_path,
     lasso1_config_template,
+    lasso_multi_provider_config_template,
+    is_lasso_multi_provider_executable,
     main,
     load_portable_config,
     parse_option,
@@ -57,10 +66,13 @@ from answer_tray import (
     resolve_api_key,
     schedule_lasso1_self_cleanup,
     save_lasso1_config,
+    save_lasso_multi_provider_config,
+    should_open_lasso_settings_on_startup,
     pix2text_bundle_importable,
     run_pix2text_ocr,
     save_portable_config,
     valid_model_name,
+    valid_lasso_multi_provider_model,
 )
 
 
@@ -480,6 +492,7 @@ class Lasso1ModeTests(unittest.TestCase):
             settings_enabled=False,
             lasso1_mode=True,
             lassv7_mode=False,
+            diagnostic_console_enabled=False,
         )
         tray.show_balloon.assert_called_once()
         root.deiconify.assert_not_called()
@@ -933,6 +946,416 @@ class Lasso1ModeTests(unittest.TestCase):
             with patch("answer_tray.sys.version_info", (3, 8, 10, "final", 0)):
                 with patch("answer_tray.struct.calcsize", return_value=4):
                     with patch("sys.argv", ["LassV27.exe", "--check-lassv27-build"]):
+                        self.assertEqual(main(), 0)
+
+
+class NewLassoVariantTests(unittest.TestCase):
+    def test_settings_prompts_at_startup_only_when_new_lasso_key_is_missing(self):
+        self.assertTrue(should_open_lasso_settings_on_startup(True, ""))
+        self.assertTrue(should_open_lasso_settings_on_startup(True, "  "))
+        self.assertFalse(should_open_lasso_settings_on_startup(True, "saved-key"))
+        self.assertFalse(should_open_lasso_settings_on_startup(False, ""))
+
+    def test_lasso_and_lassowin7_expose_only_apinex_and_openrouter(self):
+        expected = {"apinex": "APInex", "openrouter": "OpenRouter"}
+        self.assertEqual(
+            LASSO_APINEX_VISION_MODELS,
+            frozenset((DEFAULT_APINEX_MODEL, "free/gemini-3.1-pro")),
+        )
+        self.assertTrue(valid_model_name("apinex", "free/gpt-6-luna"))
+        self.assertFalse(valid_lasso_multi_provider_model("apinex", "free/gpt-6-luna"))
+        for executable_name, directory in (
+            ("Lasso.exe", LASSO_CONFIG_DIRECTORY),
+            ("LassoWin7.exe", LASSOWIN7_CONFIG_DIRECTORY),
+        ):
+            self.assertTrue(is_lasso1_executable(executable_name))
+            self.assertTrue(is_lasso_multi_provider_executable(executable_name))
+            self.assertEqual(provider_labels_for_executable(executable_name), expected)
+            self.assertEqual(default_provider_for_executable(executable_name), "apinex")
+            self.assertEqual(lasso_config_directory_for_executable(executable_name), directory)
+            self.assertEqual(lasso_app_name_for_executable(executable_name), "Lasso")
+            self.assertTrue(diagnostic_console_available_for_executable(executable_name))
+            self.assertFalse(diagnostics_page_available((), executable_name))
+            self.assertFalse(diagnostics_mode_enabled((), executable_name))
+        self.assertFalse(is_lassv7_executable("Lasso.exe"))
+        self.assertTrue(is_lassv7_executable("LassoWin7.exe"))
+        self.assertFalse(diagnostic_console_available_for_executable("LassoV2.exe"))
+
+    def test_first_run_configs_are_variant_scoped_blank_and_consent_off(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = {
+                "Lasso.exe": os.path.join(directory, "Lasso", "config.json"),
+                "LassoWin7.exe": os.path.join(directory, "LassoWin7", "config.json"),
+            }
+            for executable_name, expected_path in paths.items():
+                path = lasso1_config_path(directory, executable_name)
+                self.assertEqual(path, expected_path)
+                self.assertTrue(ensure_lasso_multi_provider_config(path))
+                with open(path, "r", encoding="utf-8") as config_file:
+                    config = json.load(config_file)
+                self.assertEqual(config, lasso_multi_provider_config_template())
+                self.assertEqual(config["provider"], "apinex")
+                self.assertEqual(config["api_keys"], {"apinex": "", "openrouter": ""})
+                self.assertEqual(
+                    config["models"],
+                    {"apinex": DEFAULT_APINEX_MODEL, "openrouter": DEFAULT_OPENROUTER_MODEL},
+                )
+                self.assertIs(config["allow_screenshot_uploads"], False)
+            self.assertNotEqual(paths["Lasso.exe"], paths["LassoWin7.exe"])
+            for old_name in ("Lasso1.exe", "LassV7.exe", "LassoV2.exe", "LassV27.exe"):
+                self.assertNotEqual(
+                    lasso1_config_path(directory, old_name),
+                    paths["Lasso.exe"],
+                )
+
+    def test_invalid_provider_models_and_retired_groq_values_migrate_safely(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "Lasso", "config.json")
+            os.makedirs(os.path.dirname(path))
+            with open(path, "w", encoding="utf-8") as config_file:
+                json.dump(
+                    {
+                        "provider": "groq",
+                        "api_keys": {
+                            "apinex": "keep-apinex-key",
+                            "openrouter": "keep-openrouter-key",
+                            "groq": "retired-groq-key",
+                        },
+                        "models": {
+                            "apinex": "free/gpt-6-luna",
+                            "openrouter": "google/gemma-4-31b-it:online",
+                            "groq": "qwen/qwen3.8-27b",
+                        },
+                        "allow_screenshot_uploads": True,
+                        "unexpected": "remove me",
+                    },
+                    config_file,
+                )
+
+            self.assertFalse(ensure_lasso_multi_provider_config(path))
+            with open(path, "r", encoding="utf-8") as config_file:
+                migrated = json.load(config_file)
+            self.assertEqual(migrated["provider"], "apinex")
+            self.assertEqual(
+                migrated["api_keys"],
+                {"apinex": "keep-apinex-key", "openrouter": "keep-openrouter-key"},
+            )
+            self.assertEqual(
+                migrated["models"],
+                {"apinex": DEFAULT_APINEX_MODEL, "openrouter": DEFAULT_OPENROUTER_MODEL},
+            )
+            self.assertIs(migrated["allow_screenshot_uploads"], False)
+            self.assertNotIn("unexpected", migrated)
+            self.assertNotIn("retired-groq-key", json.dumps(migrated))
+
+    def test_save_accepts_only_curated_vision_models_and_selected_provider_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "Lasso", "config.json")
+            models = {
+                "apinex": "free/gemini-3.1-pro",
+                "openrouter": "google/gemma-4-26b-a4b-it:free",
+            }
+            api_keys = {"apinex": "apinex-key", "openrouter": "openrouter-key"}
+            save_lasso_multi_provider_config(path, "openrouter", api_keys, models, True)
+            with open(path, "r", encoding="utf-8") as config_file:
+                saved = json.load(config_file)
+            self.assertEqual(saved["provider"], "openrouter")
+            self.assertEqual(saved["api_keys"], api_keys)
+            self.assertEqual(saved["models"], models)
+            self.assertIs(saved["allow_screenshot_uploads"], True)
+
+            with self.assertRaisesRegex(ValueError, "APInex model"):
+                save_lasso_multi_provider_config(
+                    path,
+                    "apinex",
+                    api_keys,
+                    {"apinex": "free/gpt-6-luna", "openrouter": DEFAULT_OPENROUTER_MODEL},
+                    True,
+                )
+            with self.assertRaisesRegex(ValueError, "OpenRouter model"):
+                save_lasso_multi_provider_config(
+                    path,
+                    "openrouter",
+                    api_keys,
+                    {"apinex": DEFAULT_APINEX_MODEL, "openrouter": "google/gemma-4-31b-it"},
+                    True,
+                )
+            with self.assertRaisesRegex(ValueError, "Choose APInex or OpenRouter"):
+                save_lasso_multi_provider_config(path, "groq", api_keys, models, True)
+            with self.assertRaisesRegex(ValueError, "APInex API key"):
+                save_lasso_multi_provider_config(
+                    path, "apinex", {"apinex": "", "openrouter": "key"}, models, True
+                )
+
+    def test_new_settings_form_has_provider_selector_but_no_model_control(self):
+        labels = []
+        entries = []
+        buttons = []
+        menus = []
+
+        class FakeWidget:
+            def pack(self, *args, **kwargs):
+                return None
+
+            def configure(self, *args, **kwargs):
+                return None
+
+            def winfo_reqwidth(self):
+                return 480
+
+            def winfo_reqheight(self):
+                return 360
+
+        class FakeVariable:
+            def __init__(self, value=None):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+            def set(self, value):
+                self.value = value
+
+        def make_widget(*args, **kwargs):
+            if "text" in kwargs:
+                labels.append(str(kwargs["text"]))
+            if kwargs.get("text"):
+                buttons.append(str(kwargs["text"]))
+            return FakeWidget()
+
+        def make_entry(*args, **kwargs):
+            entries.append(kwargs)
+            return FakeWidget()
+
+        def make_menu(*args, **kwargs):
+            menus.append(args)
+            return FakeWidget()
+
+        fake_tkinter = types.ModuleType("tkinter")
+        fake_tkinter.Frame = make_widget
+        fake_tkinter.Label = make_widget
+        fake_tkinter.Entry = make_entry
+        fake_tkinter.Checkbutton = make_widget
+        fake_tkinter.Button = make_widget
+        fake_tkinter.OptionMenu = make_menu
+        fake_tkinter.StringVar = FakeVariable
+        fake_tkinter.BooleanVar = FakeVariable
+
+        app = object.__new__(ScreenAnswerApp)
+        app.root = MagicMock()
+        app.root.winfo_screenwidth.return_value = 1280
+        app.root.winfo_screenheight.return_value = 900
+        app.form_provider = "apinex"
+        app.api_key = ""
+        app.api_keys = {"apinex": "", "openrouter": ""}
+        app.config_path = "C:/Users/test/AppData/Roaming/Lasso/config.json"
+        app.form_ocr_backend = "provider"
+        app.privacy_acknowledged = False
+        app._consent_text = MagicMock(return_value="consent copy")
+        app.save_settings = MagicMock()
+        app.open_lasso1_config_file = MagicMock()
+        app.open_diagnostic_console = MagicMock()
+        app.hide_window = MagicMock()
+
+        with patch.multiple(
+            "answer_tray",
+            PROVIDER_LABELS={"apinex": "APInex", "openrouter": "OpenRouter"},
+            PROVIDER_BY_LABEL={"APInex": "apinex", "OpenRouter": "openrouter"},
+        ):
+            with patch.dict("sys.modules", {"tkinter": fake_tkinter}):
+                app._build_lasso_multi_provider_window()
+
+        self.assertEqual(len(entries), 1, "Only the API-key entry should be shown.")
+        self.assertNotIn("Model:", labels)
+        self.assertIn("Open config file", buttons)
+        self.assertIn("Open diagnostic console", buttons)
+        self.assertEqual(menus[0][2:], ("APInex", "OpenRouter"))
+        self.assertIn("Model IDs are deliberately not shown or editable here", " ".join(labels))
+
+    def test_save_persists_provider_and_key_but_consent_can_remain_off(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "Lasso", "config.json")
+            ensure_lasso_multi_provider_config(path)
+            app = object.__new__(ScreenAnswerApp)
+            app.lasso1_mode = True
+            app.lasso_multi_provider_mode = True
+            app.form_provider = "apinex"
+            app.api_key_var = MagicMock()
+            app.api_key_var.get.return_value = "apinex-key"
+            app.privacy_var = MagicMock()
+            app.privacy_var.get.return_value = False
+            app.config_path = path
+            app.api_keys = {"apinex": "", "openrouter": ""}
+            app.models = {"apinex": DEFAULT_APINEX_MODEL, "openrouter": DEFAULT_OPENROUTER_MODEL}
+            app.api_key_sources = {"apinex": "not configured", "openrouter": "not configured"}
+            app.portable_config = {}
+            app.status_var = MagicMock()
+            app.tray = MagicMock()
+            app.hide_window = MagicMock()
+            app.show_window = MagicMock()
+            app._show_error = MagicMock()
+            app._log_diagnostic = MagicMock()
+
+            self.assertTrue(app.save_settings())
+            app.hide_window.assert_called_once_with()
+            app._show_error.assert_not_called()
+            self.assertFalse(app.privacy_acknowledged)
+            with open(path, "r", encoding="utf-8") as config_file:
+                saved = json.load(config_file)
+            self.assertEqual(saved["provider"], "apinex")
+            self.assertEqual(saved["api_keys"]["apinex"], "apinex-key")
+            self.assertEqual(saved["api_keys"]["openrouter"], "")
+            self.assertIs(saved["allow_screenshot_uploads"], False)
+
+    def test_diagnostic_console_is_created_only_after_explicit_request(self):
+        app = object.__new__(ScreenAnswerApp)
+        app.lasso_multi_provider_mode = True
+        app.diagnostics_enabled = True
+        app.diagnostic_console_lock = __import__("threading").RLock()
+        app.diagnostic_console_process = None
+        app.diagnostic_console_messages = queue.Queue(maxsize=2000)
+        app.diagnostic_lines = ["startup diagnostic"]
+        app._log_diagnostic = MagicMock()
+        process = MagicMock()
+        process.poll.return_value = None
+        process.stdin = MagicMock()
+
+        with patch("answer_tray.subprocess.Popen", return_value=process) as popen:
+            with patch("answer_tray.threading.Thread") as thread_class:
+                self.assertTrue(app.open_diagnostic_console())
+                popen.assert_called_once()
+                self.assertIn("--diagnostic-console-child", popen.call_args.args[0])
+                self.assertIs(popen.call_args.kwargs["stdin"], __import__("subprocess").PIPE)
+                self.assertEqual(app.diagnostic_console_messages.qsize(), 2)
+                thread_class.return_value.start.assert_called_once_with()
+                self.assertTrue(app.open_diagnostic_console())
+                popen.assert_called_once()
+                app._queue_diagnostic_console_line("later event")
+                self.assertEqual(app.diagnostic_console_messages.qsize(), 3)
+        app._log_diagnostic.assert_called_once_with("Separate diagnostic console opened on request.")
+
+    def test_new_lasso_uses_console_instead_of_the_diagnostics_page(self):
+        app = object.__new__(ScreenAnswerApp)
+        app.diagnostics_enabled = True
+        app.lasso_multi_provider_mode = True
+
+        app.show_diagnostics()
+
+        self.assertFalse(diagnostics_page_available((), "Lasso.exe"))
+        self.assertFalse(diagnostics_page_available((), "LassoWin7.exe"))
+
+    def test_diagnostic_console_writer_sends_one_line_at_a_time(self):
+        app = object.__new__(ScreenAnswerApp)
+        app.diagnostic_console_lock = __import__("threading").RLock()
+        process = MagicMock()
+        process.poll.side_effect = [None, 1]
+        process.stdin = MagicMock()
+        app.diagnostic_console_process = process
+        messages = queue.Queue()
+        messages.put("diagnostic event")
+
+        app._diagnostic_console_writer(process, messages)
+
+        process.stdin.write.assert_called_once_with("diagnostic event\n")
+        process.stdin.flush.assert_called_once_with()
+        process.stdin.close.assert_called_once_with()
+        self.assertIsNone(app.diagnostic_console_process)
+
+    def test_diagnostic_console_child_preserves_parent_stdin_pipe(self):
+        import io
+        from types import SimpleNamespace
+
+        calls = []
+        kernel32 = MagicMock()
+        kernel32.GetStdHandle.side_effect = lambda handle: calls.append("get-stdin") or 12345
+        kernel32.AllocConsole.side_effect = lambda: calls.append("alloc-console") or 1
+        input_stream = io.StringIO("diagnostic event\\n")
+        output_stream = MagicMock()
+        msvcrt = SimpleNamespace(
+            open_osfhandle=lambda handle, flags: calls.append(("pipe-handle", handle)) or 77
+        )
+
+        with patch("answer_tray.os.name", "nt"):
+            with patch("answer_tray.ctypes.WinDLL", return_value=kernel32, create=True):
+                with patch.dict("sys.modules", {"msvcrt": msvcrt}):
+                    with patch("answer_tray.os.fdopen", return_value=input_stream) as fdopen:
+                        with patch("builtins.open", return_value=output_stream):
+                            self.assertEqual(_run_diagnostic_console_child(), 0)
+
+        self.assertLess(calls.index("get-stdin"), calls.index("alloc-console"))
+        self.assertIn(("pipe-handle", 12345), calls)
+        fdopen.assert_called_once()
+        self.assertTrue(any("diagnostic event\\n" in call.args[0] for call in output_stream.write.call_args_list))
+
+    def test_tray_menu_can_open_console_and_child_cli_does_not_start_tray_app(self):
+        class Point(ctypes.Structure):
+            _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+        tray = object.__new__(WindowsTray)
+        tray.settings_enabled = False
+        tray.lasso1_mode = True
+        tray.diagnostics_enabled = True
+        tray.diagnostic_console_enabled = True
+        tray.events = MagicMock()
+        tray._user32 = MagicMock()
+        tray._user32.CreatePopupMenu.return_value = 1
+        tray._user32.TrackPopupMenu.return_value = 108
+        WindowsTray._show_context_menu(
+            tray,
+            1,
+            Point,
+            101,
+            102,
+            103,
+            104,
+            105,
+            107,
+            106,
+            0,
+            0x0800,
+            0x0100,
+            0x0002,
+            0,
+            108,
+        )
+        labels = [
+            call.args[3]
+            for call in tray._user32.AppendMenuW.call_args_list
+            if call.args[3]
+        ]
+        self.assertIn("Open diagnostic console", labels)
+        self.assertNotIn("Show diagnostics", labels)
+        tray.events.put.assert_called_once_with(("open_diagnostic_console",))
+
+        with patch("sys.argv", ["Lasso.exe", "--diagnostic-console-child"]):
+            with patch("answer_tray._run_diagnostic_console_child", return_value=0) as child:
+                self.assertEqual(main(), 0)
+                child.assert_called_once_with()
+
+    def test_packaged_windows11_and_windows7_build_checks(self):
+        lasso_overrides = {
+            "LASSO1_MODE": True,
+            "LASSO_MULTI_PROVIDER_MODE": True,
+            "LASSO_OPENROUTER_ONLY_MODE": False,
+            "LASSOV7_MODE": False,
+            "APP_NAME": "Lasso",
+            "APP_DEFAULT_PROVIDER": "apinex",
+            "PROVIDER_LABELS": {"apinex": "APInex", "openrouter": "OpenRouter"},
+            "API_KEY_ENV_VARS": {"apinex": "APINEX_API_KEY", "openrouter": "OPENROUTER_API_KEY"},
+            "DEFAULT_MODELS": {"apinex": DEFAULT_APINEX_MODEL, "openrouter": DEFAULT_OPENROUTER_MODEL},
+        }
+        with patch.multiple("answer_tray", **lasso_overrides):
+            with patch("answer_tray.sys.version_info", (3, 11, 9, "final", 0)):
+                with patch("answer_tray.struct.calcsize", return_value=8):
+                    with patch("sys.argv", ["Lasso.exe", "--check-lasso-build"]):
+                        self.assertEqual(main(), 0)
+
+        lasso7_overrides = dict(lasso_overrides)
+        lasso7_overrides["LASSOV7_MODE"] = True
+        with patch.multiple("answer_tray", **lasso7_overrides):
+            with patch("answer_tray.sys.version_info", (3, 8, 10, "final", 0)):
+                with patch("answer_tray.struct.calcsize", return_value=4):
+                    with patch("sys.argv", ["LassoWin7.exe", "--check-lassowin7-build"]):
                         self.assertEqual(main(), 0)
 
 

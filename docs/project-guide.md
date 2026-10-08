@@ -26,7 +26,7 @@ The app is not a continuous screen recorder, browser extension, hosted backend, 
 The project has evolved to accommodate two different use cases:
 
 - **Standard Screen Answer:** a general Windows app where the user can choose among hosted providers and a local model. The v1.6.0 line introduced APInex as the default and Ollama for local inference; the v1.7.0 build adds `free/gpt-6-luna` as an optional APInex model while keeping the existing default. Mistral and OpenRouter remain available.
-- **Lasso variants:** separate tray-only builds with a narrower, OpenRouter-only configuration model. They preserve dedicated per-user settings, a model value in the config file (not the Settings GUI), explicit upload consent, and variant-specific cleanup/notification behavior.
+- **Lasso variants:** the existing Lasso1/LassV7 and LassoV2/LassV27 families remain OpenRouter-only and unchanged. A new Lasso family adds APInex plus OpenRouter, with model IDs kept only in per-user config, explicit upload consent, silent scoped cleanup, and on-demand diagnostics. Its Windows 11 and Windows 7 builds use separate names/config folders.
 - **Optional Pix2Text build:** a much larger experimental 64-bit build that adds local OCR. OCR extracts text and formulas; it does not solve the problem. The solver still receives the screenshot and, depending on provider, its OCR transcript.
 - **Diagnostic build:** the standard program with a live diagnostics window opened automatically, for detailed testing of captures, OCR, network requests, response parsing, and errors.
 
@@ -40,9 +40,10 @@ The direct Google Gemini and Groq integrations were removed from the standard v1
 | Standard diagnostics | `ScreenAnswer-Diagnostic.exe` | Same standard provider set | Same app, but opens the live diagnostic window at startup | Included in `v1.7.0-experimental` |
 | Optional local OCR | `ScreenAnswer-Pix2Text.exe` | Same solver set; Pix2Text OCR is selected by default in that named build | 64-bit Windows 10+ experimental package; large dependencies, model weights downloaded separately | Published in `v1.3.0-experimental`; source/workflow can build it again on demand |
 | Legacy Lasso | `Lasso1.exe`, `LassV7.exe` | OpenRouter only | Per-user config; Settings opens only on demand; no model field in GUI; `LassV7` suppresses balloons/tooltips | Public `lasso1` release |
-| Newer Lasso design | `LassoV2.exe`, `LassV27.exe` | OpenRouter only | Per-user config; Settings opens only on demand; no model field in GUI; `LassV27` suppresses balloons/tooltips | Workflow and WebPull script exist; no `lasso2` release/tag was listed on GitHub as of 8 October 2026. Verify availability before using the `lasso2` download URL. |
+| LassoV2 family | `LassoV2.exe`, `LassV27.exe` | OpenRouter only | Per-user config; Settings opens only on demand; no model field in GUI; `LassV27` suppresses balloons/tooltips | Workflow and WebPull script exist; no `lasso2` release/tag was listed on GitHub as of 8 October 2026. Existing release scope remains unchanged. |
+| New Lasso family | `Lasso.exe`, `LassoWin7.exe` | APInex and OpenRouter only | Provider choice and key in Settings; model IDs config-only; separate diagnostics console on request; silent `Ctrl+Alt+O` cleanup | Build and release jobs prepared; `lasso3` tag publishes both targets |
 
-The names `LassV7` and `LassV27` identify 32-bit Python 3.8.10 Windows 7-compatible targets. The modern Windows variants are also built as 32-bit executables by the current workflows. The Pix2Text build is a separate 64-bit Windows 10+ package because of its heavier dependency stack.
+`LassV7`, `LassV27`, and `LassoWin7` identify 32-bit Python 3.8.10 Windows 7-compatible targets. The new `Lasso.exe` target is 64-bit Python 3.11 for Windows 11; the Pix2Text build is a separate 64-bit Windows 10+ package because of its heavier dependency stack. The existing Lasso1/LassoV2 release families are not overwritten.
 
 ### Project history and rationale
 
@@ -51,7 +52,7 @@ The names `LassV7` and `LassV27` identify 32-bit Python 3.8.10 Windows 7-compati
 - **v1.4.0-experimental and v1.5.0-experimental:** continued the standard experimental line. The v1.5.0 release included standard/diagnostic builds and a historical Groq executable.
 - **v1.6.0-experimental:** replaced direct Google Gemini and Groq integrations in the standard test version with APInex and local Ollama, while keeping Mistral and OpenRouter as choices. This tests a hosted intermediary and an on-device alternative without changing the separate Lasso provider scope.
 - **v1.7.0-experimental:** adds the optional APInex free-category vision ID `free/gpt-6-luna`; `free/gemini-3.8-flash` remains the default. The account-level allowance and billing behavior still need live confirmation.
-- **Lasso releases/builds:** evolved as distinct OpenRouter-only tray products rather than settings presets inside the standard app. Lasso1/LassV7 are publicly released; the LassoV2/LassV27 build flow exists but its release is not currently published.
+- **Lasso releases/builds:** the legacy Lasso1/LassV7 and LassoV2/LassV27 families remain OpenRouter-only. The new Lasso family adds APInex and OpenRouter with config-only model IDs and Windows 11/Windows 7 builds; it does not overwrite the earlier families.
 
 The overall reason for these branches is controlled experimentation: compare a small, explicit provider set, local OCR and inference options, response reliability, cost/quota behavior, and the privacy consequences of each route before expanding distribution. The project's latest release remains marked experimental for that reason.
 
@@ -205,31 +206,38 @@ The loader filters retired/unknown provider fields, resets invalid APInex/OpenRo
 
 ### Dedicated Lasso builds
 
-Each Lasso executable has its own per-user `config.json`:
+Each Lasso executable has a separate per-user config; the new family does not read or overwrite keys/configs from the older families:
 
-| Executable | Config path |
-| --- | --- |
-| `Lasso1.exe` | `%APPDATA%\Lasso1\config.json` |
-| `LassV7.exe` | `%APPDATA%\LassV7\config.json` |
-| `LassoV2.exe` | `%APPDATA%\LassoV2\config.json` |
-| `LassV27.exe` | `%APPDATA%\LassV27\config.json` |
+| Executable | Provider scope | Config path |
+| --- | --- | --- |
+| `Lasso1.exe` | OpenRouter only | `%APPDATA%\Lasso1\config.json` |
+| `LassV7.exe` | OpenRouter only | `%APPDATA%\LassV7\config.json` |
+| `LassoV2.exe` | OpenRouter only | `%APPDATA%\LassoV2\config.json` |
+| `LassV27.exe` | OpenRouter only | `%APPDATA%\LassV27\config.json` |
+| `Lasso.exe` | APInex or OpenRouter | `%APPDATA%\Lasso\config.json` |
+| `LassoWin7.exe` | APInex or OpenRouter | `%APPDATA%\LassoWin7\config.json` |
 
-A first-run config has a blank OpenRouter key, the default allowlisted Gemma `:free` model, and `allow_screenshot_uploads: false`. The only accepted Lasso model IDs are `google/gemma-4-31b-it:free` and `google/gemma-4-26b-a4b-it:free`. Lasso config writes are atomic; a key saved there is plaintext, so protect the per-user config as a credential file. Lasso builds ignore environment keys. The model can only be changed by editing the matching config file and restarting; it is not shown in the Settings GUI. A missing/unapproved model migrates to the safe default and clears old screenshot consent when the route/model changes.
+The four existing Lasso1/LassV7/LassoV2/LassV27 packages remain OpenRouter-only, accepting only `google/gemma-4-31b-it:free` and `google/gemma-4-26b-a4b-it:free`. The new Lasso family accepts two config-only APInex vision IDs (`free/gemini-3.8-flash` and `free/gemini-3.1-pro`) and those same two OpenRouter free IDs. `free/gpt-6-luna` remains an optional APInex model in standard Screen Answer only; it is not accepted by the new Lasso family. APInex quotas/pricing can change; no model is guaranteed free or unlimited. No paid or cross-provider fallback is added.
 
-Example first-run Lasso config:
+New Lasso first-run config (both keys blank and upload consent off):
 
 ```json
 {
-  "provider": "openrouter",
-  "api_keys": {"openrouter": ""},
-  "models": {"openrouter": "google/gemma-4-31b-it:free"},
+  "provider": "apinex",
+  "api_keys": {"apinex": "", "openrouter": ""},
+  "models": {
+    "apinex": "free/gemini-3.8-flash",
+    "openrouter": "google/gemma-4-31b-it:free"
+  },
   "allow_screenshot_uploads": false
 }
 ```
 
+Settings lets the user choose APInex or OpenRouter and enter that provider's key. Models are deliberately absent from the Settings GUI; change only `models.apinex` or `models.openrouter` in the matching config file, then restart. APInex requests use `https://api.apinex.bond/v1/chat/completions`; OpenRouter requests use `https://openrouter.ai/api/v1/chat/completions`. Each capture normally makes one provider request; retryable 429/5xx errors can trigger up to three HTTP attempts total. The retries are additional requests and may count toward provider limits. There is no separate OCR, web-search, or tool API call in this family. Lasso never reads API keys from environment variables. Config writes are atomic, and keys are plaintext, so protect each per-user file as a credential. Invalid/missing models migrate to safe defaults and clear consent when the route/model changes.
+
 ## 8. Consent, privacy, and logging
 
-Consent describes the actual recipient. Changing the selected provider or OCR backend clears consent in the standard UI; saving the new selection is required before a later capture. The standard app never persists consent. Lasso consent is stored in its per-user config and begins false. Full-screen upload notices should be read carefully; do not capture screens the user is not permitted to share.
+Consent describes the actual recipient. Changing the selected provider or OCR backend clears consent in the standard UI; saving the new selection is required before a later capture. The standard app never persists consent. Consent for all Lasso builds is stored in the matching per-user config and begins false. The new Lasso family also clears consent when the provider/model route changes; switching from APInex to OpenRouter requires explicit renewed consent. Full-screen upload notices should be read carefully; do not capture screens the user is not permitted to share.
 
 Screenshots are not logged or automatically saved. API keys are not logged and are redacted from diagnostic events. Diagnostic output can nevertheless contain:
 
@@ -247,9 +255,9 @@ The standard tray menu offers capture, Settings, diagnostics where enabled, and 
 - `Ctrl+Alt+Q` — exit normally.
 - `Ctrl+Alt+O` — only registered for dedicated Lasso builds; silently triggers scoped self-cleanup.
 
-For Lasso, right-click **Open** reveals Settings on demand. The menu also opens the matching config file/folder and can show Diagnostics on demand. Saving Settings hides/closes the window. The tray-menu self-destruct action asks for confirmation, while `Ctrl+Alt+O` does not prompt or show an app notification. Cleanup targets only the running Lasso EXE and its matching config file; a directory is removed only if empty, and unexpected files are left alone. If cleanup cannot be scheduled, the app stays open.
+For the existing Lasso families, right-click **Open** reveals Settings on demand. The new APInex/OpenRouter family opens Settings at startup when the selected provider's API key is missing; after a key is saved, it stays on demand. Saving closes Settings in every Lasso build. The menu opens the matching config file/folder. Legacy Lasso builds keep their on-demand Diagnostics page. The new family does not expose that page: its Settings button and tray menu launch a separate Windows diagnostic console only when explicitly requested. Closing Lasso shuts down that child process. Its log may contain OCR/model text and provider errors, but omits API keys and screenshot pixels; review it before sharing. The tray-menu self-destruct action asks for confirmation, while `Ctrl+Alt+O` does not prompt or show an app notification. Cleanup targets only the running Lasso EXE and its matching config file; a directory is removed only if empty, and unexpected files are left alone. If cleanup cannot be scheduled, the app stays open.
 
-LassV7 and LassV27 suppress app-generated notification-area balloons and hover tooltips; their icon color is the runtime feedback. Standard builds and the other Lasso variants (`Lasso1` and `LassoV2`) may show normal status notifications and tooltips.
+`LassV7`, `LassV27`, and the new `LassoWin7` suppress app-generated notification-area balloons and hover tooltips; their icon color is the runtime feedback. `Lasso1`, `LassoV2`, and the new 64-bit `Lasso.exe` may show normal status notifications and tooltips. Standard builds retain their existing feedback.
 
 ## 10. Repository map
 
@@ -261,7 +269,7 @@ LassV7 and LassV27 suppress app-generated notification-area balloons and hover t
 | `docs/project-guide.md` | This project-wide user/maintainer guide |
 | `docs/v1.6.0-apinex-ollama-implementation-guide.md` | Focused technical detail for v1.6 APInex/Ollama, request shapes, testing status, and pilot plan |
 | `docs/free-model-research-action-plan.md` | APInex allowance/pricing research, local-gateway comparison, quota plan, and open validation questions |
-| `.github/workflows/windows-release.yml` | Standard, Lasso, Pix2Text Windows build and release workflows |
+| `.github/workflows/windows-release.yml` | Standard, legacy Lasso, new Lasso Win11/x64 and Win7/x86, and Pix2Text Windows build/release workflows |
 | `requirements-pix2text.txt` | Optional OCR dependency constraints; not needed for standard runtime |
 | `webpull-lasso1.ps1` | PowerShell downloader/readme generator for the legacy LassV7 package |
 | `webpull.ps1` | PowerShell downloader/readme generator for the prepared LassV27 package |
@@ -277,13 +285,13 @@ Run the platform-independent test suite with:
 python -m unittest discover -s tests -v
 ```
 
-The suite has 68 tests as of v1.7.0. Provider tests mock `urllib.request.urlopen`; they inspect payloads, model allowlists, redaction, retries, local endpoint errors, OCR context, and answer parsing without using a real key or service. The suite also covers config migration, no-key Ollama Settings behavior, upload consent, Lasso config paths and UI behavior, tray notification suppression, self-cleanup scope, PNG encoding, and Pix2Text API import/behavior using mocks.
+The v1.7.0 baseline had 68 tests; the current working-tree suite has 81. Provider tests mock `urllib.request.urlopen`; they inspect payloads, model allowlists, redaction, retries, local endpoint errors, OCR context, and answer parsing without using a real key or service. Tests also cover config migration, no-key Ollama Settings behavior, upload consent, Lasso config paths and UI behavior, the new APInex/OpenRouter Lasso family, on-demand diagnostic-console lifecycle, tray notification suppression, self-cleanup scope, PNG encoding, and Pix2Text API import/behavior. No live inference is performed.
 
 The EXEs support build smoke-check flags:
 
 - `--check-apinex-ollama` — checks standard defaults, provider registry, endpoints, valid default models, and keyless Ollama policy.
 - `--check-openrouter-support` — checks OpenRouter provider/key/model/endpoint wiring.
-- `--check-lasso1-build`, `--check-lassv7-build`, `--check-lassov2-build`, `--check-lassv27-build` — verify expected executable identity, provider scope, model policy, config folder, diagnostics mode, and where relevant Python version/bitness.
+- `--check-lasso1-build`, `--check-lassv7-build`, `--check-lassov2-build`, `--check-lassv27-build`, `--check-lasso-build`, `--check-lassowin7-build` — verify expected executable identity, provider scope, model policy, config folder, diagnostics mode, and Python version/bitness where applicable.
 - `--check-pix2text` — smoke-tests that the bundled Pix2Text API imports; it does not download model weights or test recognition quality.
 - `--diagnostics` — opens diagnostics when running from source (except dedicated Lasso builds, whose diagnostic page remains on-demand).
 
@@ -307,9 +315,11 @@ The output goes to `dist/`. For a Windows 7-targeted build, use 32-bit Python 3.
 
 ### Lasso packages
 
-The same workflow defines Lasso1/LassV7 and LassoV2/LassV27 build jobs. Each pair uses x86 Python 3.8.10 and PyInstaller 5.13.2, runs the test suite and build smoke checks, validates its PowerShell script, and uploads two EXEs plus a renamed `webpull.ps1` artifact. Tags `lasso1` and `lasso2` publish their respective Lasso releases. The workflow also permits manual dispatch or matching commit-message markers (`[lasso1-build]`, `[lasso2-build]`) to build the pairs.
+The workflow keeps the existing Lasso1/LassV7 and LassoV2/LassV27 build jobs intact. Each pair uses x86 Python 3.8.10 and PyInstaller 5.13.2, runs the test suite and build smoke checks, validates its PowerShell script, and uploads two EXEs plus a renamed `webpull.ps1` artifact. Tags `lasso1` and `lasso2` publish their respective releases; manual dispatch or matching commit-message markers (`[lasso1-build]`, `[lasso2-build]`) build the pairs.
 
-**Current distribution caveat:** the public GitHub release list as checked on 8 October 2026 includes the `lasso1` release but does not show a `lasso2` tag/release. The source and workflow for LassoV2/LassV27 exist, but their release/WebPull URL should be considered pending until the `lasso2` release is actually published. The README now distinguishes this prepared build flow from a published download.
+The new `lasso3` family has two separate packaging jobs: `Lasso.exe` uses x64 Python 3.11 for the Windows 11 target, and `LassoWin7.exe` uses x86 Python 3.8.10 for the Windows 7 target. Both jobs run the unit suite and their executable-specific smoke check. A `lasso3` tag runs both jobs and the release job, which publishes both EXEs together; manual dispatch or `[lasso3-build]` builds them as artifacts without publishing a release. The Windows CI runner is Windows Server 2022, so the Win7 EXE is not tested on an actual Windows 7 host.
+
+**Distribution status:** `lasso1` is the previously published release. The LassoV2/LassV27 release remains pending until `lasso2` is published. The new Lasso `lasso3` workflow and release job are prepared in this branch; no Windows build or public `lasso3` release has been performed as part of this work. Release/download links must not be described as available until the corresponding tag/release exists.
 
 ### Pix2Text package
 
@@ -325,9 +335,10 @@ The workflow builds Pix2Text only by manual dispatch or a push whose head commit
 | `v1.3.0-experimental` | `ScreenAnswer.exe`, `ScreenAnswer-Diagnostic.exe`, `ScreenAnswer-Pix2Text.exe` | Experimental x64 local OCR package |
 | `lasso1` | `Lasso1.exe`, `LassV7.exe`, `webpull.ps1` | Public OpenRouter-only Lasso release |
 | `lasso2` | Workflow is prepared for `LassoV2.exe`, `LassV27.exe`, `webpull.ps1` | Not present in public release list at check time |
+| `lasso3` | Workflow is prepared for `Lasso.exe` (Win11 x64) and `LassoWin7.exe` (Win7 x86) | Not yet published; the tag runs both build jobs and attaches both EXEs |
 | `v1.0.0`, `v1.0.1`, `v1.0.2`, `v1.0.3`, `v1.0.4`, `v1.1.0`, `v1.2.0`, `v1.2.1`, `v1.4.0-experimental` | Earlier standard iterations | See GitHub release notes for per-version asset/change history |
 
-The v1.7.0 release assets do not include `screen_answer_config.json`, any API key, `servomotor`, Ollama, Ollama model files, or Pix2Text weights. The release is experimental and does not certify inference quality, quotas, or provider billing. The current workflow defines no Authenticode-signing or separate checksum-publication step; users should verify the source and release provenance before running an EXE.
+The v1.7.0 release assets do not include `screen_answer_config.json`, any API key, `servomotor`, Ollama, Ollama model files, or Pix2Text weights. The new Lasso release job likewise packages only `Lasso.exe` and `LassoWin7.exe`; it does not package user configs or credentials. Releases are experimental and do not certify inference quality, quotas, or provider billing. The current workflow defines no Authenticode-signing or separate checksum-publication step; users should verify the source and release provenance before running an EXE.
 
 ## 13. WebPull scripts
 
@@ -335,6 +346,7 @@ The Lasso WebPull scripts create a new folder under the user's Downloads directo
 
 - `webpull-lasso1.ps1` downloads `LassV7.exe` from the `lasso1` release.
 - `webpull.ps1` is prepared to download `LassV27.exe` from `lasso2` once that release exists.
+- No WebPull helper is defined for the new `lasso3` family; once published, obtain the Windows-specific EXE directly from that release's assets.
 
 If the target folder already exists, each script creates a numbered sibling instead of overwriting it. If the download fails, the script removes the newly created folder. TLS 1.2 is requested where available. The script does not download an API key, config, or `servomotor` file. It does not perform a separate cryptographic checksum/signature verification of the EXE, so users who run a downloaded PowerShell script should inspect the script/source and release provenance first.
 
@@ -357,6 +369,14 @@ For `lasso2`, use the equivalent command only after verifying that the LassoV2/L
 5. Read the matching upload/data-path notice, select consent, and save. Standard consent starts unchecked after each app launch.
 6. Use a synthetic/non-sensitive screenshot first; press `Ctrl+Alt+S` only after checking the screen contents.
 
+### New Lasso family (when the `lasso3` release is published)
+
+1. Choose `Lasso.exe` for the 64-bit Windows 11 target or `LassoWin7.exe` for the 32-bit Windows 7 target. The CI workflow is configured for both; neither Windows build has been executed from this worktree yet.
+2. On first launch the app creates its matching `%APPDATA%` config with blank APInex/OpenRouter keys and screenshot consent off, then opens Settings automatically because the selected provider key is missing. Choose a provider, enter its key, and explicitly enable consent if you accept the upload route. **Save** closes Settings; after a key is stored, Settings is available from the tray on demand.
+3. APInex is the default provider/model. OpenRouter is limited to two explicit Gemma `:free` vision IDs; this Lasso family accepts only `free/gemini-3.8-flash` and `free/gemini-3.1-pro` on APInex. Model names are never shown in Settings: change the selected provider's `models` entry in the config and restart. The GPT-6 Luna alternative is confined to standard Screen Answer. No paid or cross-provider fallback is used; verify APInex quota/pricing in the user's account.
+4. **Ctrl+Alt+S** sends the full desktop only after consent. A separate diagnostic console opens only when explicitly requested. It can contain OCR/model text or provider errors; API keys and screenshot pixels are omitted. `Ctrl+Alt+O` silently schedules cleanup of only the running executable and matching config; the tray-menu self-destruct command remains confirmation-gated.
+5. The family makes chat-completions requests only; live web search and tool execution are disabled. Never package or share the per-user config, which stores keys in plaintext.
+
 ### Common failure cases
 
 | Symptom | What to check |
@@ -373,19 +393,20 @@ For `lasso2`, use the equivalent command only after verifying that the LassoV2/L
 
 ## 15. Current status, risks, and next work
 
-### Implemented and verified in the code/release workflow
+### Implemented in source and workflow configuration
 
 - Standard APInex/Ollama/Mistral/OpenRouter provider set, consent UX, config filtering, and API request implementations.
 - Direct Google/Gemini and Groq provider paths removed from the standard build; historical Groq release assets remain historical, not current.
-- Dedicated Lasso provider scope remains OpenRouter-only and separate from standard settings.
+- Existing Lasso1/LassV7 and LassoV2/LassV27 remain OpenRouter-only and separate. The new Lasso source adds APInex/OpenRouter, per-variant config, config-only model selection, explicit consent, and on-demand console diagnostics.
 - Full-desktop capture, tray color reporting, OCR options, diagnostics, and multiple-choice parsing.
-- Offline tests and Windows packaging/smoke checks.
+- Offline test coverage, including mocked API request formatting and new Lasso behavior. Separate Win11/x64 and Win7/x86 build/release jobs are configured.
 
 ### Not verified by this project run
 
 - Real APInex image acceptance, account quota, billing after quota, upstream retention, real-world latency, and answer quality.
 - Real Ollama inference, hardware requirements/latency, and answer quality on the target device.
 - Accuracy on a representative problem set or sustained 80–120-query workload.
+- Execution of the new Windows packaging/release jobs, runtime behavior on actual Windows 11 and Windows 7 machines, and whether the `lasso3` assets are published.
 - Availability of a `lasso2` release/WebPull asset at the check date.
 
 ### Sensible next steps
@@ -394,7 +415,8 @@ For `lasso2`, use the equivalent command only after verifying that the LassoV2/L
 2. Test Ollama locally on the target Windows device, including the model load time, memory use, and answer accuracy.
 3. Compare both providers using the same labeled problem set and keep records of correct, incorrect, neutral, latency, and usage.
 4. Only after these tests decide whether to expand distribution or change provider/model defaults.
-5. If the LassoV2/LassV27 assets are needed publicly, verify the WebPull script/release notes and publish the intended `lasso2` tag through the configured workflow.
+5. Run the `lasso3` Windows 11 and Windows 7 build jobs, then smoke-test the corresponding EXEs on their target operating systems before publishing the tag.
+6. If the LassoV2/LassV27 assets are needed publicly, verify the WebPull script/release notes and publish the intended `lasso2` tag through the configured workflow.
 
 ## 16. Reference links
 
