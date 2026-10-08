@@ -96,5 +96,23 @@ class TrayModuleContractTests(unittest.TestCase):
                 )
 
 
+class AppTrayWiringTests(unittest.TestCase):
+    def test_run_app_wires_the_real_shell_into_the_app(self):
+        # Regression: the app was once built without `shell=` and drove a
+        # private NullShell — the tray sphere never changed color. The shell
+        # must be created first and passed in.
+        import inspect
+
+        from screenanswer.__main__ import _run_app
+
+        source = inspect.getsource(_run_app)
+        self.assertIn("shell=shell", source)
+        self.assertLess(
+            source.index("create_shell(events)"),
+            source.index("ScreenAnswerApp("),
+            "the shell must exist before the app is constructed",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

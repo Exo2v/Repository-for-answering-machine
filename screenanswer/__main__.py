@@ -86,33 +86,6 @@ def _run_app(show_diagnostics: bool) -> int:
     console_holder: dict = {}
     settings_holder: dict = {}
 
-    def scheduler(delay_ms: int, callback: Any) -> None:
-        root.after(delay_ms, callback)
-
-    app = ScreenAnswerApp(
-        settings,
-        diagnostics=diagnostics,
-        scheduler=scheduler,
-        status_fn=lambda text: (
-            settings_holder.get("window") and settings_holder["window"].set_status(text)
-        ),
-    )
-
-    def open_settings() -> None:
-        window = settings_holder.get("window")
-        if window is not None:
-            window.root.deiconify()
-            window.root.lift()
-
-    def open_diagnostics() -> None:
-        if "console" not in console_holder:
-            console_holder["console"] = DiagnosticConsole(diagnostics)
-        console_holder["console"].show()
-
-    def exit_app() -> None:
-        app.handle_event(("exit",))
-        root.after(200, root.destroy)
-
     shell = None
     try:
         shell = create_shell(events)
@@ -134,6 +107,30 @@ def _run_app(show_diagnostics: bool) -> int:
         from .tray import NullShell
 
         shell = NullShell()
+
+    app = ScreenAnswerApp(
+        settings,
+        shell=shell,  # the real tray sphere — colors ARE the answer
+        diagnostics=diagnostics,
+        status_fn=lambda text: (
+            settings_holder.get("window") and settings_holder["window"].set_status(text)
+        ),
+    )
+
+    def open_settings() -> None:
+        window = settings_holder.get("window")
+        if window is not None:
+            window.root.deiconify()
+            window.root.lift()
+
+    def open_diagnostics() -> None:
+        if "console" not in console_holder:
+            console_holder["console"] = DiagnosticConsole(diagnostics)
+        console_holder["console"].show()
+
+    def exit_app() -> None:
+        app.handle_event(("exit",))
+        root.after(200, root.destroy)
 
     window = SettingsWindow(
         settings,
