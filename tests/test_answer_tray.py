@@ -1,6 +1,7 @@
 import base64
 import ctypes
 import io
+import inspect
 import json
 import os
 import queue
@@ -23,6 +24,9 @@ from answer_tray import (
     DEFAULT_OLLAMA_MODEL,
     DEFAULT_MISTRAL_MODEL,
     DEFAULT_OPENROUTER_MODEL,
+    OTTERARY_CONFIG_DIRECTORY,
+    OTTERARY_SYSTEM_INSTRUCTION,
+    OTTERARY_WIN7_CONFIG_DIRECTORY,
     LASSO_APINEX_VISION_MODELS,
     LASSO_CONFIG_DIRECTORY,
     LASSOV2_CONFIG_DIRECTORY,
@@ -51,8 +55,11 @@ from answer_tray import (
     diagnostics_page_available,
     ensure_lasso1_config,
     ensure_lasso_multi_provider_config,
+    ensure_otterary_config,
     is_lasso1_executable,
     is_lassv7_executable,
+    is_otterary_executable,
+    is_otterary_win7_executable,
     hotkey_specs_for_variant,
     hotkey_event_for_id,
     lasso_app_name_for_executable,
@@ -63,13 +70,19 @@ from answer_tray import (
     is_lasso_multi_provider_executable,
     main,
     load_portable_config,
+    load_otterary_config,
+    otterary_config_directory_for_executable,
+    otterary_config_path,
+    otterary_config_template,
     parse_option,
     provider_labels_for_executable,
     provider_requires_api_key,
     resolve_api_key,
     schedule_lasso1_self_cleanup,
+    self_destruct_config_directory_for_executable,
     save_lasso1_config,
     save_lasso_multi_provider_config,
+    save_otterary_config,
     should_open_lasso_settings_on_startup,
     pix2text_bundle_importable,
     run_pix2text_ocr,
@@ -1927,6 +1940,371 @@ class ProviderRegistryTests(unittest.TestCase):
     def test_build_smoke_check_covers_new_providers(self):
         with patch("sys.argv", ["ScreenAnswer-Diagnostic.exe", "--check-apinex-ollama"]):
             self.assertEqual(main(), 0)
+
+
+class OtteraryVariantTests(unittest.TestCase):
+    def test_builds_are_isolated_to_gemini_and_openrouter(self):
+        expected = {"openrouter": "OpenRouter", "gemini": "Google Gemini"}
+        for executable_name, config_directory in (
+            ("Otterary.exe", OTTERARY_CONFIG_DIRECTORY),
+            ("OtteraryWin7.exe", OTTERARY_WIN7_CONFIG_DIRECTORY),
+        ):
+            self.assertTrue(is_otterary_executable(executable_name))
+            self.assertEqual(provider_labels_for_executable(executable_name), expected)
+            self.assertEqual(default_provider_for_executable(executable_name), "openrouter")
+            self.assertEqual(
+                otterary_config_directory_for_executable(executable_name), config_directory
+            )
+            self.assertEqual(
+                self_destruct_config_directory_for_executable(executable_name), config_directory
+            )
+            self.assertTrue(diagnostic_console_available_for_executable(executable_name))
+            self.assertFalse(diagnostics_page_available((), executable_name))
+            self.assertFalse(diagnostics_mode_enabled(("--diagnostics",), executable_name))
+            self.assertIn("Ctrl+Alt+O", hotkey_specs_for_variant(True)[-1][1])
+            self.assertFalse(is_lasso1_executable(executable_name))
+            self.assertFalse(is_lasso_multi_provider_executable(executable_name))
+        self.assertFalse(is_otterary_win7_executable("Otterary.exe"))
+        self.assertTrue(is_otterary_win7_executable("OtteraryWin7.exe"))
+        self.assertFalse(is_otterary_executable("Lasso.exe"))
+
+    def test_first_run_configs_are_separate_blank_and_consent_off(self):
+        with tempfile.TemporaryDirectory() as directory:
+            expected_paths = {
+                "Otterary.exe": os.path.join(directory, "Otterary", "config.json"),
+                "OtteraryWin7.exe": os.path.join(directory, "OtteraryWin7", "config.json"),
+            }
+            for executable_name, expected_path in expected_paths.items():
+                path = otterary_config_path(directory, executable_name)
+                self.assertEqual(path, expected_path)
+                self.assertTrue(ensure_otterary_config(path))
+                with open(path, "r", encoding="utf-8") as config_file:
+                    raw_config = json.load(config_file)
+                self.assertEqual(raw_config, otterary_config_template())
+                self.assertEqual(raw_config["api_keys"], {"openrouter": "", "gemini": ""})
+                self.assertIs(raw_config["allow_screenshot_uploads"], False)
+                self.assertNotIn("ocr_backend", raw_config)
+                self.assertNotIn("OCR", json.dumps(raw_config))
+                self.assertEqual(load_otterary_config(path), otterary_config_template())
+            self.assertNotEqual(expected_paths["Otterary.exe"], expected_paths["OtteraryWin7.exe"])
+
+    def test_saved_provider_and_models_ignore_environment_keys(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = otterary_config_path(directory, "Otterary.exe")
+            ensure_otterary_config(path)
+            keys = {"openrouter": "openrouter-saved", "gemini": "gemini-saved"}
+            models = {
+                "openrouter": DEFAULT_OPENROUTER_MODEL,
+                "gemini": DEFAULT_GEMINI_MODEL,
+            }
+            save_otterary_config(path, "gemini", keys, models, True)
+            loaded = load_otterary_config(path)
+            self.assertEqual(loaded["provider"], "gemini")
+            self.assertEqual(loaded["api_keys"], keys)
+            self.assertEqual(loaded["models"], models)
+            self.assertIs(loaded["allow_screenshot_uploads"], True)
+            self.assertEqual(
+                resolve_api_key(
+                    "gemini",
+                    loaded["api_keys"],
+                    {"GEMINI_API_KEY": "environment-key"},
+                    lasso1_mode=True,
+                    config_label="Otterary",
+                ),
+                ("gemini-saved", "Otterary config file"),
+            )
+            with self.assertRaisesRegex(ValueError, "API key is required"):
+                save_otterary_config(path, "openrouter", {"openrouter": ""}, models, True)
+            with self.assertRaisesRegex(ValueError, "valid OpenRouter model"):
+                save_otterary_config(
+                    path,
+                    "openrouter",
+                    {"openrouter": "openrouter-key"},
+                    {"openrouter": "openai/gpt-4o", "gemini": DEFAULT_GEMINI_MODEL},
+                    True,
+                )
+
+    def test_first_run_opens_settings_but_not_console_and_ignores_environment_keys(self):
+        class FakeStringVar:
+            def __init__(self, value=""):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+            def set(self, value):
+                self.value = value
+
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = otterary_config_path(directory, "Otterary.exe")
+            root = MagicMock()
+            root.after = MagicMock()
+            tray = MagicMock()
+            tkinter_module = types.SimpleNamespace(StringVar=FakeStringVar)
+            overrides = {
+                "OTTERARY_MODE": True,
+                "OTTERARY_WIN7_MODE": False,
+                "LASSO1_MODE": False,
+                "LASSO_MULTI_PROVIDER_MODE": False,
+                "LASSO_OPENROUTER_ONLY_MODE": False,
+                "LASSOV7_MODE": False,
+                "APP_NAME": "Otterary",
+                "APP_VERSION": "1.0.0",
+                "APP_DEFAULT_PROVIDER": "openrouter",
+                "PROVIDER_LABELS": {"openrouter": "OpenRouter", "gemini": "Google Gemini"},
+                "API_KEY_ENV_VARS": {
+                    "openrouter": "OPENROUTER_API_KEY",
+                    "gemini": "GEMINI_API_KEY",
+                },
+                "DEFAULT_MODELS": {
+                    "openrouter": DEFAULT_OPENROUTER_MODEL,
+                    "gemini": DEFAULT_GEMINI_MODEL,
+                },
+            }
+            with patch.multiple("answer_tray", **overrides):
+                with patch("answer_tray.portable_config_path", return_value=path):
+                    with patch("answer_tray.diagnostics_mode_enabled", return_value=False):
+                        with patch("answer_tray.WindowsTray", return_value=tray) as tray_class:
+                            with patch.object(
+                                ScreenAnswerApp, "_build_otterary_window"
+                            ) as build_window:
+                                with patch.dict("sys.modules", {"tkinter": tkinter_module}):
+                                    with patch.dict(
+                                        os.environ,
+                                        {"GEMINI_API_KEY": "environment-key"},
+                                    ):
+                                        app = ScreenAnswerApp(root)
+
+        self.assertEqual(app.provider, "openrouter")
+        self.assertEqual(app.api_key, "")
+        self.assertEqual(app.api_key_sources["gemini"], "not configured")
+        self.assertEqual(app.ocr_backend, "provider")
+        self.assertFalse(app.privacy_acknowledged)
+        self.assertTrue(app.prompt_for_otterary_setup)
+        self.assertFalse(app.diagnostics_auto_open)
+        self.assertTrue(app.diagnostics_enabled)
+        self.assertIsNone(app.diagnostic_console_process)
+        build_window.assert_called_once_with()
+        tray_class.assert_called_once()
+        self.assertTrue(tray_class.call_args.kwargs["suppress_tray_feedback"])
+        self.assertTrue(tray_class.call_args.kwargs["diagnostic_console_enabled"])
+        self.assertEqual([call.args[0] for call in root.after.call_args_list], [100, 0])
+
+    def test_otterary_ui_console_and_prompts_avoid_backend_wording(self):
+        ui_source = inspect.getsource(ScreenAnswerApp._build_otterary_window)
+        consent_source = inspect.getsource(ScreenAnswerApp._otterary_consent_text)
+        self.assertNotIn("OCR", ui_source)
+        self.assertNotIn("OCR", consent_source)
+        self.assertNotIn("open_diagnostic_console", ui_source)
+        self.assertNotIn("OCR", OTTERARY_SYSTEM_INSTRUCTION)
+        self.assertFalse(diagnostics_page_available((), "Otterary.exe"))
+        repo_root = os.path.dirname(os.path.dirname(__file__))
+        with open(os.path.join(repo_root, "docs", "otterary.md"), "r", encoding="utf-8") as guide:
+            guide_text = guide.read()
+        with open(
+            os.path.join(repo_root, ".github", "workflows", "windows-release.yml"),
+            "r",
+            encoding="utf-8",
+        ) as workflow:
+            workflow_text = workflow.read()
+        otterary_release = workflow_text.split("  release-otterary:\n", 1)[1].split(
+            "  release-lasso3:\n", 1
+        )[0]
+        self.assertNotIn("OCR", guide_text.upper())
+        self.assertNotIn("OCR", otterary_release.upper())
+
+    def test_packaged_windows11_and_windows7_smoke_checks(self):
+        overrides = {
+            "OTTERARY_MODE": True,
+            "OTTERARY_WIN7_MODE": False,
+            "APP_NAME": "Otterary",
+            "APP_VERSION": "1.0.0",
+            "APP_DEFAULT_PROVIDER": "openrouter",
+            "PROVIDER_LABELS": {"openrouter": "OpenRouter", "gemini": "Google Gemini"},
+            "API_KEY_ENV_VARS": {
+                "openrouter": "OPENROUTER_API_KEY",
+                "gemini": "GEMINI_API_KEY",
+            },
+            "DEFAULT_MODELS": {
+                "openrouter": DEFAULT_OPENROUTER_MODEL,
+                "gemini": DEFAULT_GEMINI_MODEL,
+            },
+        }
+        with patch.multiple("answer_tray", **overrides):
+            with patch("answer_tray.sys.version_info", (3, 11, 9, "final", 0)):
+                with patch("answer_tray.struct.calcsize", return_value=8):
+                    with patch("sys.argv", ["Otterary.exe", "--check-otterary-build"]):
+                        self.assertEqual(main(), 0)
+
+        win7_overrides = dict(overrides)
+        win7_overrides["OTTERARY_WIN7_MODE"] = True
+        with patch.multiple("answer_tray", **win7_overrides):
+            with patch("answer_tray.sys.version_info", (3, 8, 10, "final", 0)):
+                with patch("answer_tray.struct.calcsize", return_value=4):
+                    with patch(
+                        "sys.argv",
+                        ["OtteraryWin7.exe", "--check-otterarywin7-build"],
+                    ):
+                        self.assertEqual(main(), 0)
+
+    def test_otterary_console_is_explicit_and_its_intro_avoids_backend_wording(self):
+        app = object.__new__(ScreenAnswerApp)
+        app.lasso_multi_provider_mode = False
+        app.otterary_mode = True
+        app.diagnostics_enabled = True
+        app.diagnostic_console_lock = MagicMock()
+        app.diagnostic_console_process = None
+        app.diagnostic_lines = ["OpenRouter request completed."]
+        app._log_diagnostic = MagicMock()
+        app.status_var = MagicMock()
+        process = MagicMock()
+        process.poll.return_value = None
+
+        with patch("answer_tray.subprocess.Popen", return_value=process) as popen:
+            with patch("answer_tray.threading.Thread") as thread_class:
+                self.assertTrue(app.open_diagnostic_console())
+
+        popen.assert_called_once()
+        thread_class.assert_called_once()
+        thread_class.return_value.start.assert_called_once_with()
+        messages = []
+        while not app.diagnostic_console_messages.empty():
+            messages.append(app.diagnostic_console_messages.get_nowait())
+        self.assertTrue(any("Console opened on request" in line for line in messages))
+        self.assertTrue(any("OpenRouter request completed" in line for line in messages))
+        self.assertFalse(any("OCR" in line.upper() for line in messages))
+
+    def test_otterary_tray_menu_has_on_demand_console_and_self_delete(self):
+        class Point(ctypes.Structure):
+            _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+        tray = object.__new__(WindowsTray)
+        tray.settings_enabled = True
+        tray.lasso1_mode = False
+        tray.self_destruct_enabled = True
+        tray.diagnostics_enabled = True
+        tray.diagnostic_console_enabled = True
+        tray.events = MagicMock()
+        tray._user32 = MagicMock()
+        tray._user32.CreatePopupMenu.return_value = 1
+        tray._user32.TrackPopupMenu.return_value = 108
+        with patch("answer_tray.APP_NAME", "Otterary"):
+            WindowsTray._show_context_menu(
+                tray,
+                1,
+                Point,
+                101,
+                102,
+                103,
+                104,
+                105,
+                107,
+                106,
+                0,
+                0x0800,
+                0x0100,
+                0x0002,
+                0,
+                108,
+            )
+        labels = [
+            call.args[3]
+            for call in tray._user32.AppendMenuW.call_args_list
+            if call.args[3]
+        ]
+        self.assertIn("Open Otterary", labels)
+        self.assertIn("Open diagnostic console", labels)
+        self.assertIn("Self-destruct Otterary…", labels)
+        self.assertNotIn("Show diagnostics", labels)
+        tray.events.put.assert_called_once_with(("open_diagnostic_console",))
+
+    def test_otterary_silent_delete_uses_its_private_config_path_without_prompt(self):
+        app = object.__new__(ScreenAnswerApp)
+        app.lasso1_mode = False
+        app.otterary_mode = True
+        app.self_destruct_enabled = True
+        app.config_path = os.path.join("profile", "Otterary", "config.json")
+        app.tray = MagicMock()
+        app.exit_app = MagicMock()
+        app._log_diagnostic = MagicMock()
+        with patch("answer_tray.ctypes.WinDLL", side_effect=AssertionError("unexpected prompt"), create=True):
+            with patch("answer_tray.schedule_lasso1_self_cleanup", return_value=True) as cleanup:
+                self.assertTrue(app.silent_delete())
+        cleanup.assert_called_once_with(sys.executable, app.config_path)
+        app.exit_app.assert_called_once_with()
+        app.tray.show_balloon.assert_not_called()
+
+    def test_otterary_tray_suppresses_tooltips_and_notifications_but_keeps_color(self):
+        class NotifyIconData(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", ctypes.c_uint),
+                ("hWnd", ctypes.c_void_p),
+                ("uID", ctypes.c_uint),
+                ("uFlags", ctypes.c_uint),
+                ("uCallbackMessage", ctypes.c_uint),
+                ("hIcon", ctypes.c_void_p),
+                ("szTip", ctypes.c_wchar * 128),
+                ("dwState", ctypes.c_uint),
+                ("dwStateMask", ctypes.c_uint),
+                ("szInfo", ctypes.c_wchar * 256),
+                ("uTimeoutOrVersion", ctypes.c_uint),
+                ("szInfoTitle", ctypes.c_wchar * 64),
+                ("dwInfoFlags", ctypes.c_uint),
+            ]
+
+        tray = object.__new__(WindowsTray)
+        tray.suppress_tray_feedback = True
+        tray.hwnd = 1
+        tray._nid = NotifyIconData()
+        tray._nid_type = NotifyIconData
+        tray._lock = MagicMock()
+        tray._create_icon = MagicMock(return_value=17)
+        tray._shell32 = MagicMock()
+        tray.set_state((67, 160, 71), "Option 3")
+        self.assertEqual(tray._nid.hIcon, 17)
+        self.assertEqual(tray._nid.uFlags, 0x00000001 | 0x00000002)
+        tray._shell32.Shell_NotifyIconW.reset_mock()
+        tray.show_balloon("Otterary", "Answer 3")
+        tray._shell32.Shell_NotifyIconW.assert_not_called()
+
+    def test_requests_use_only_selected_provider_without_tools_or_auxiliary_text(self):
+        gemini_payload = {
+            "candidates": [{"content": {"parts": [{"text": "ANSWER: 2"}]}}]
+        }
+        with patch("answer_tray._gemini_post_json", return_value=gemini_payload) as post:
+            option, _ = ask_gemini(
+                "gemini-key",
+                DEFAULT_GEMINI_MODEL,
+                b"image",
+                system_instruction=OTTERARY_SYSTEM_INSTRUCTION,
+            )
+        self.assertEqual(option, 2)
+        gemini_body = post.call_args.args[2]
+        self.assertNotIn("OCR", json.dumps(gemini_body))
+        self.assertNotIn("tools", gemini_body)
+
+        openrouter_payload = {
+            "model": DEFAULT_OPENROUTER_MODEL,
+            "choices": [{"message": {"content": "ANSWER: 1"}}],
+        }
+        diagnostics = []
+        with patch("answer_tray._openrouter_post_json", return_value=openrouter_payload) as post:
+            option, _ = ask_openrouter(
+                "openrouter-key",
+                DEFAULT_OPENROUTER_MODEL,
+                b"image",
+                diagnostic=diagnostics.append,
+                system_instruction=OTTERARY_SYSTEM_INSTRUCTION,
+                omit_ocr_diagnostics=True,
+            )
+        self.assertEqual(option, 1)
+        openrouter_body = post.call_args.args[1]
+        self.assertNotIn("OCR", json.dumps(openrouter_body))
+        self.assertNotIn("tools", openrouter_body)
+        self.assertFalse(any("OCR" in line for line in diagnostics))
+
 
 class GeminiRequestTests(unittest.TestCase):
     def test_direct_gemini_sends_png_once_and_omits_thought_parts(self):

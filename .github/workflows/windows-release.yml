@@ -10,6 +10,7 @@ on:
       - "lasso1"
       - "lasso2"
       - "lasso3"
+      - "otterary"
 
 permissions:
   contents: write
@@ -17,7 +18,7 @@ permissions:
 jobs:
   build-standard:
     name: Build legacy-compatible Windows executables
-    if: github.ref != 'refs/tags/lasso1' && github.ref != 'refs/tags/lasso2' && github.ref != 'refs/tags/lasso3'
+    if: github.ref != 'refs/tags/lasso1' && github.ref != 'refs/tags/lasso2' && github.ref != 'refs/tags/lasso3' && github.ref != 'refs/tags/otterary'
     runs-on: windows-2022
     steps:
       - name: Check out source
@@ -206,6 +207,68 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  build-otterary-win11:
+    name: Build Otterary version 1 for Windows 11 (x64)
+    if: github.ref == 'refs/tags/otterary' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && contains(github.event.head_commit.message, '[otterary-build]'))
+    runs-on: windows-2022
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up 64-bit Python 3.11 (Windows 11 target)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: "x64"
+
+      - name: Test
+        run: python -m unittest discover -s tests -v
+
+      - name: Package Otterary for Windows 11
+        run: |
+          python -m pip install pyinstaller==5.13.2
+          pyinstaller --noconfirm --clean --onefile --windowed --name Otterary answer_tray.py
+          .\dist\Otterary.exe --check-otterary-build
+
+      - name: Upload Windows 11 executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: Otterary-Windows-11-x64
+          path: dist/Otterary.exe
+          if-no-files-found: error
+          retention-days: 30
+
+  build-otterary-win7:
+    name: Build Otterary version 1 for Windows 7 (x86)
+    if: github.ref == 'refs/tags/otterary' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && contains(github.event.head_commit.message, '[otterary-build]'))
+    runs-on: windows-2022
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up 32-bit Python 3.8.10 (Windows 7 target)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.8.10"
+          architecture: "x86"
+
+      - name: Test
+        run: python -m unittest discover -s tests -v
+
+      - name: Package Otterary for Windows 7
+        run: |
+          python -m pip install pyinstaller==5.13.2
+          pyinstaller --noconfirm --clean --onefile --windowed --name OtteraryWin7 answer_tray.py
+          .\dist\OtteraryWin7.exe --check-otterarywin7-build
+
+      - name: Upload Windows 7 executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: Otterary-Windows-7-x86
+          path: dist/OtteraryWin7.exe
+          if-no-files-found: error
+          retention-days: 30
+
   build-pix2text:
     name: Build experimental Pix2Text executable (Windows x64)
     # The commit-message opt-in also permits test builds where manual dispatch is unavailable.
@@ -357,6 +420,46 @@ jobs:
             release-assets/LassoV2.exe
             release-assets/LassV27.exe
             release-assets/webpull.ps1
+
+  release-otterary:
+    name: Publish Otterary version 1 Windows release
+    if: github.ref == 'refs/tags/otterary'
+    needs:
+      - build-otterary-win11
+      - build-otterary-win7
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Windows 11 executable
+        uses: actions/download-artifact@v4
+        with:
+          name: Otterary-Windows-11-x64
+          path: release-assets
+
+      - name: Download Windows 7 executable
+        uses: actions/download-artifact@v4
+        with:
+          name: Otterary-Windows-7-x86
+          path: release-assets
+
+      - name: Publish Otterary version 1 assets
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Otterary version 1.0.0
+          generate_release_notes: false
+          overwrite_files: true
+          body: |
+            Otterary version 1.0.0 includes two standalone Windows builds: `Otterary.exe` for 64-bit Windows 11 (Python 3.11) and `OtteraryWin7.exe` for 32-bit Windows 7 (Python 3.8.10). This is a separate family from all Lasso and Screen Answer builds.
+
+            First launch opens Settings. Choose Google Gemini or OpenRouter, enter your own API key, review the upload notice, and Save. API-key fields start blank and provider model defaults are prefilled; no credentials are bundled and no environment variables are required. Settings are stored at `%APPDATA%\Otterary\config.json` or `%APPDATA%\OtteraryWin7\config.json`. API keys are stored as plain text in that private per-user file.
+
+            Gemini sends captures directly to Google's API. OpenRouter is limited to the configured Gemma `:free` vision model IDs. The app does not switch providers or invoke live web search or tools. Provider usage limits, data terms, and billing can change; check the selected provider's current terms and do not assume unlimited or guaranteed free usage.
+
+            Ctrl+Alt+S captures the full desktop and sends it only after upload consent is saved. The tray icon reports answer choices with color and fades back to grey; Otterary creates no hover tooltip and no tray balloons/notifications. Right-click the tray icon and choose `Open diagnostic console` to show diagnostics; it remains hidden until requested and omits API keys and screenshot pixels.
+
+            Ctrl+Alt+O silently closes Otterary and schedules deletion of only the running executable and its matching config file. The config folder is removed only when empty. The right-click `Self-destruct Otterary…` action asks for confirmation.
+          files: |
+            release-assets/Otterary.exe
+            release-assets/OtteraryWin7.exe
 
   release-lasso3:
     name: Publish new Lasso Windows release
