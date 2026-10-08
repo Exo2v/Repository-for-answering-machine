@@ -36,8 +36,7 @@ jobs:
           python -m pip install pyinstaller==5.13.2
           pyinstaller --noconfirm --clean --onefile --windowed --name ScreenAnswer answer_tray.py
           pyinstaller --noconfirm --clean --onefile --windowed --name ScreenAnswer-Diagnostic answer_tray.py
-          pyinstaller --noconfirm --clean --onefile --windowed --name ScreenAnswer-Groq answer_tray.py
-          .\dist\ScreenAnswer-Groq.exe --check-groq-provider
+          .\dist\ScreenAnswer-Diagnostic.exe --check-apinex-ollama
           .\dist\ScreenAnswer-Diagnostic.exe --check-openrouter-support
 
       - name: Upload standard standalone executables
@@ -47,7 +46,6 @@ jobs:
           path: |
             dist/ScreenAnswer.exe
             dist/ScreenAnswer-Diagnostic.exe
-            dist/ScreenAnswer-Groq.exe
           if-no-files-found: error
           retention-days: 30
 
@@ -228,7 +226,6 @@ jobs:
           files: |
             release-assets/ScreenAnswer.exe
             release-assets/ScreenAnswer-Diagnostic.exe
-            release-assets/ScreenAnswer-Groq.exe
 
   release-lasso1:
     name: Publish Lasso1 Windows release

@@ -24,21 +24,21 @@ import tempfile
 import threading
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 import zlib
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Optional, Tuple
 
-DEFAULT_MODEL = "gemini-3.8-flash"
+DEFAULT_APINEX_MODEL = "free/gemini-3.8-flash"
+DEFAULT_OLLAMA_MODEL = "qwen3-vl:8b"
 DEFAULT_MISTRAL_MODEL = "mistral-medium-latest"
-DEFAULT_GROQ_MODEL = "qwen/qwen3.8-27b"
 DEFAULT_OPENROUTER_MODEL = "google/gemma-4-31b-it:free"
-# Current Groq free-tier references identify Qwen 3.8 27B as the only supported
-# vision/reasoning candidate; its official model guides confirm both capabilities.
-# All other Groq model IDs are rejected before save or network access. The API
-# has no request-level free switch, so the account plan still determines billing.
-GROQ_FREE_VISION_REASONING_MODELS = frozenset((DEFAULT_GROQ_MODEL,))
+APINEX_FREE_VISION_MODELS = frozenset(
+    (
+        DEFAULT_APINEX_MODEL,
+        "free/gemini-3.1-pro",
+    )
+)
 # Keep OpenRouter on explicitly priced :free variants, not openrouter/free (whose
 # model selection is dynamic) or an unqualified model ID that could be paid.
 OPENROUTER_FREE_VISION_REASONING_MODELS = frozenset(
@@ -49,7 +49,7 @@ OPENROUTER_FREE_VISION_REASONING_MODELS = frozenset(
 )
 LEGACY_MISTRAL_MODEL = "ministral-14b-2512"
 MISTRAL_OCR_MODEL = "mistral-ocr-latest"
-DEFAULT_PROVIDER = "gemini"
+DEFAULT_PROVIDER = "apinex"
 LASSO1_CONFIG_DIRECTORY = "Lasso1"
 LASSV7_CONFIG_DIRECTORY = "LassV7"
 LASSOV2_CONFIG_DIRECTORY = "LassoV2"
@@ -98,35 +98,38 @@ def is_lassv7_executable(executable_name: Optional[str] = None) -> bool:
 LASSOV7_MODE = is_lassv7_executable()
 LASSO1_MODE = is_lasso1_executable()
 APP_NAME = lasso_app_name_for_executable() or "Screen Answer"
-APP_VERSION = APP_NAME.lower() if LASSO1_MODE else "1.5.0-experimental"
+APP_VERSION = APP_NAME.lower() if LASSO1_MODE else "1.6.0-experimental"
 
 
 def default_provider_for_executable(executable_name: str) -> str:
-    """Select the dedicated provider for a named executable variant."""
+    """Select a provider default for a named executable variant."""
     name = os.path.splitext(os.path.basename(executable_name))[0].lower()
     if is_lasso1_executable(name):
         return "openrouter"
-    return "groq" if "groq" in name else DEFAULT_PROVIDER
+    if "ollama" in name:
+        return "ollama"
+    if "apinex" in name:
+        return "apinex"
+    return DEFAULT_PROVIDER
 
 
 APP_DEFAULT_PROVIDER = default_provider_for_executable(sys.executable)
 DEFAULT_OCR_BACKEND = "pix2text" if "pix2text" in _DEFAULT_EXE_NAME else "provider"
 _ALL_PROVIDER_LABELS = {
-    "gemini": "Google Gemini",
+    "apinex": "APInex",
+    "ollama": "Ollama (local)",
     "mistral": "Mistral",
-    "groq": "Groq",
     "openrouter": "OpenRouter",
 }
 _ALL_API_KEY_ENV_VARS = {
-    "gemini": "GEMINI_API_KEY",
+    "apinex": "APINEX_API_KEY",
     "mistral": "MISTRAL_API_KEY",
-    "groq": "GROQ_API_KEY",
     "openrouter": "OPENROUTER_API_KEY",
 }
 _ALL_DEFAULT_MODELS = {
-    "gemini": DEFAULT_MODEL,
+    "apinex": DEFAULT_APINEX_MODEL,
+    "ollama": DEFAULT_OLLAMA_MODEL,
     "mistral": DEFAULT_MISTRAL_MODEL,
-    "groq": DEFAULT_GROQ_MODEL,
     "openrouter": DEFAULT_OPENROUTER_MODEL,
 }
 
@@ -140,7 +143,9 @@ def provider_labels_for_executable(executable_name: str) -> Dict[str, str]:
 
 PROVIDER_LABELS = provider_labels_for_executable(sys.executable)
 API_KEY_ENV_VARS = {
-    provider: _ALL_API_KEY_ENV_VARS[provider] for provider in PROVIDER_LABELS
+    provider: _ALL_API_KEY_ENV_VARS[provider]
+    for provider in PROVIDER_LABELS
+    if provider in _ALL_API_KEY_ENV_VARS
 }
 PROVIDER_BY_LABEL = {label: provider for provider, label in PROVIDER_LABELS.items()}
 OCR_BACKEND_LABELS = {
@@ -152,16 +157,27 @@ DEFAULT_MODELS = {provider: _ALL_DEFAULT_MODELS[provider] for provider in PROVID
 
 
 def valid_model_name(provider: str, model: str) -> bool:
-    """Validate model IDs, with fail-closed free vision allowlists for Groq/OpenRouter."""
+    """Validate model names and fail closed to free multimodal models on APInex/OpenRouter."""
     if not isinstance(provider, str) or not isinstance(model, str):
         return False
-    if provider == "groq":
-        return model in GROQ_FREE_VISION_REASONING_MODELS
+    provider = provider.lower()
+    if provider == "apinex":
+        return model in APINEX_FREE_VISION_MODELS
+    if provider == "ollama":
+        # Ollama model names may include a namespace and a tag (for example
+        # qwen3-vl:8b); block whitespace, query strings, and header-like input.
+        return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,149}", model))
     if provider == "openrouter":
-        # Exact :free IDs prevent paid routing and :online/search variants. These
-        # curated entries are verified to accept screenshot images and support reasoning.
+        # Exact :free IDs prevent paid routing and :online/search variants.
         return model in OPENROUTER_FREE_VISION_REASONING_MODELS
-    return bool(re.fullmatch(r"[A-Za-z0-9._-]{1,100}", model))
+    if provider == "mistral":
+        return bool(re.fullmatch(r"[A-Za-z0-9._-]{1,100}", model))
+    return False
+
+
+def provider_requires_api_key(provider: str) -> bool:
+    """Only the local Ollama endpoint is keyless; hosted API providers need keys."""
+    return provider != "ollama"
 
 
 CAPTURE_HOTKEY_TEXT = "Ctrl+Alt+S"
@@ -194,10 +210,10 @@ def hotkey_event_for_id(hotkey_id: int, lasso1_mode: bool) -> Optional[Tuple[Any
     return None
 
 
-GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+APINEX_ENDPOINT = "https://api.apinex.bond/v1/chat/completions"
+OLLAMA_ENDPOINT = "http://127.0.0.1:11434/api/chat"
 MISTRAL_ENDPOINT = "https://api.mistral.ai/v1/chat/completions"
 MISTRAL_OCR_ENDPOINT = "https://api.mistral.ai/v1/ocr"
-GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
 OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
 
 # The grey state means ready, busy, no answer, or a completed fade.
@@ -218,9 +234,10 @@ MAX_PNG_BYTES = 12 * 1024 * 1024
 MAX_API_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_API_ATTEMPTS = 3
 MAX_RETRY_AFTER_SECONDS = 30
-MAX_GEMINI_OUTPUT_TOKENS = 2048
+MAX_APINEX_OUTPUT_TOKENS = 2048
+MAX_OLLAMA_OUTPUT_TOKENS = 2048
+OLLAMA_TIMEOUT_SECONDS = 300
 MAX_MISTRAL_OUTPUT_TOKENS = 4096
-MAX_GROQ_OUTPUT_TOKENS = 4096
 MAX_OPENROUTER_OUTPUT_TOKENS = 4096
 MAX_OCR_CONTEXT_CHARS = 48_000
 MAX_DIAGNOSTIC_TEXT_CHARS = 16_000
@@ -517,7 +534,7 @@ def _empty_portable_config() -> Dict[str, Any]:
 
 
 def load_portable_config(path: Optional[str] = None) -> Dict[str, Any]:
-    """Load provider keys/models and OCR choice, migrating the original Gemini format."""
+    """Load current provider settings and safely discard retired Google/Groq credentials."""
     config_path = path or portable_config_path()
     try:
         with open(config_path, "r", encoding="utf-8") as config_file:
@@ -527,57 +544,67 @@ def load_portable_config(path: Optional[str] = None) -> Dict[str, Any]:
     if not isinstance(raw_config, dict):
         return _empty_portable_config()
 
-    # Keep migrating pre-provider Gemini-only config files as Gemini, even when
-    # the app was started through the dedicated Groq-default executable.
-    has_legacy_gemini_fields = "api_key" in raw_config or "model" in raw_config
-    default_config_provider = DEFAULT_PROVIDER if has_legacy_gemini_fields else APP_DEFAULT_PROVIDER
-    provider = raw_config.get("provider", default_config_provider)
-    if not isinstance(provider, str) or provider.lower() not in PROVIDER_LABELS:
-        provider = APP_DEFAULT_PROVIDER
+    raw_provider = raw_config.get("provider")
+    if isinstance(raw_provider, str) and raw_provider.lower() in PROVIDER_LABELS:
+        provider = raw_provider.lower()
     else:
-        provider = provider.lower()
+        # A provider-less legacy config came from the retired Gemini-only app.
+        # Never reinterpret its old key as an APInex credential.
+        provider = APP_DEFAULT_PROVIDER
 
     api_keys: Dict[str, str] = {}
     stored_keys = raw_config.get("api_keys")
     if isinstance(stored_keys, dict):
         for key_provider, key_value in stored_keys.items():
+            normalized_provider = key_provider.lower() if isinstance(key_provider, str) else ""
             if (
-                isinstance(key_provider, str)
-                and key_provider.lower() in PROVIDER_LABELS
+                normalized_provider in PROVIDER_LABELS
+                and provider_requires_api_key(normalized_provider)
                 and isinstance(key_value, str)
                 and key_value.strip()
             ):
-                api_keys[key_provider.lower()] = key_value.strip()
+                api_keys[normalized_provider] = key_value.strip()
     legacy_key = raw_config.get("api_key")
-    if isinstance(legacy_key, str) and legacy_key.strip():
+    # Only migrate an unscoped key when the old config explicitly named a provider
+    # that still exists. In particular, do not send an old Google/Groq key to APInex.
+    if (
+        isinstance(raw_provider, str)
+        and raw_provider.lower() in PROVIDER_LABELS
+        and provider_requires_api_key(provider)
+        and isinstance(legacy_key, str)
+        and legacy_key.strip()
+    ):
         api_keys.setdefault(provider, legacy_key.strip())
 
     models: Dict[str, str] = {}
     stored_models = raw_config.get("models")
     if isinstance(stored_models, dict):
         for model_provider, model_value in stored_models.items():
+            normalized_provider = model_provider.lower() if isinstance(model_provider, str) else ""
             if (
-                isinstance(model_provider, str)
-                and model_provider.lower() in PROVIDER_LABELS
+                normalized_provider in PROVIDER_LABELS
                 and isinstance(model_value, str)
                 and model_value.strip()
             ):
-                models[model_provider.lower()] = model_value.strip()
+                models[normalized_provider] = model_value.strip()
     legacy_model = raw_config.get("model")
-    if isinstance(legacy_model, str) and legacy_model.strip():
+    if (
+        isinstance(raw_provider, str)
+        and raw_provider.lower() in PROVIDER_LABELS
+        and isinstance(legacy_model, str)
+        and legacy_model.strip()
+    ):
         models.setdefault(provider, legacy_model.strip())
-    # Upgrade the previous Mistral default when it was stored by an older build.
-    # Custom model names remain untouched for providers outside the free-only policy.
+
     if models.get("mistral") == LEGACY_MISTRAL_MODEL:
         models["mistral"] = DEFAULT_MISTRAL_MODEL
     for restricted_provider, default_model in (
-        ("groq", DEFAULT_GROQ_MODEL),
+        ("apinex", DEFAULT_APINEX_MODEL),
+        ("ollama", DEFAULT_OLLAMA_MODEL),
         ("openrouter", DEFAULT_OPENROUTER_MODEL),
     ):
         stored_model = models.get(restricted_provider)
-        if stored_model is not None and not valid_model_name(
-            restricted_provider, stored_model
-        ):
+        if stored_model is not None and not valid_model_name(restricted_provider, stored_model):
             models[restricted_provider] = default_model
     if LASSO1_MODE and not valid_model_name(
         "openrouter", models.get("openrouter", "")
@@ -596,6 +623,35 @@ def load_portable_config(path: Optional[str] = None) -> Dict[str, Any]:
     }
     if LASSO1_MODE:
         config["allow_screenshot_uploads"] = raw_config.get("allow_screenshot_uploads") is True
+    else:
+        # Scrub retired-provider keys/models and legacy flat Gemini fields from the
+        # plaintext sidecar. Preserve all supported provider settings.
+        obsolete_fields = "api_key" in raw_config or "model" in raw_config
+        unsupported_provider = raw_provider is not None and (
+            not isinstance(raw_provider, str) or raw_provider.lower() not in PROVIDER_LABELS
+        )
+        unsupported_keys = isinstance(stored_keys, dict) and any(
+            not isinstance(name, str)
+            or name.lower() not in PROVIDER_LABELS
+            or not provider_requires_api_key(name.lower())
+            for name in stored_keys
+        )
+        unsupported_models = isinstance(stored_models, dict) and any(
+            not isinstance(name, str) or name.lower() not in PROVIDER_LABELS
+            for name in stored_models
+        )
+        if obsolete_fields or unsupported_provider or unsupported_keys or unsupported_models:
+            try:
+                save_portable_config(
+                    path=config_path,
+                    provider=provider,
+                    api_keys=api_keys,
+                    models=models,
+                    ocr_backend=ocr_backend,
+                )
+            except OSError:
+                # Loading still succeeds if a read-only sidecar cannot be scrubbed.
+                pass
     return config
 
 
@@ -606,6 +662,8 @@ def resolve_api_key(
     lasso1_mode: Optional[bool] = None,
 ) -> Tuple[str, str]:
     """Resolve a key and source; Lasso builds deliberately ignore environment keys."""
+    if provider == "ollama":
+        return "", "local Ollama server (no API key required)"
     use_lasso1_rules = LASSO1_MODE if lasso1_mode is None else lasso1_mode
     saved_key = stored_keys.get(provider, "")
     if not isinstance(saved_key, str):
@@ -647,11 +705,16 @@ def save_portable_config(
         if (
             isinstance(key_provider, str)
             and key_provider.lower() in PROVIDER_LABELS
+            and provider_requires_api_key(key_provider.lower())
             and isinstance(key_value, str)
             and key_value.strip()
         ):
             saved_keys[key_provider.lower()] = key_value.strip()
-    if api_key.strip():
+    if (
+        provider_requires_api_key(selected_provider)
+        and isinstance(api_key, str)
+        and api_key.strip()
+    ):
         saved_keys[selected_provider] = api_key.strip()
 
     saved_models: Dict[str, str] = {}
@@ -666,7 +729,8 @@ def save_portable_config(
     if model.strip():
         saved_models[selected_provider] = model.strip()
     for restricted_provider, default_model in (
-        ("groq", DEFAULT_GROQ_MODEL),
+        ("apinex", DEFAULT_APINEX_MODEL),
+        ("ollama", DEFAULT_OLLAMA_MODEL),
         ("openrouter", DEFAULT_OPENROUTER_MODEL),
     ):
         stored_model = saved_models.get(restricted_provider)
@@ -1001,304 +1065,6 @@ def capture_virtual_desktop_png() -> bytes:
         user32.ReleaseDC(None, screen_dc)
 
 
-def _extract_gemini_text(response_data: Dict[str, Any]) -> str:
-    """Return the first candidate's text, tolerating incomplete API responses."""
-    if not isinstance(response_data, dict):
-        return ""
-    candidates = response_data.get("candidates")
-    if not isinstance(candidates, list) or not candidates:
-        return ""
-    candidate = candidates[0]
-    if not isinstance(candidate, dict):
-        return ""
-    content = candidate.get("content")
-    if not isinstance(content, dict):
-        return ""
-    parts = content.get("parts")
-    if not isinstance(parts, list):
-        return ""
-    return "".join(
-        part.get("text", "")
-        for part in parts
-        if (
-            isinstance(part, dict)
-            and part.get("thought") is not True
-            and isinstance(part.get("text", ""), str)
-        )
-    ).strip()
-
-
-def _log_gemini_response_metadata(
-    response_data: Dict[str, Any],
-    report: Callable[[str], None],
-) -> None:
-    """Log safe response structure metadata without including generated text."""
-    if not isinstance(response_data, dict):
-        report("Gemini response metadata: top-level JSON value was not an object.")
-        return
-
-    candidates_value = response_data.get("candidates")
-    candidates = candidates_value if isinstance(candidates_value, list) else []
-    model_version = response_data.get("modelVersion")
-    if not isinstance(model_version, str):
-        model_version = "not provided"
-    model_version = model_version.replace("\r", " ").replace("\n", " ")[:100]
-    response_id = response_data.get("responseId")
-    if not isinstance(response_id, str):
-        response_id = "not provided"
-    response_id = response_id.replace("\r", " ").replace("\n", " ")[:100]
-    report(
-        "Gemini response metadata: candidate_count=%d; model_version=%s; response_id=%s."
-        % (len(candidates), model_version, response_id)
-    )
-    if candidates_value is not None and not isinstance(candidates_value, list):
-        report("Gemini response metadata: candidates field had type %s." % type(candidates_value).__name__)
-
-    prompt_feedback = response_data.get("promptFeedback")
-    if isinstance(prompt_feedback, dict):
-        block_reason = prompt_feedback.get("blockReason")
-        if isinstance(block_reason, str):
-            report("Gemini prompt feedback: block_reason=%s." % block_reason[:100])
-        ratings = prompt_feedback.get("safetyRatings")
-        if isinstance(ratings, list):
-            rating_summary = []
-            for rating in ratings[:10]:
-                if not isinstance(rating, dict):
-                    continue
-                category = rating.get("category")
-                probability = rating.get("probability")
-                if isinstance(category, str) and isinstance(probability, str):
-                    rating_summary.append("%s:%s" % (category[:60], probability[:40]))
-            if rating_summary:
-                report("Gemini prompt safety ratings: %s." % ", ".join(rating_summary))
-
-    usage = response_data.get("usageMetadata")
-    if isinstance(usage, dict):
-        counts = []
-        for field in ("promptTokenCount", "candidatesTokenCount", "totalTokenCount"):
-            count = usage.get(field)
-            if isinstance(count, int) and not isinstance(count, bool):
-                counts.append("%s=%d" % (field, count))
-        if counts:
-            report("Gemini token usage: %s." % ", ".join(counts))
-
-    for index, candidate in enumerate(candidates[:3]):
-        if not isinstance(candidate, dict):
-            report("Gemini candidate %d had type %s." % (index, type(candidate).__name__))
-            continue
-        finish_reason = candidate.get("finishReason")
-        if not isinstance(finish_reason, str):
-            finish_reason = "not provided"
-        content = candidate.get("content")
-        role = content.get("role", "not provided") if isinstance(content, dict) else "not provided"
-        if not isinstance(role, str):
-            role = "not provided"
-        parts = content.get("parts") if isinstance(content, dict) else None
-        parts = parts if isinstance(parts, list) else []
-        text_characters = sum(
-            len(part.get("text", ""))
-            for part in parts
-            if isinstance(part, dict) and isinstance(part.get("text", ""), str)
-        )
-        part_types = sorted(
-            set(
-                str(key)[:40]
-                for part in parts
-                if isinstance(part, dict)
-                for key in part.keys()
-            )
-        )
-        report(
-            "Gemini candidate %d: finish_reason=%s; role=%s; parts=%d; text_characters=%d; part_types=%s."
-            % (
-                index,
-                finish_reason[:100],
-                role[:40],
-                len(parts),
-                text_characters,
-                ",".join(part_types[:8]) if part_types else "none",
-            )
-        )
-
-def ask_gemini(
-    api_key: str,
-    model: str,
-    png_image: bytes,
-    diagnostic: Optional[Callable[[str], None]] = None,
-    ocr_markdown: str = "",
-) -> Tuple[Optional[int], str]:
-    """Send one user-triggered screenshot to Gemini without live web search."""
-
-    def report(message: str) -> None:
-        if diagnostic is not None:
-            safe_message = str(message)
-            if api_key:
-                safe_message = safe_message.replace(api_key, "[REDACTED API KEY]")
-            diagnostic(safe_message)
-
-    if not re.fullmatch(r"[A-Za-z0-9._-]{1,100}", model):
-        raise RuntimeError("The Gemini model name contains unsupported characters.")
-    report("Preparing Gemini request for model %s." % model)
-    image_b64 = base64.b64encode(png_image).decode("ascii")
-    request_body = {
-        "systemInstruction": {"parts": [{"text": SYSTEM_INSTRUCTION}]},
-        "contents": [
-            {
-                "role": "user",
-                "parts": [
-                    {"text": _append_ocr_context(USER_PROMPT, ocr_markdown)},
-                    {
-                        "inlineData": {
-                            "mimeType": "image/png",
-                            "data": image_b64,
-                        }
-                    },
-                ],
-            }
-        ],
-        "generationConfig": {
-            "temperature": 0,
-            "maxOutputTokens": MAX_GEMINI_OUTPUT_TOKENS,
-        },
-    }
-    encoded_body = json.dumps(request_body, separators=(",", ":")).encode("utf-8")
-    url = GEMINI_ENDPOINT.format(model=urllib.parse.quote(model, safe=""))
-    request = urllib.request.Request(
-        url,
-        data=encoded_body,
-        headers={
-            "Content-Type": "application/json; charset=utf-8",
-            "x-goog-api-key": api_key,
-        },
-        method="POST",
-    )
-    response_bytes = None
-    for attempt in range(MAX_API_ATTEMPTS):
-        attempt_started = time.monotonic()
-        report(
-            "HTTP attempt %d/%d started (request body %d bytes; API key and image content omitted)."
-            % (attempt + 1, MAX_API_ATTEMPTS, len(encoded_body))
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=45) as response:
-                response_bytes = response.read(MAX_API_RESPONSE_BYTES + 1)
-                status = getattr(response, "status", None)
-                if status is None:
-                    getcode = getattr(response, "getcode", None)
-                    status = getcode() if getcode is not None else "unknown"
-            report(
-                "HTTP attempt %d/%d received status %s and %d response bytes in %.2f seconds."
-                % (
-                    attempt + 1,
-                    MAX_API_ATTEMPTS,
-                    status,
-                    len(response_bytes),
-                    time.monotonic() - attempt_started,
-                )
-            )
-            break
-        except urllib.error.HTTPError as exc:
-            status = exc.code
-            provider_reason = ""
-            provider_message = ""
-            try:
-                error_bytes = exc.read(4096)
-                error_payload = json.loads(error_bytes.decode("utf-8")) if error_bytes else {}
-                provider_error = error_payload.get("error", {})
-                if isinstance(provider_error, dict):
-                    reason_value = provider_error.get("status")
-                    message_value = provider_error.get("message")
-                    if isinstance(reason_value, str):
-                        provider_reason = reason_value[:100]
-                    if isinstance(message_value, str):
-                        provider_message = message_value.replace("\r", " ").replace("\n", " ")[:400]
-            except (AttributeError, UnicodeDecodeError, ValueError):
-                pass
-            finally:
-                exc.close()
-            report(
-                "HTTP attempt %d/%d failed with status %d after %.2f seconds."
-                % (
-                    attempt + 1,
-                    MAX_API_ATTEMPTS,
-                    status,
-                    time.monotonic() - attempt_started,
-                )
-            )
-            if provider_reason:
-                report("Gemini error category: %s." % provider_reason)
-            if provider_message:
-                report("Gemini error detail: %s" % provider_message)
-            if status in RETRYABLE_HTTP_STATUSES and attempt < MAX_API_ATTEMPTS - 1:
-                # Temporary overloads (notably HTTP 503) often clear quickly.
-                # Retry in the worker thread so the tray UI remains responsive.
-                delay = 2 ** attempt
-                report("Temporary server error; retrying in %d second(s)." % delay)
-                time.sleep(delay)
-                continue
-            if status in (401, 403):
-                report("Gemini rejected the API key or account permissions.")
-                raise RuntimeError(
-                    "Gemini rejected the API key or account permissions (HTTP %d)." % status
-                )
-            if status == 429:
-                report("Gemini reported a quota or rate limit (HTTP 429).")
-                raise RuntimeError("Gemini's quota or rate limit was reached (HTTP 429).")
-            if status in RETRYABLE_HTTP_STATUSES:
-                report("Retry limit reached; Gemini is still temporarily unavailable.")
-                raise RuntimeError(
-                    "Gemini is temporarily unavailable or overloaded (HTTP %d). "
-                    "The request was retried; wait a moment and try again." % status
-                )
-            report("Gemini returned a non-retryable HTTP error (status %d)." % status)
-            raise RuntimeError("Gemini returned an HTTP error (%d)." % status)
-        except urllib.error.URLError as exc:
-            reason = getattr(exc, "reason", None)
-            if isinstance(reason, TimeoutError):
-                report(
-                    "Network request timed out after %.2f seconds while waiting for Gemini."
-                    % (time.monotonic() - attempt_started)
-                )
-                raise RuntimeError("The Gemini request timed out. Please try again.")
-            reason_name = type(reason).__name__ if reason is not None else type(exc).__name__
-            report(
-                "Could not reach Gemini after %.2f seconds; network error type: %s."
-                % (time.monotonic() - attempt_started, reason_name)
-            )
-            raise RuntimeError("Could not reach Gemini. Check the internet connection and try again.")
-    if len(response_bytes) > MAX_API_RESPONSE_BYTES:
-        report("Gemini response exceeded the %d-byte safety limit." % MAX_API_RESPONSE_BYTES)
-        raise RuntimeError("Gemini returned an unexpectedly large response.")
-    try:
-        response_data = json.loads(response_bytes.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        report("Gemini response was received but could not be decoded as JSON.")
-        raise RuntimeError("Gemini returned a response that could not be read.")
-    if diagnostic is not None:
-        _log_gemini_response_metadata(response_data, report)
-    text = _extract_gemini_text(response_data)
-    if diagnostic is not None:
-        _report_model_output("Gemini", text, report)
-    option = parse_option(text)
-    if option is None:
-        report(
-            "Response parsing found no explicit, reliable ANSWER line "
-            "(response length %d characters)." % len(text)
-        )
-    else:
-        report(
-            "Response parsing recognized option position %d%s."
-            % (
-                option,
-                "; final response is shown above in diagnostics"
-                if diagnostic is not None
-                else "",
-            )
-        )
-    return option, text
-
-
-
 def _extract_mistral_text(response_data: Dict[str, Any]) -> str:
     """Return text from the first Mistral chat-completion choice."""
     if not isinstance(response_data, dict):
@@ -1323,6 +1089,390 @@ def _extract_mistral_text(response_data: Dict[str, Any]) -> str:
             )
         ).strip()
     return ""
+
+
+def _log_apinex_response_metadata(
+    response_data: Dict[str, Any],
+    report: Callable[[str], None],
+) -> None:
+    """Log APInex model/usage metadata, never the reasoning field."""
+    model = response_data.get("model", "not provided")
+    response_id = response_data.get("id", "not provided")
+    if not isinstance(model, str):
+        model = "not provided"
+    if not isinstance(response_id, str):
+        response_id = "not provided"
+    model = model.replace("\\r", " ").replace("\\n", " ")[:100]
+    response_id = response_id.replace("\\r", " ").replace("\\n", " ")[:100]
+    report("APInex response metadata: model=%s; response_id=%s." % (model, response_id))
+    usage = response_data.get("usage")
+    if isinstance(usage, dict):
+        counts = []
+        for field in (
+            "prompt_tokens",
+            "input_tokens",
+            "completion_tokens",
+            "output_tokens",
+            "total_tokens",
+            "cost_tokens",
+        ):
+            value = usage.get(field)
+            if isinstance(value, int) and not isinstance(value, bool):
+                counts.append("%s=%d" % (field, value))
+        if counts:
+            report("APInex token usage: %s." % ", ".join(counts))
+
+
+def _apinex_post_json(
+    api_key: str,
+    request_body: Dict[str, Any],
+    report: Callable[[str], None],
+) -> Dict[str, Any]:
+    """POST a bounded OpenAI-compatible APInex request with transient retries."""
+    if not isinstance(api_key, str) or not api_key.strip():
+        raise RuntimeError("Enter an APInex API key before sending a screenshot.")
+    encoded_body = json.dumps(request_body, separators=(",", ":")).encode("utf-8")
+    request = urllib.request.Request(
+        APINEX_ENDPOINT,
+        data=encoded_body,
+        headers={
+            "Content-Type": "application/json; charset=utf-8",
+            "Authorization": "Bearer " + api_key.strip(),
+        },
+        method="POST",
+    )
+    for attempt in range(MAX_API_ATTEMPTS):
+        attempt_started = time.monotonic()
+        report(
+            "APInex HTTP attempt %d/%d started (request body %d bytes; API key and screenshot omitted)."
+            % (attempt + 1, MAX_API_ATTEMPTS, len(encoded_body))
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                response_bytes = response.read(MAX_API_RESPONSE_BYTES + 1)
+                headers = getattr(response, "headers", None)
+                status = getattr(response, "status", None)
+                if status is None:
+                    getcode = getattr(response, "getcode", None)
+                    status = getcode() if getcode is not None else "unknown"
+            _report_rate_limit_headers(headers, "APInex", report)
+            report(
+                "APInex HTTP attempt %d/%d received status %s and %d response bytes in %.2f seconds."
+                % (
+                    attempt + 1,
+                    MAX_API_ATTEMPTS,
+                    status,
+                    len(response_bytes),
+                    time.monotonic() - attempt_started,
+                )
+            )
+            if len(response_bytes) > MAX_API_RESPONSE_BYTES:
+                raise RuntimeError("APInex returned an unexpectedly large response.")
+            try:
+                response_data = json.loads(response_bytes.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                raise RuntimeError("APInex returned a response that could not be read.")
+            if not isinstance(response_data, dict):
+                raise RuntimeError("APInex returned an invalid response.")
+            return response_data
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            headers = getattr(exc, "headers", None)
+            provider_message = ""
+            try:
+                error_bytes = exc.read(4096)
+                error_payload = json.loads(error_bytes.decode("utf-8")) if error_bytes else {}
+                if isinstance(error_payload, dict):
+                    error_value = error_payload.get("error")
+                    if isinstance(error_value, dict):
+                        error_value = error_value.get("message") or error_value.get("detail")
+                    if not isinstance(error_value, str):
+                        error_value = error_payload.get("message") or error_payload.get("detail")
+                    if isinstance(error_value, str):
+                        provider_message = error_value.replace("\\r", " ").replace("\\n", " ")[:400]
+            except (AttributeError, UnicodeDecodeError, ValueError):
+                pass
+            finally:
+                exc.close()
+            _report_rate_limit_headers(headers, "APInex", report)
+            report(
+                "APInex HTTP attempt %d/%d failed with status %d after %.2f seconds."
+                % (attempt + 1, MAX_API_ATTEMPTS, status, time.monotonic() - attempt_started)
+            )
+            if provider_message:
+                report("APInex error detail: %s" % provider_message)
+            if status == 429 and attempt < MAX_API_ATTEMPTS - 1:
+                delay = _retry_after_delay(headers, attempt)
+                if delay is not None:
+                    report("APInex rate limit; retrying in %.1f second(s)." % delay)
+                    time.sleep(delay)
+                    continue
+            elif status in RETRYABLE_HTTP_STATUSES and attempt < MAX_API_ATTEMPTS - 1:
+                delay = 2 ** attempt
+                report("APInex temporary upstream error; retrying in %d second(s)." % delay)
+                time.sleep(delay)
+                continue
+            if status in (401, 403):
+                raise RuntimeError("APInex rejected the API key or account permissions (HTTP %d)." % status)
+            if status == 402:
+                raise RuntimeError(
+                    "APInex rejected the request for insufficient balance or free-model allowance (HTTP 402). "
+                    "Check the account's free quota and balance."
+                )
+            if status == 429:
+                raise RuntimeError(
+                    "APInex rate limit or usage quota was reached (HTTP 429). Wait, then try again."
+                )
+            if status == 413:
+                raise RuntimeError(
+                    "APInex rejected the screenshot request as too large (HTTP 413). "
+                    "Try reducing the desktop resolution."
+                )
+            if status == 400:
+                raise RuntimeError(
+                    "APInex rejected the model or image format (HTTP 400). Check the selected free vision model."
+                )
+            if status == 404:
+                raise RuntimeError("APInex could not find the selected model or API route (HTTP 404).")
+            if status in RETRYABLE_HTTP_STATUSES:
+                raise RuntimeError("APInex or its model provider is temporarily unavailable (HTTP %d)." % status)
+            raise RuntimeError("APInex returned an HTTP error (%d)." % status)
+        except urllib.error.URLError as exc:
+            reason = getattr(exc, "reason", None)
+            if isinstance(reason, TimeoutError):
+                report("APInex request timed out after %.2f seconds." % (time.monotonic() - attempt_started))
+                raise RuntimeError("The APInex request timed out. Please try again.")
+            reason_name = type(reason).__name__ if reason is not None else type(exc).__name__
+            report("Could not reach APInex; network error type: %s." % reason_name)
+            raise RuntimeError("Could not reach APInex. Check the internet connection and API key.")
+        except TimeoutError:
+            report("APInex request timed out after %.2f seconds." % (time.monotonic() - attempt_started))
+            raise RuntimeError("The APInex request timed out. Please try again.")
+    raise RuntimeError("APInex did not return a response.")
+
+
+def ask_apinex(
+    api_key: str,
+    model: str,
+    png_image: bytes,
+    diagnostic: Optional[Callable[[str], None]] = None,
+    ocr_markdown: str = "",
+) -> Tuple[Optional[int], str]:
+    """Send one consented screenshot through APInex's free vision-model API."""
+
+    def report(message: str) -> None:
+        if diagnostic is not None:
+            safe_message = str(message)
+            if api_key:
+                safe_message = safe_message.replace(api_key, "[REDACTED API KEY]")
+            diagnostic(safe_message)
+
+    if not valid_model_name("apinex", model):
+        raise RuntimeError("APInex is restricted to its curated free vision models.")
+    markdown = ocr_markdown.strip() if isinstance(ocr_markdown, str) else ""
+    if len(markdown) > MAX_OCR_CONTEXT_CHARS:
+        original_characters = len(markdown)
+        markdown = markdown[:MAX_OCR_CONTEXT_CHARS]
+        report(
+            "Local OCR Markdown truncated from %d to %d characters for the solver request."
+            % (original_characters, len(markdown))
+        )
+    image_data_uri = "data:image/png;base64," + base64.b64encode(png_image).decode("ascii")
+    request_body = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SYSTEM_INSTRUCTION},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": _append_ocr_context(USER_PROMPT, markdown)},
+                    {"type": "image_url", "image_url": {"url": image_data_uri}},
+                ],
+            },
+        ],
+        "temperature": 0,
+        "max_tokens": MAX_APINEX_OUTPUT_TOKENS,
+        "reasoning_effort": "medium",
+    }
+    report("Preparing APInex vision request for free model %s." % model)
+    response_data = _apinex_post_json(api_key, request_body, report)
+    if response_data.get("error") is not None:
+        error_value = response_data.get("error")
+        error_message = ""
+        error_code = ""
+        if isinstance(error_value, dict):
+            message_value = error_value.get("message") or error_value.get("detail")
+            code_value = error_value.get("code") or error_value.get("type")
+            if isinstance(message_value, str):
+                error_message = message_value.replace("\\r", " ").replace("\\n", " ")[:400]
+            if isinstance(code_value, (str, int)) and not isinstance(code_value, bool):
+                error_code = str(code_value)[:80]
+        if error_code:
+            report("APInex inference error category: %s." % error_code)
+        if error_message:
+            report("APInex inference error detail: %s" % error_message)
+        raise RuntimeError("APInex or its selected model reported an inference error. See Diagnostics.")
+    if diagnostic is not None:
+        _log_apinex_response_metadata(response_data, report)
+    response_text = _extract_mistral_text(response_data)
+    if diagnostic is not None:
+        _report_model_output("APInex", response_text, report)
+    option = parse_option(response_text)
+    if option is None:
+        report("APInex response contained no explicit, reliable ANSWER line.")
+    else:
+        report("APInex response parsing recognized option position %d." % option)
+    return option, response_text
+
+
+def _log_ollama_response_metadata(
+    response_data: Dict[str, Any],
+    report: Callable[[str], None],
+) -> None:
+    """Log Ollama model/token/timing metadata without its separate thinking field."""
+    model = response_data.get("model", "not provided")
+    if not isinstance(model, str):
+        model = "not provided"
+    model = model.replace("\\r", " ").replace("\\n", " ")[:120]
+    counts = []
+    for field in ("prompt_eval_count", "eval_count", "total_duration", "load_duration"):
+        value = response_data.get(field)
+        if isinstance(value, int) and not isinstance(value, bool):
+            counts.append("%s=%d" % (field, value))
+    report(
+        "Ollama response metadata: model=%s%s."
+        % (model, "; " + ", ".join(counts) if counts else "")
+    )
+
+
+def ask_ollama(
+    model: str,
+    png_image: bytes,
+    diagnostic: Optional[Callable[[str], None]] = None,
+    ocr_markdown: str = "",
+) -> Tuple[Optional[int], str]:
+    """Send a screenshot to the local Ollama REST API; no cloud key or tools are used."""
+
+    def report(message: str) -> None:
+        if diagnostic is not None:
+            diagnostic(str(message))
+
+    if not valid_model_name("ollama", model):
+        raise RuntimeError("The Ollama model name contains unsupported characters.")
+    markdown = ocr_markdown.strip() if isinstance(ocr_markdown, str) else ""
+    if len(markdown) > MAX_OCR_CONTEXT_CHARS:
+        original_characters = len(markdown)
+        markdown = markdown[:MAX_OCR_CONTEXT_CHARS]
+        report(
+            "Local OCR Markdown truncated from %d to %d characters for the solver request."
+            % (original_characters, len(markdown))
+        )
+    image_b64 = base64.b64encode(png_image).decode("ascii")
+    request_body = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SYSTEM_INSTRUCTION},
+            {
+                "role": "user",
+                "content": _append_ocr_context(USER_PROMPT, markdown),
+                "images": [image_b64],
+            },
+        ],
+        "stream": False,
+        "options": {
+            "temperature": 0,
+            "num_predict": MAX_OLLAMA_OUTPUT_TOKENS,
+        },
+    }
+    encoded_body = json.dumps(request_body, separators=(",", ":")).encode("utf-8")
+    request = urllib.request.Request(
+        OLLAMA_ENDPOINT,
+        data=encoded_body,
+        headers={"Content-Type": "application/json; charset=utf-8"},
+        method="POST",
+    )
+    report(
+        "Sending screenshot to local Ollama at 127.0.0.1:11434 using model %s; image bytes and request body omitted."
+        % model
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=OLLAMA_TIMEOUT_SECONDS) as response:
+            response_bytes = response.read(MAX_API_RESPONSE_BYTES + 1)
+            status = getattr(response, "status", None)
+            if status is None:
+                getcode = getattr(response, "getcode", None)
+                status = getcode() if getcode is not None else "unknown"
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+        error_message = ""
+        try:
+            error_bytes = exc.read(4096)
+            error_payload = json.loads(error_bytes.decode("utf-8")) if error_bytes else {}
+            if isinstance(error_payload, dict) and isinstance(error_payload.get("error"), str):
+                error_message = error_payload["error"].replace("\\r", " ").replace("\\n", " ")[:300]
+        except (AttributeError, UnicodeDecodeError, ValueError):
+            pass
+        finally:
+            exc.close()
+        if error_message:
+            report("Ollama error detail: %s" % error_message)
+        if status == 404:
+            raise RuntimeError(
+                "Ollama could not find model '%s'. Install it with `ollama pull %s`, then try again."
+                % (model, model)
+            )
+        if status == 400:
+            raise RuntimeError(
+                "Ollama rejected the request. Check that '%s' is installed and supports vision images."
+                % model
+            )
+        if status in (401, 403):
+            raise RuntimeError("The local Ollama server rejected the request (HTTP %d)." % status)
+        if status in (429, 503):
+            raise RuntimeError("Ollama is busy or unavailable (HTTP %d). Wait and try again." % status)
+        if status == 413:
+            raise RuntimeError("Ollama rejected the screenshot as too large (HTTP 413).")
+        raise RuntimeError("Ollama returned an HTTP error (%d)." % status)
+    except urllib.error.URLError as exc:
+        reason = getattr(exc, "reason", None)
+        reason_name = type(reason).__name__ if reason is not None else type(exc).__name__
+        report("Could not reach local Ollama; network error type: %s." % reason_name)
+        raise RuntimeError(
+            "Could not reach Ollama at 127.0.0.1:11434. Start Ollama and pull a vision model."
+        )
+    except TimeoutError:
+        report("Local Ollama request exceeded the %d-second timeout." % OLLAMA_TIMEOUT_SECONDS)
+        raise RuntimeError("Ollama took too long to answer. Try a smaller model or screenshot.")
+    if len(response_bytes) > MAX_API_RESPONSE_BYTES:
+        raise RuntimeError("Ollama returned an unexpectedly large response.")
+    try:
+        response_data = json.loads(response_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise RuntimeError("Ollama returned a response that could not be read.")
+    if not isinstance(response_data, dict):
+        raise RuntimeError("Ollama returned an invalid response.")
+    if response_data.get("error"):
+        error_message = response_data.get("error")
+        if isinstance(error_message, str):
+            report("Ollama error detail: %s" % error_message[:300])
+        raise RuntimeError("Ollama could not complete the vision request. Check the model and local server.")
+    if diagnostic is not None:
+        _log_ollama_response_metadata(response_data, report)
+    message = response_data.get("message")
+    response_text = message.get("content", "") if isinstance(message, dict) else ""
+    if not isinstance(response_text, str):
+        response_text = ""
+    response_text = response_text.strip()
+    # Ollama can return private reasoning separately in `message.thinking`; only
+    # the user-facing content is parsed or displayed.
+    if diagnostic is not None:
+        _report_model_output("Ollama", response_text, report)
+    option = parse_option(response_text)
+    if option is None:
+        report("Ollama response contained no explicit, reliable ANSWER line.")
+    else:
+        report("Ollama response parsing recognized option position %d." % option)
+    return option, response_text
 
 
 def _log_mistral_response_metadata(
@@ -1886,284 +2036,6 @@ def ask_mistral(
     else:
         report(
             "Mistral response parsing recognized option position %d%s."
-            % (
-                option,
-                "; final response is shown above in diagnostics"
-                if diagnostic is not None
-                else "",
-            )
-        )
-    return option, text
-
-
-def _groq_post_json(
-    api_key: str,
-    request_body: Dict[str, Any],
-    report: Callable[[str], None],
-) -> Dict[str, Any]:
-    """POST a bounded Groq chat-completion request with transient-error retries."""
-    encoded_body = json.dumps(request_body, separators=(",", ":")).encode("utf-8")
-    request = urllib.request.Request(
-        GROQ_ENDPOINT,
-        data=encoded_body,
-        headers={
-            "Content-Type": "application/json; charset=utf-8",
-            "Authorization": "Bearer " + api_key,
-        },
-        method="POST",
-    )
-    response_bytes = None
-    for attempt in range(MAX_API_ATTEMPTS):
-        attempt_started = time.monotonic()
-        report(
-            "Groq HTTP attempt %d/%d started (request body %d bytes; key and screenshot omitted)."
-            % (attempt + 1, MAX_API_ATTEMPTS, len(encoded_body))
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=60) as response:
-                response_bytes = response.read(MAX_API_RESPONSE_BYTES + 1)
-                response_headers = getattr(response, "headers", None)
-                status = getattr(response, "status", None)
-                if status is None:
-                    getcode = getattr(response, "getcode", None)
-                    status = getcode() if getcode is not None else "unknown"
-            _report_rate_limit_headers(response_headers, "Groq", report)
-            report(
-                "Groq HTTP attempt %d/%d received status %s and %d response bytes in %.2f seconds."
-                % (
-                    attempt + 1,
-                    MAX_API_ATTEMPTS,
-                    status,
-                    len(response_bytes),
-                    time.monotonic() - attempt_started,
-                )
-            )
-            break
-        except urllib.error.HTTPError as exc:
-            status = exc.code
-            error_headers = getattr(exc, "headers", None)
-            provider_message = ""
-            try:
-                error_bytes = exc.read(4096)
-                error_payload = json.loads(error_bytes.decode("utf-8")) if error_bytes else {}
-                if isinstance(error_payload, dict):
-                    error_value = error_payload.get("error")
-                    if isinstance(error_value, dict):
-                        error_value = error_value.get("message") or error_value.get("detail")
-                    if not isinstance(error_value, str):
-                        error_value = error_payload.get("message") or error_payload.get("detail")
-                    if isinstance(error_value, str):
-                        provider_message = error_value.replace("\r", " ").replace("\n", " ")[:400]
-            except (AttributeError, UnicodeDecodeError, ValueError):
-                pass
-            finally:
-                exc.close()
-            _report_rate_limit_headers(error_headers, "Groq", report)
-            report(
-                "Groq HTTP attempt %d/%d failed with status %d after %.2f seconds."
-                % (
-                    attempt + 1,
-                    MAX_API_ATTEMPTS,
-                    status,
-                    time.monotonic() - attempt_started,
-                )
-            )
-            if provider_message:
-                report("Groq error detail: %s" % provider_message)
-            if status == 429 and attempt < MAX_API_ATTEMPTS - 1:
-                delay = _retry_after_delay(error_headers, attempt)
-                if delay is None:
-                    report(
-                        "Groq rate limit requested a wait longer than the %d-second automatic "
-                        "retry limit; stopping retries."
-                        % MAX_RETRY_AFTER_SECONDS
-                    )
-                else:
-                    report("Groq was rate-limited (HTTP 429); retrying in %.1f second(s)." % delay)
-                    time.sleep(delay)
-                    continue
-            if status in RETRYABLE_HTTP_STATUSES and attempt < MAX_API_ATTEMPTS - 1:
-                delay = 2 ** attempt
-                report("Temporary Groq server error; retrying in %d second(s)." % delay)
-                time.sleep(delay)
-                continue
-            if status in (401, 403):
-                raise RuntimeError("Groq rejected the API key or account permissions (HTTP %d)." % status)
-            if status == 402:
-                raise RuntimeError(
-                    "Groq reported an API billing or account-access issue (HTTP 402)."
-                )
-            if status == 429:
-                raise RuntimeError(
-                    "Groq is rate-limited or its usage quota was reached (HTTP 429). "
-                    "Wait and retry or check GroqCloud usage limits."
-                )
-            if status == 413:
-                raise RuntimeError(
-                    "Groq rejected the screenshot request as too large (HTTP 413). "
-                    "Try reducing the desktop resolution."
-                )
-            if status in RETRYABLE_HTTP_STATUSES:
-                raise RuntimeError(
-                    "Groq is temporarily unavailable (HTTP %d); the request was retried."
-                    % status
-                )
-            raise RuntimeError("Groq returned an HTTP error (%d)." % status)
-        except urllib.error.URLError as exc:
-            reason = getattr(exc, "reason", None)
-            if isinstance(reason, TimeoutError):
-                report(
-                    "Groq request timed out after %.2f seconds."
-                    % (time.monotonic() - attempt_started)
-                )
-                raise RuntimeError("The Groq request timed out. Please try again.")
-            reason_name = type(reason).__name__ if reason is not None else type(exc).__name__
-            report(
-                "Could not reach Groq after %.2f seconds; network error type: %s."
-                % (time.monotonic() - attempt_started, reason_name)
-            )
-            raise RuntimeError("Could not reach Groq. Check the internet connection and try again.")
-        except TimeoutError:
-            report("Groq request timed out after %.2f seconds." % (time.monotonic() - attempt_started))
-            raise RuntimeError("The Groq request timed out. Please try again.")
-
-    if response_bytes is None:
-        raise RuntimeError("Groq did not return a response.")
-    if len(response_bytes) > MAX_API_RESPONSE_BYTES:
-        report("Groq response exceeded the %d-byte safety limit." % MAX_API_RESPONSE_BYTES)
-        raise RuntimeError("Groq returned an unexpectedly large response.")
-    try:
-        response_data = json.loads(response_bytes.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        report("Groq response could not be decoded as JSON.")
-        raise RuntimeError("Groq returned a response that could not be read.")
-    if not isinstance(response_data, dict):
-        report("Groq response JSON was not an object.")
-        raise RuntimeError("Groq returned an invalid response.")
-    return response_data
-
-
-def _log_groq_response_metadata(
-    response_data: Dict[str, Any],
-    report: Callable[[str], None],
-) -> None:
-    """Log safe Groq completion metadata, never hidden reasoning or image contents."""
-    if not isinstance(response_data, dict):
-        report("Groq response metadata: top-level JSON value was not an object.")
-        return
-    model = response_data.get("model")
-    response_id = response_data.get("id")
-    if not isinstance(model, str):
-        model = "not provided"
-    if not isinstance(response_id, str):
-        response_id = "not provided"
-    model = model.replace("\r", " ").replace("\n", " ")[:100]
-    response_id = response_id.replace("\r", " ").replace("\n", " ")[:100]
-    choices = response_data.get("choices")
-    choices = choices if isinstance(choices, list) else []
-    report(
-        "Groq response metadata: choice_count=%d; model=%s; response_id=%s."
-        % (len(choices), model, response_id)
-    )
-    usage = response_data.get("usage")
-    if isinstance(usage, dict):
-        counts = []
-        for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
-            count = usage.get(field)
-            if isinstance(count, int) and not isinstance(count, bool):
-                counts.append("%s=%d" % (field, count))
-        if counts:
-            report("Groq token usage: %s." % ", ".join(counts))
-    for index, choice in enumerate(choices[:3]):
-        if not isinstance(choice, dict):
-            continue
-        finish_reason = choice.get("finish_reason", "not provided")
-        if not isinstance(finish_reason, str):
-            finish_reason = "not provided"
-        message = choice.get("message")
-        content = message.get("content") if isinstance(message, dict) else None
-        text_characters = len(content) if isinstance(content, str) else 0
-        report(
-            "Groq choice %d: finish_reason=%s; text_characters=%d."
-            % (index, finish_reason[:100], text_characters)
-        )
-
-
-def ask_groq(
-    api_key: str,
-    model: str,
-    png_image: bytes,
-    diagnostic: Optional[Callable[[str], None]] = None,
-    ocr_markdown: str = "",
-) -> Tuple[Optional[int], str]:
-    """Send the screenshot directly to Groq's vision chat model; no OCR service is called."""
-    def report(message: str) -> None:
-        if diagnostic is not None:
-            safe_message = str(message)
-            if api_key:
-                safe_message = safe_message.replace(api_key, "[REDACTED API KEY]")
-            diagnostic(safe_message)
-
-    if not valid_model_name("groq", model):
-        raise RuntimeError(
-            "The Groq model is outside this build's free-tier vision/reasoning allowlist."
-        )
-
-    markdown = ocr_markdown.strip() if isinstance(ocr_markdown, str) else ""
-    if len(markdown) > MAX_OCR_CONTEXT_CHARS:
-        original_characters = len(markdown)
-        markdown = markdown[:MAX_OCR_CONTEXT_CHARS]
-        report(
-            "Local OCR Markdown truncated from %d to %d characters for the solver request."
-            % (original_characters, len(markdown))
-        )
-    if markdown:
-        report("Attaching %d characters of optional local OCR transcript to Groq vision chat." % len(markdown))
-    else:
-        report("Sending the screenshot directly to Groq vision chat; no separate OCR API is used.")
-
-    image_data_uri = "data:image/png;base64," + base64.b64encode(png_image).decode("ascii")
-    request_body: Dict[str, Any] = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": SYSTEM_INSTRUCTION},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": _append_ocr_context(USER_PROMPT, markdown)},
-                    {"type": "image_url", "image_url": {"url": image_data_uri}},
-                ],
-            },
-        ],
-        "max_completion_tokens": MAX_GROQ_OUTPUT_TOKENS,
-    }
-    if model.lower() == DEFAULT_GROQ_MODEL:
-        # Groq documents these Qwen parameters for its thinking mode; hide the
-        # separate internal reasoning field and only consume the final message.
-        request_body.update(
-            {
-                "temperature": 1.0,
-                "top_p": 0.95,
-                "reasoning_effort": "high",
-                "reasoning_format": "hidden",
-            }
-        )
-    report("Preparing Groq vision request for model %s." % model)
-    response_data = _groq_post_json(api_key, request_body, report)
-    if diagnostic is not None:
-        _log_groq_response_metadata(response_data, report)
-    text = _extract_mistral_text(response_data)
-    if diagnostic is not None:
-        _report_model_output("Groq", text, report)
-    option = parse_option(text)
-    if option is None:
-        report(
-            "Groq response parsing found no explicit, reliable ANSWER line "
-            "(response length %d characters)." % len(text)
-        )
-    else:
-        report(
-            "Groq response parsing recognized option position %d%s."
             % (
                 option,
                 "; final response is shown above in diagnostics"
@@ -3165,7 +3037,7 @@ class ScreenAnswerApp:
         self.portable_config = load_portable_config(self.config_path)
         stored_keys = self.portable_config.get("api_keys", {})
         stored_models = self.portable_config.get("models", {})
-        self._config_has_key = any(stored_keys.values())
+        self._config_has_key = bool(stored_keys) or bool(stored_models)
         self.api_keys: Dict[str, str] = {}
         self.models: Dict[str, str] = {}
         self.api_key_sources: Dict[str, str] = {}
@@ -3540,8 +3412,9 @@ class ScreenAnswerApp:
         tk.Label(
             outer,
             text=(
-                "AI only — no live web search. Ctrl+Alt+S captures all monitors and sends "
-                "the screenshot (and optional local OCR text) to the selected AI provider over HTTPS."
+                "AI only — no live web search or tools. Ctrl+Alt+S captures all monitors. "
+                "APInex/OpenRouter/Mistral use hosted APIs; Ollama sends the image to the local "
+                "server at 127.0.0.1:11434."
             ),
             justify="left",
             wraplength=430,
@@ -3571,10 +3444,9 @@ class ScreenAnswerApp:
             outer,
             text=(
                 "Provider default sends the screenshot directly to the selected vision model "
-                "(Gemini, Groq, and OpenRouter make no separate OCR call; Mistral uses hosted OCR). "
-                "Optional Pix2Text "
-                "runs locally but needs its own install/model download; the screenshot and OCR "
-                "text are still sent to the selected AI provider."
+                "(APInex, Ollama, and OpenRouter make no separate OCR call; Mistral uses hosted OCR). "
+                "Optional Pix2Text runs locally but needs its own install/model download; the "
+                "screenshot and OCR text are still sent to the selected solver."
             ),
             justify="left",
             wraplength=430,
@@ -3591,11 +3463,14 @@ class ScreenAnswerApp:
         self.api_key_var = tk.StringVar(value=self.api_key)
         self.api_entry = tk.Entry(outer, textvariable=self.api_key_var, show="*", width=60)
         self.api_entry.pack(fill="x", pady=(3, 3))
+        if self.form_provider == "ollama":
+            self.api_key_var.set("")
+            self.api_entry.configure(state="disabled")
         self.portable_var = tk.BooleanVar(value=self._config_has_key)
         tk.Checkbutton(
             outer,
             text=(
-                "Keep the key in a portable config beside the app (plain text; keep it private)."
+                "Save settings beside the app (API keys are plain text; keep the file private)."
             ),
             variable=self.portable_var,
             wraplength=430,
@@ -3641,10 +3516,10 @@ class ScreenAnswerApp:
         tk.Label(
             outer,
             text=(
-                "The screenshot is not saved to disk. Provider-default Mistral uses separate "
-                "OCR and chat requests; Gemini, Groq, and OpenRouter send the image directly "
-                "to vision chat. Local Pix2Text OCR skips Mistral's OCR API call but still uploads the screenshot "
-                "for solving. Verify answers and use only where AI assistance is permitted."
+                "The screenshot is not saved to disk. Mistral provider-default sends it to separate "
+                "OCR and chat APIs; APInex and OpenRouter send it to hosted vision APIs; Ollama "
+                "sends it only to the local server at 127.0.0.1:11434. Local Pix2Text skips Mistral's "
+                "OCR API call. Verify answers and use only where AI assistance is permitted."
             ),
             fg="#555555",
             justify="left",
@@ -3665,37 +3540,56 @@ class ScreenAnswerApp:
         self.root.minsize(min(500, width), min(450, height))
 
     def _api_key_label_text(self, provider: str) -> str:
+        if provider == "ollama":
+            return "Ollama local server — no API key required (127.0.0.1:11434):"
         return "%s API key:" % PROVIDER_LABELS.get(provider, "Selected provider")
 
     def _consent_text(self, provider: str) -> str:
-        provider_label = PROVIDER_LABELS.get(provider, "the selected provider")
         if self.form_ocr_backend == "pix2text":
+            if provider == "ollama":
+                return (
+                    "I understand Pix2Text reads locally, then the full screenshot and OCR text "
+                    "go only to my local Ollama server at 127.0.0.1:11434. No cloud model API "
+                    "is called by this app. Do not enable if this endpoint is not on this device."
+                )
+            if provider == "apinex":
+                return (
+                    "I understand Pix2Text reads locally, then the full screenshot and OCR text "
+                    "go through APInex and its upstream model provider. APInex data terms and "
+                    "free-quota limits apply; do not upload sensitive screens."
+                )
             if provider == "openrouter":
                 return (
-                    "I understand Pix2Text reads locally, then the full screenshot and OCR "
-                    "text go through OpenRouter to its selected model host. Host data terms "
-                    "apply; no live web search is used. Do not upload sensitive screens."
-                )
-            if provider == "groq":
-                return (
-                    "I understand Pix2Text reads locally, then the full screenshot and OCR "
-                    "text go to Groq. The model is free only under Groq's Free plan; its "
-                    "Developer plan may bill."
+                    "I understand Pix2Text reads locally, then the full screenshot and OCR text "
+                    "go through OpenRouter to its selected model host. Host data terms apply; "
+                    "no live web search is used. Do not upload sensitive screens."
                 )
             return (
-                "I understand Pix2Text reads the screenshot locally, then the full screenshot "
-                "and OCR text are uploaded to %s for AI solving."
-            ) % provider_label
+                "I understand Pix2Text reads locally, then the full screenshot and OCR text "
+                "are sent to %s for AI solving."
+            ) % PROVIDER_LABELS.get(provider, "the selected provider")
+        if provider == "apinex":
+            return (
+                "I understand each capture sends the full desktop screenshot through APInex "
+                "to its selected upstream vision model. APInex privacy terms, provider terms, "
+                "free allowance and rate limits apply. No web search or tools are used. Do not "
+                "upload sensitive screens."
+            )
+        if provider == "ollama":
+            return (
+                "I understand each capture sends the full desktop screenshot to the local "
+                "Ollama server at 127.0.0.1:11434 on this device. This app does not send it to "
+                "a cloud model API. Confirm Ollama is running locally before consenting."
+            )
         if provider == "mistral":
+            if self.form_ocr_backend == "pix2text":
+                return (
+                    "I understand Pix2Text reads locally, then the screenshot and OCR text "
+                    "are sent to Mistral chat for solving."
+                )
             return (
                 "I understand each capture uploads the full desktop screenshot to Mistral "
                 "OCR and chat APIs for transcription and solving."
-            )
-        if provider == "groq":
-            return (
-                "I understand each capture uploads the full desktop screenshot directly to "
-                "Groq's vision chat API. This model is free only under Groq's Free plan; "
-                "the Developer plan may bill. No separate OCR service is called."
             )
         if provider == "openrouter":
             return (
@@ -3704,11 +3598,16 @@ class ScreenAnswerApp:
                 "terms apply; no separate OCR service or live web search is used. Do not "
                 "upload sensitive screens."
             )
-        return "I understand each capture uploads the full desktop screenshot to %s." % provider_label
+        return "I understand each capture sends the full desktop screenshot to %s." % (
+            PROVIDER_LABELS.get(provider, "the selected provider")
+        )
 
     def _remember_form_settings(self) -> None:
         provider = self.form_provider
-        self.api_keys[provider] = self.api_key_var.get().strip()
+        if provider_requires_api_key(provider):
+            self.api_keys[provider] = self.api_key_var.get().strip()
+        else:
+            self.api_keys[provider] = ""
         self.models[provider] = self.model_var.get().strip()
 
     def _provider_changed(self, selected_label: str) -> None:
@@ -3718,15 +3617,22 @@ class ScreenAnswerApp:
         self._remember_form_settings()
         self.form_provider = provider
         self.api_key_label.configure(text=self._api_key_label_text(provider))
-        self.api_key_var.set(self.api_keys.get(provider, ""))
+        if not provider_requires_api_key(provider):
+            self.api_keys[provider] = ""
+        key_value = self.api_keys.get(provider, "") if provider_requires_api_key(provider) else ""
+        self.api_key_var.set(key_value)
+        try:
+            self.api_entry.configure(state="normal" if provider_requires_api_key(provider) else "disabled")
+        except (AttributeError, TypeError):
+            pass
         self.model_var.set(self.models.get(provider, DEFAULT_MODELS[provider]))
         self.privacy_var.set(False)
         self.privacy_acknowledged = False
         self.privacy_checkbutton.configure(text=self._consent_text(provider))
+        key_note = "a provider API key" if provider_requires_api_key(provider) else "no API key (local service)"
         self._log_diagnostic(
-            "Settings provider changed to %s; a provider-specific API key and new "
-            "upload consent are required."
-            % PROVIDER_LABELS[provider]
+            "Settings provider changed to %s; %s and new upload consent are required."
+            % (PROVIDER_LABELS[provider], key_note)
         )
 
     def _ocr_backend_changed(self, selected_label: str) -> None:
@@ -3819,9 +3725,9 @@ class ScreenAnswerApp:
         self._remember_form_settings()
         provider = self.form_provider
         provider_label = PROVIDER_LABELS[provider]
-        key = self.api_keys.get(provider, "").strip()
+        key = self.api_keys.get(provider, "").strip() if provider_requires_api_key(provider) else ""
         model = self.models.get(provider, "").strip()
-        if not key:
+        if provider_requires_api_key(provider) and not key:
             self._log_diagnostic("Settings save blocked: no %s API key was entered." % provider_label)
             self.show_window()
             self._show_error("Enter a %s API key before using capture." % provider_label)
@@ -3836,10 +3742,15 @@ class ScreenAnswerApp:
                 "Settings save blocked: model is outside the provider's allowed model policy."
             )
             self.show_window()
-            if provider == "groq":
+            if provider == "apinex":
                 model_error = (
-                    "Groq is restricted to its curated Free-plan vision/reasoning model: %s."
-                    % DEFAULT_GROQ_MODEL
+                    "APInex is restricted to its configured free vision models: %s."
+                    % ", ".join(sorted(APINEX_FREE_VISION_MODELS))
+                )
+            elif provider == "ollama":
+                model_error = (
+                    "Enter an installed Ollama vision model, such as %s."
+                    % DEFAULT_OLLAMA_MODEL
                 )
             elif provider == "openrouter":
                 model_error = (
@@ -3884,7 +3795,7 @@ class ScreenAnswerApp:
                 self.show_window()
                 self._show_error("Could not save the portable config file: %s" % exc)
                 return False
-            self._config_has_key = any(self.api_keys.values())
+            self._config_has_key = True
             save_message = "Settings saved beside the app for portable use."
         else:
             if self._config_has_key:
@@ -3906,7 +3817,10 @@ class ScreenAnswerApp:
         self.ocr_backend = ocr_backend
         self.api_key = key
         self.model = model
-        self.api_key_source = "portable config sidecar" if self.portable_var.get() else "in-memory settings"
+        if provider == "ollama":
+            self.api_key_source = "local Ollama server (no API key required)"
+        else:
+            self.api_key_source = "portable config sidecar" if self.portable_var.get() else "in-memory settings"
         self.api_key_sources[provider] = self.api_key_source
         self.privacy_acknowledged = True
         self._log_diagnostic(
@@ -4015,7 +3929,7 @@ class ScreenAnswerApp:
             self._log_diagnostic("Capture request ignored: another request is already in progress.")
             self.tray.show_balloon(APP_NAME, "A screenshot request is already in progress.")
             return
-        if not self.api_key:
+        if provider_requires_api_key(self.provider) and not self.api_key:
             self._log_diagnostic(
                 "Capture blocked: no %s API key is configured." % PROVIDER_LABELS[self.provider]
             )
@@ -4124,7 +4038,22 @@ class ScreenAnswerApp:
                             )
 
                 stage = "%s request" % provider_label
-                if provider == "mistral":
+                if provider == "apinex":
+                    option, response_text = ask_apinex(
+                        api_key,
+                        model,
+                        image,
+                        diagnostic=diagnostic_callback,
+                        ocr_markdown=local_ocr_markdown or "",
+                    )
+                elif provider == "ollama":
+                    option, response_text = ask_ollama(
+                        model,
+                        image,
+                        diagnostic=diagnostic_callback,
+                        ocr_markdown=local_ocr_markdown or "",
+                    )
+                elif provider == "mistral":
                     option, response_text = ask_mistral(
                         api_key,
                         model,
@@ -4132,24 +4061,8 @@ class ScreenAnswerApp:
                         diagnostic=diagnostic_callback,
                         local_ocr_markdown=local_ocr_markdown,
                     )
-                elif provider == "groq":
-                    option, response_text = ask_groq(
-                        api_key,
-                        model,
-                        image,
-                        diagnostic=diagnostic_callback,
-                        ocr_markdown=local_ocr_markdown or "",
-                    )
-                elif provider == "openrouter":
-                    option, response_text = ask_openrouter(
-                        api_key,
-                        model,
-                        image,
-                        diagnostic=diagnostic_callback,
-                        ocr_markdown=local_ocr_markdown or "",
-                    )
                 else:
-                    option, response_text = ask_gemini(
+                    option, response_text = ask_openrouter(
                         api_key,
                         model,
                         image,
@@ -4245,10 +4158,11 @@ class ScreenAnswerApp:
                 elif kind == "captured":
                     captured_provider = event[1] if len(event) > 1 else self.provider
                     provider_label = PROVIDER_LABELS.get(captured_provider, "the selected provider")
-                    self.tray.show_balloon(
-                        APP_NAME,
-                        "Screenshot captured; sending it to %s over HTTPS." % provider_label,
-                    )
+                    if captured_provider == "ollama":
+                        message = "Screenshot captured; sending it only to local Ollama."
+                    else:
+                        message = "Screenshot captured; sending it to %s over HTTPS." % provider_label
+                    self.tray.show_balloon(APP_NAME, message)
                 elif kind == "open":
                     self._log_diagnostic("Settings window requested from the tray.")
                     self.show_window()
@@ -4308,10 +4222,18 @@ class ScreenAnswerApp:
 def main() -> int:
     if "--check-pix2text" in sys.argv[1:]:
         return 0 if pix2text_bundle_importable() else 1
-    if "--check-groq-provider" in sys.argv[1:]:
+    if "--check-apinex-ollama" in sys.argv[1:]:
         return 0 if (
-            APP_DEFAULT_PROVIDER == "groq"
-            and valid_model_name("groq", DEFAULT_GROQ_MODEL)
+            APP_DEFAULT_PROVIDER == "apinex"
+            and provider_labels_for_executable("ScreenAnswer.exe").get("apinex") == "APInex"
+            and provider_labels_for_executable("ScreenAnswer.exe").get("ollama") == "Ollama (local)"
+            and "gemini" not in provider_labels_for_executable("ScreenAnswer.exe")
+            and "groq" not in provider_labels_for_executable("ScreenAnswer.exe")
+            and APINEX_ENDPOINT == "https://api.apinex.bond/v1/chat/completions"
+            and OLLAMA_ENDPOINT == "http://127.0.0.1:11434/api/chat"
+            and valid_model_name("apinex", DEFAULT_APINEX_MODEL)
+            and valid_model_name("ollama", DEFAULT_OLLAMA_MODEL)
+            and not provider_requires_api_key("ollama")
         ) else 1
     if "--check-openrouter-support" in sys.argv[1:]:
         return 0 if (

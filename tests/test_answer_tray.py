@@ -14,26 +14,28 @@ from unittest.mock import MagicMock, patch
 
 from answer_tray import (
     _encode_rgb_png,
+    API_KEY_ENV_VARS,
+    APINEX_ENDPOINT,
+    APINEX_FREE_VISION_MODELS,
+    DEFAULT_APINEX_MODEL,
+    DEFAULT_OLLAMA_MODEL,
     DEFAULT_MISTRAL_MODEL,
-    DEFAULT_GROQ_MODEL,
     DEFAULT_OPENROUTER_MODEL,
-    GROQ_FREE_VISION_REASONING_MODELS,
     LASSOV2_CONFIG_DIRECTORY,
     LASSV27_CONFIG_DIRECTORY,
+    OLLAMA_ENDPOINT,
     OPENROUTER_FREE_VISION_REASONING_MODELS,
-    GROQ_ENDPOINT,
     ScreenAnswerApp,
     WindowsTray,
     _powershell_string_literal,
     OPENROUTER_ENDPOINT,
     MISTRAL_OCR_ENDPOINT,
     MISTRAL_OCR_MODEL,
-    _extract_gemini_text,
     _extract_mistral_ocr_markdown,
     _extract_mistral_text,
-    ask_gemini,
+    ask_apinex,
     ask_mistral,
-    ask_groq,
+    ask_ollama,
     ask_openrouter,
     default_provider_for_executable,
     diagnostics_mode_enabled,
@@ -51,6 +53,7 @@ from answer_tray import (
     load_portable_config,
     parse_option,
     provider_labels_for_executable,
+    provider_requires_api_key,
     resolve_api_key,
     schedule_lasso1_self_cleanup,
     save_lasso1_config,
@@ -527,12 +530,20 @@ class Lasso1ModeTests(unittest.TestCase):
                 saved = json.load(config_file)
             self.assertIs(saved["allow_screenshot_uploads"], True)
 
-    def test_free_provider_upload_notices_disclose_billing_and_host_data_terms(self):
+    def test_apinex_and_ollama_upload_notices_explain_data_paths(self):
         app = object.__new__(ScreenAnswerApp)
         app.form_ocr_backend = "provider"
-        groq_notice = app._consent_text("groq")
-        self.assertIn("Free plan", groq_notice)
-        self.assertIn("Developer plan may bill", groq_notice)
+        apinex_notice = app._consent_text("apinex")
+        self.assertIn("through APInex", apinex_notice)
+        self.assertIn("upstream vision model", apinex_notice)
+        self.assertIn("free allowance", apinex_notice)
+        self.assertIn("Do not upload sensitive screens", apinex_notice)
+        self.assertIn("No web search or tools", apinex_notice)
+
+        ollama_notice = app._consent_text("ollama")
+        self.assertIn("local Ollama server", ollama_notice)
+        self.assertIn("127.0.0.1:11434", ollama_notice)
+        self.assertIn("does not send it to a cloud model API", ollama_notice)
 
         openrouter_notice = app._consent_text("openrouter")
         self.assertIn("through OpenRouter", openrouter_notice)
@@ -542,10 +553,13 @@ class Lasso1ModeTests(unittest.TestCase):
         self.assertIn("live web search", openrouter_notice)
 
         app.form_ocr_backend = "pix2text"
-        local_ocr_notice = app._consent_text("openrouter")
+        local_ocr_notice = app._consent_text("apinex")
         self.assertIn("OCR text", local_ocr_notice)
-        self.assertIn("Host data terms apply", local_ocr_notice)
-        self.assertIn("Do not upload sensitive screens", local_ocr_notice)
+        self.assertIn("through APInex", local_ocr_notice)
+        self.assertIn("do not upload sensitive screens", local_ocr_notice)
+        local_ollama_notice = app._consent_text("ollama")
+        self.assertIn("Pix2Text reads locally", local_ollama_notice)
+        self.assertIn("127.0.0.1:11434", local_ollama_notice)
 
     def test_lasso1_settings_window_can_be_shown_on_demand(self):
         app = object.__new__(ScreenAnswerApp)
@@ -922,6 +936,72 @@ class Lasso1ModeTests(unittest.TestCase):
                         self.assertEqual(main(), 0)
 
 
+class StandardSettingsTests(unittest.TestCase):
+    def test_switching_to_ollama_disables_key_entry_and_resets_consent(self):
+        app = object.__new__(ScreenAnswerApp)
+        app.form_provider = "apinex"
+        app.form_ocr_backend = "provider"
+        app.api_keys = {"apinex": "apinex-key", "ollama": "stale-key"}
+        app.models = {"apinex": DEFAULT_APINEX_MODEL, "ollama": DEFAULT_OLLAMA_MODEL}
+        app.api_key_var = MagicMock()
+        app.api_key_var.get.return_value = "apinex-key"
+        app.model_var = MagicMock()
+        app.model_var.get.return_value = DEFAULT_APINEX_MODEL
+        app.api_key_label = MagicMock()
+        app.api_entry = MagicMock()
+        app.privacy_var = MagicMock()
+        app.privacy_checkbutton = MagicMock()
+        app._log_diagnostic = MagicMock()
+
+        app._provider_changed("Ollama (local)")
+
+        self.assertEqual(app.form_provider, "ollama")
+        self.assertEqual(app.api_keys["ollama"], "")
+        app.api_key_var.set.assert_called_once_with("")
+        app.api_entry.configure.assert_called_once_with(state="disabled")
+        app.api_key_label.configure.assert_called_once_with(
+            text="Ollama local server — no API key required (127.0.0.1:11434):"
+        )
+        app.model_var.set.assert_called_once_with(DEFAULT_OLLAMA_MODEL)
+        app.privacy_var.set.assert_called_once_with(False)
+
+    def test_ollama_settings_save_without_key_and_close(self):
+        app = object.__new__(ScreenAnswerApp)
+        app.lasso1_mode = False
+        app.form_provider = "ollama"
+        app.form_ocr_backend = "provider"
+        app.provider = "apinex"
+        app.api_key = ""
+        app.api_key_source = "not configured"
+        app.api_keys = {"ollama": ""}
+        app.api_key_sources = {}
+        app.models = {"ollama": DEFAULT_OLLAMA_MODEL}
+        app.privacy_var = MagicMock()
+        app.privacy_var.get.return_value = True
+        app.model_var = MagicMock()
+        app.model_var.get.return_value = DEFAULT_OLLAMA_MODEL
+        app.portable_var = MagicMock()
+        app.portable_var.get.return_value = False
+        app._config_has_key = False
+        app.status_var = MagicMock()
+        app.tray = MagicMock()
+        app.hide_window = MagicMock()
+        app.show_window = MagicMock()
+        app._show_error = MagicMock()
+        app._log_diagnostic = MagicMock()
+
+        self.assertTrue(app.save_settings())
+
+        self.assertEqual(app.provider, "ollama")
+        self.assertEqual(app.model, DEFAULT_OLLAMA_MODEL)
+        self.assertEqual(app.api_key, "")
+        self.assertEqual(app.api_key_source, "local Ollama server (no API key required)")
+        self.assertTrue(app.privacy_acknowledged)
+        app.hide_window.assert_called_once_with()
+        app.show_window.assert_not_called()
+        app._show_error.assert_not_called()
+
+
 class Pix2TextOCRTests(unittest.TestCase):
     def test_recognizes_text_formula_from_in_memory_png_and_logs_only_when_enabled(self):
         source_image = MagicMock()
@@ -1005,89 +1085,56 @@ class ParseOptionTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertIsNone(parse_option(text))
 
-    def test_extracts_candidate_text(self):
+    def test_extracts_chat_content_without_exposing_separate_reasoning_fields(self):
         payload = {
-            "candidates": [
-                {"content": {"parts": [{"text": "2"}, {"text": ""}]}}
-            ]
-        }
-        self.assertEqual(_extract_gemini_text(payload), "2")
-        self.assertEqual(_extract_gemini_text({"candidates": []}), "")
-        self.assertEqual(
-            _extract_gemini_text(
+            "choices": [
                 {
-                    "candidates": [
-                        {
-                            "content": {
-                                "parts": [
-                                    {"text": "private thought", "thought": True},
-                                    {"text": "ANSWER: B"},
-                                ]
-                            }
-                        }
-                    ]
-                }
-            ),
-            "ANSWER: B",
-        )
-
-
-class GeminiRequestTests(unittest.TestCase):
-    def test_uses_screenshot_without_search_tools(self):
-        image_bytes = b"fake png bytes"
-        captured = {}
-        response_payload = {
-            "candidates": [
-                {
-                    "content": {
-                        "parts": [
-                            {
-                                "text": (
-                                    "TRANSCRIPTION: a question with choices A-D.\n"
-                                    "SOLUTION: calculate and verify the value.\n"
-                                    "ANSWER: C"
-                                )
-                            }
-                        ]
+                    "message": {
+                        "content": "ANSWER: B",
+                        "reasoning_content": "private chain of thought",
                     }
                 }
             ]
         }
+        self.assertEqual(_extract_mistral_text(payload), "ANSWER: B")
+        self.assertEqual(_extract_mistral_text({"choices": []}), "")
 
-        class FakeResponse:
-            def __enter__(self):
-                return self
 
-            def __exit__(self, exc_type, exc_value, traceback):
-                return False
-
-            def read(self, limit=-1):
-                encoded = json.dumps(response_payload).encode("utf-8")
-                return encoded if limit < 0 else encoded[:limit]
-
-        def fake_urlopen(request, timeout):
-            captured["body"] = json.loads(request.data.decode("utf-8"))
-            captured["timeout"] = timeout
-            return FakeResponse()
-
-        with patch("answer_tray.urllib.request.urlopen", side_effect=fake_urlopen):
-            option, response_text = ask_gemini("test-key", "gemini-3.8-flash", image_bytes)
-
-        self.assertEqual(option, 3)
-        self.assertIn("ANSWER: C", response_text)
-        self.assertNotIn("tools", captured["body"])
-        self.assertEqual(captured["body"]["generationConfig"]["maxOutputTokens"], 2048)
-        parts = captured["body"]["contents"][0]["parts"]
-        self.assertEqual(parts[1]["inlineData"]["data"], base64.b64encode(image_bytes).decode("ascii"))
-
-    def test_attaches_local_ocr_transcript_and_original_image(self):
-        captured = {}
+class APInexRequestTests(unittest.TestCase):
+    def test_sends_free_vision_request_with_base64_image_and_no_tools(self):
+        image_bytes = b"synthetic screenshot bytes"
+        final_text = (
+            "TRANSCRIPTION: 1 + 1; choices A=1, B=2, C=3, D=4.\n"
+            "SOLUTION: 1 + 1 = 2, so the second choice matches.\n"
+            "ANSWER: B"
+        )
+        captured = []
+        diagnostics = []
         response_payload = {
-            "candidates": [{"content": {"parts": [{"text": "ANSWER: B"}]}}]
+            "id": "apinex-request-1",
+            "model": DEFAULT_APINEX_MODEL,
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": final_text,
+                        "reasoning_content": "hidden reasoning must not be returned or logged",
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 120,
+                "completion_tokens": 70,
+                "total_tokens": 190,
+                "cost_tokens": 0,
+            },
         }
-        markdown = "Calculate $2 + 2$.\nA. 3\nB. 4"
 
         class FakeResponse:
+            status = 200
+            headers = {"x-ratelimit-remaining": "4"}
+
             def __enter__(self):
                 return self
 
@@ -1099,36 +1146,51 @@ class GeminiRequestTests(unittest.TestCase):
                 return data if limit < 0 else data[:limit]
 
         def fake_urlopen(request, timeout):
-            captured["body"] = json.loads(request.data.decode("utf-8"))
+            captured.append(
+                {
+                    "url": request.full_url,
+                    "authorization": request.get_header("Authorization"),
+                    "body": json.loads(request.data.decode("utf-8")),
+                    "timeout": timeout,
+                }
+            )
             return FakeResponse()
 
-        image_bytes = b"original screenshot"
         with patch("answer_tray.urllib.request.urlopen", side_effect=fake_urlopen):
-            option, _ = ask_gemini(
-                "key", "gemini-3.8-flash", image_bytes, ocr_markdown=markdown
+            option, response_text = ask_apinex(
+                "apinex-test-key",
+                DEFAULT_APINEX_MODEL,
+                image_bytes,
+                diagnostic=diagnostics.append,
             )
 
-        parts = captured["body"]["contents"][0]["parts"]
         self.assertEqual(option, 2)
-        self.assertIn(markdown, parts[0]["text"])
-        self.assertIn("verify it against the attached original screenshot", parts[0]["text"])
+        self.assertEqual(response_text, final_text)
+        self.assertEqual(len(captured), 1)
+        request = captured[0]
+        self.assertEqual(request["url"], APINEX_ENDPOINT)
+        self.assertEqual(request["authorization"], "Bearer apinex-test-key")
+        self.assertEqual(request["timeout"], 120)
+        body = request["body"]
+        self.assertEqual(body["model"], DEFAULT_APINEX_MODEL)
+        self.assertEqual(body["max_tokens"], 2048)
+        self.assertEqual(body["reasoning_effort"], "medium")
+        self.assertNotIn("tools", body)
+        self.assertNotIn("plugins", body)
+        self.assertIn("Do not use live web search", body["messages"][0]["content"])
+        content = body["messages"][1]["content"]
+        self.assertEqual(content[1]["type"], "image_url")
         self.assertEqual(
-            parts[1]["inlineData"]["data"],
-            base64.b64encode(image_bytes).decode("ascii"),
+            content[1]["image_url"]["url"],
+            "data:image/png;base64," + base64.b64encode(image_bytes).decode("ascii"),
         )
+        self.assertTrue(any("prompt_tokens=120" in line for line in diagnostics))
+        self.assertFalse(any("hidden reasoning" in line for line in diagnostics))
+        self.assertFalse(any("apinex-test-key" in line for line in diagnostics))
 
-    def test_diagnostic_callback_shows_final_model_text_but_redacts_key(self):
-        private_response = (
-            "TRANSCRIPTION: question text from the screenshot.\n"
-            "SOLUTION: concise calculation.\n"
-            "ANSWER: A"
-        )
-        response_payload = {
-            "candidates": [
-                {"content": {"parts": [{"text": private_response}]}}
-            ]
-        }
-        diagnostic_lines = []
+    def test_local_ocr_is_context_and_only_one_apinex_request_is_made(self):
+        calls = []
+        transcript = "Question: x + 1 = 3\nA. 1\nB. 2"
 
         class FakeResponse:
             status = 200
@@ -1140,141 +1202,214 @@ class GeminiRequestTests(unittest.TestCase):
                 return False
 
             def read(self, limit=-1):
-                data = json.dumps(response_payload).encode("utf-8")
-                return data if limit < 0 else data[:limit]
-
-        with patch("answer_tray.urllib.request.urlopen", return_value=FakeResponse()):
-            option, response_text = ask_gemini(
-                "test-key", "gemini-3.8-flash", b"image", diagnostic=diagnostic_lines.append
-            )
-
-        self.assertEqual(option, 1)
-        self.assertEqual(response_text, private_response)
-        self.assertTrue(any("final response (diagnostic-only" in line for line in diagnostic_lines))
-        self.assertTrue(any("TRANSCRIPTION: question text" in line for line in diagnostic_lines))
-        self.assertTrue(any("ANSWER: A" in line for line in diagnostic_lines))
-        self.assertFalse(any("test-key" in line for line in diagnostic_lines))
-
-    def test_diagnostics_explain_empty_response_structure(self):
-        response_payload = {
-            "promptFeedback": {
-                "blockReason": "SAFETY",
-                "safetyRatings": [
-                    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "probability": "HIGH"}
-                ],
-            },
-            "usageMetadata": {
-                "promptTokenCount": 320,
-                "candidatesTokenCount": 0,
-                "totalTokenCount": 320,
-            },
-            "modelVersion": "gemini-3.8-flash-test",
-        }
-        diagnostic_lines = []
-
-        class FakeResponse:
-            status = 200
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc_value, traceback):
-                return False
-
-            def read(self, limit=-1):
-                data = json.dumps(response_payload).encode("utf-8")
-                return data if limit < 0 else data[:limit]
-
-        with patch("answer_tray.urllib.request.urlopen", return_value=FakeResponse()):
-            option, response_text = ask_gemini(
-                "test-key", "gemini-3.8-flash", b"image", diagnostic=diagnostic_lines.append
-            )
-
-        self.assertIsNone(option)
-        self.assertEqual(response_text, "")
-        self.assertTrue(any("candidate_count=0" in line for line in diagnostic_lines))
-        self.assertTrue(any("block_reason=SAFETY" in line for line in diagnostic_lines))
-        self.assertTrue(any("HARM_CATEGORY_DANGEROUS_CONTENT:HIGH" in line for line in diagnostic_lines))
-        self.assertTrue(any("candidatesTokenCount=0" in line for line in diagnostic_lines))
-        self.assertFalse(any("test-key" in line for line in diagnostic_lines))
-
-    def test_retries_temporary_503_then_succeeds(self):
-        response_payload = {
-            "candidates": [{"content": {"parts": [{"text": "1"}]}}]
-        }
-        call_count = [0]
-
-        class FakeResponse:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc_value, traceback):
-                return False
-
-            def read(self, limit=-1):
-                data = json.dumps(response_payload).encode("utf-8")
+                data = json.dumps({"choices": [{"message": {"content": "ANSWER: B"}}]}).encode("utf-8")
                 return data if limit < 0 else data[:limit]
 
         def fake_urlopen(request, timeout):
-            call_count[0] += 1
-            if call_count[0] == 1:
+            calls.append((request.full_url, json.loads(request.data.decode("utf-8"))))
+            return FakeResponse()
+
+        with patch("answer_tray.urllib.request.urlopen", side_effect=fake_urlopen):
+            option, _ = ask_apinex(
+                "key", DEFAULT_APINEX_MODEL, b"original screenshot", ocr_markdown=transcript
+            )
+
+        self.assertEqual(option, 2)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], APINEX_ENDPOINT)
+        text_part, image_part = calls[0][1]["messages"][1]["content"]
+        self.assertIn(transcript, text_part["text"])
+        self.assertEqual(image_part["type"], "image_url")
+
+    def test_retries_429_and_redacts_api_key_in_diagnostics(self):
+        api_key = "apinex-secret-key"
+        attempts = []
+        diagnostics = []
+
+        class FakeResponse:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+            def read(self, limit=-1):
+                data = json.dumps({"choices": [{"message": {"content": "ANSWER: C"}}]}).encode("utf-8")
+                return data if limit < 0 else data[:limit]
+
+        def fake_urlopen(request, timeout):
+            attempts.append(request.full_url)
+            if len(attempts) == 1:
+                payload = {"error": {"message": "rate limit: " + api_key}}
                 raise urllib.error.HTTPError(
-                    request.full_url, 503, "Service Unavailable", None, io.BytesIO()
+                    request.full_url,
+                    429,
+                    "Too Many Requests",
+                    {"Retry-After": "2", "X-RateLimit-Remaining": "0"},
+                    io.BytesIO(json.dumps(payload).encode("utf-8")),
                 )
             return FakeResponse()
 
-        diagnostic_lines = []
         with patch("answer_tray.urllib.request.urlopen", side_effect=fake_urlopen):
             with patch("answer_tray.time.sleep") as sleep:
-                option, _ = ask_gemini(
-                    "test-key",
-                    "gemini-3.8-flash",
-                    b"image",
-                    diagnostic=diagnostic_lines.append,
-                )
+                option, _ = ask_apinex(api_key, DEFAULT_APINEX_MODEL, b"image", diagnostics.append)
 
-        self.assertEqual(option, 1)
-        self.assertEqual(call_count[0], 2)
-        sleep.assert_called_once_with(1)
-        self.assertTrue(any("failed with status 503" in line for line in diagnostic_lines))
-        self.assertTrue(any("retrying in 1 second" in line for line in diagnostic_lines))
-        self.assertTrue(any("recognized option position 1" in line for line in diagnostic_lines))
-        self.assertFalse(any("test-key" in line for line in diagnostic_lines))
+        self.assertEqual(option, 3)
+        self.assertEqual(attempts, [APINEX_ENDPOINT, APINEX_ENDPOINT])
+        sleep.assert_called_once_with(2.0)
+        self.assertTrue(any("Retry-After=2" in line for line in diagnostics))
+        self.assertTrue(any("[REDACTED API KEY]" in line for line in diagnostics))
+        self.assertFalse(any(api_key in line for line in diagnostics))
 
-    def test_final_503_diagnostic_includes_provider_reason_without_key(self):
-        provider_message = "temporary service failure test-key"
-        diagnostic_lines = []
-        call_count = [0]
+    def test_rejects_non_allowlisted_or_paid_model_before_network_access(self):
+        self.assertTrue(valid_model_name("apinex", DEFAULT_APINEX_MODEL))
+        self.assertIn(DEFAULT_APINEX_MODEL, APINEX_FREE_VISION_MODELS)
+        self.assertFalse(valid_model_name("apinex", "gemini-3.8-flash"))
+        self.assertFalse(valid_model_name("apinex", "paid/gemini-3.8-flash"))
+        with patch("answer_tray.urllib.request.urlopen") as urlopen:
+            with self.assertRaisesRegex(RuntimeError, "curated free vision models"):
+                ask_apinex("key", "paid/gemini-3.8-flash", b"image")
+        urlopen.assert_not_called()
+
+
+class OllamaRequestTests(unittest.TestCase):
+    def test_sends_raw_base64_image_to_loopback_without_api_key_or_tools(self):
+        image_bytes = b"local synthetic screenshot"
+        final_text = "TRANSCRIPTION: 2 + 2.\nSOLUTION: It equals 4.\nANSWER: D"
+        captured = []
+        diagnostics = []
+        response_payload = {
+            "model": DEFAULT_OLLAMA_MODEL,
+            "message": {
+                "role": "assistant",
+                "content": final_text,
+                "thinking": "private internal reasoning",
+            },
+            "done": True,
+            "prompt_eval_count": 120,
+            "eval_count": 70,
+            "total_duration": 123456,
+        }
+
+        class FakeResponse:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+            def read(self, limit=-1):
+                data = json.dumps(response_payload).encode("utf-8")
+                return data if limit < 0 else data[:limit]
 
         def fake_urlopen(request, timeout):
-            call_count[0] += 1
-            body = json.dumps(
-                {"error": {"status": "UNAVAILABLE", "message": provider_message}}
-            ).encode("utf-8")
+            captured.append(
+                {
+                    "url": request.full_url,
+                    "authorization": request.get_header("Authorization"),
+                    "body": json.loads(request.data.decode("utf-8")),
+                    "timeout": timeout,
+                }
+            )
+            return FakeResponse()
+
+        with patch("answer_tray.urllib.request.urlopen", side_effect=fake_urlopen):
+            option, response_text = ask_ollama(
+                DEFAULT_OLLAMA_MODEL,
+                image_bytes,
+                diagnostic=diagnostics.append,
+            )
+
+        self.assertEqual(option, 4)
+        self.assertEqual(response_text, final_text)
+        self.assertEqual(len(captured), 1)
+        request = captured[0]
+        self.assertEqual(request["url"], OLLAMA_ENDPOINT)
+        self.assertIsNone(request["authorization"])
+        self.assertEqual(request["timeout"], 300)
+        body = request["body"]
+        self.assertEqual(body["model"], DEFAULT_OLLAMA_MODEL)
+        self.assertIs(body["stream"], False)
+        self.assertEqual(body["options"]["temperature"], 0)
+        self.assertEqual(body["options"]["num_predict"], 2048)
+        self.assertNotIn("tools", body)
+        self.assertIn("Do not use live web search", body["messages"][0]["content"])
+        self.assertEqual(
+            body["messages"][1]["images"],
+            [base64.b64encode(image_bytes).decode("ascii")],
+        )
+        self.assertNotIn("data:image/png", body["messages"][1]["images"][0])
+        self.assertTrue(any("prompt_eval_count=120" in line for line in diagnostics))
+        self.assertFalse(any("private internal reasoning" in line for line in diagnostics))
+
+    def test_local_ollama_404_explains_how_to_pull_model(self):
+        error_payload = {"error": "model 'qwen3-vl:8b' not found"}
+
+        def fake_urlopen(request, timeout):
             raise urllib.error.HTTPError(
-                request.full_url, 503, "Service Unavailable", None, io.BytesIO(body)
+                request.full_url,
+                404,
+                "Not Found",
+                {},
+                io.BytesIO(json.dumps(error_payload).encode("utf-8")),
             )
 
         with patch("answer_tray.urllib.request.urlopen", side_effect=fake_urlopen):
-            with patch("answer_tray.time.sleep"):
-                with self.assertRaisesRegex(RuntimeError, "HTTP 503"):
-                    ask_gemini(
-                        "test-key",
-                        "gemini-3.8-flash",
-                        b"image",
-                        diagnostic=diagnostic_lines.append,
-                    )
+            with self.assertRaisesRegex(RuntimeError, "ollama pull qwen3-vl:8b"):
+                ask_ollama(DEFAULT_OLLAMA_MODEL, b"image")
 
-        self.assertEqual(call_count[0], 3)
-        self.assertTrue(any("UNAVAILABLE" in line for line in diagnostic_lines))
-        self.assertTrue(
-            any(
-                "temporary service failure [REDACTED API KEY]" in line
-                for line in diagnostic_lines
-            )
+    def test_local_ollama_connection_failure_is_clear(self):
+        with patch(
+            "answer_tray.urllib.request.urlopen",
+            side_effect=urllib.error.URLError("connection refused"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Start Ollama"):
+                ask_ollama(DEFAULT_OLLAMA_MODEL, b"image")
+
+
+class ProviderRegistryTests(unittest.TestCase):
+    def test_standard_app_replaces_google_and_groq_with_apinex_and_ollama(self):
+        providers = provider_labels_for_executable("ScreenAnswer.exe")
+        self.assertEqual(
+            providers,
+            {
+                "apinex": "APInex",
+                "ollama": "Ollama (local)",
+                "mistral": "Mistral",
+                "openrouter": "OpenRouter",
+            },
         )
-        self.assertFalse(any("test-key" in line for line in diagnostic_lines))
+        self.assertNotIn("gemini", providers)
+        self.assertNotIn("groq", providers)
+        self.assertEqual(
+            API_KEY_ENV_VARS,
+            {
+                "apinex": "APINEX_API_KEY",
+                "mistral": "MISTRAL_API_KEY",
+                "openrouter": "OPENROUTER_API_KEY",
+            },
+        )
+        self.assertEqual(default_provider_for_executable("ScreenAnswer.exe"), "apinex")
+        self.assertEqual(default_provider_for_executable("ScreenAnswer-APInex.exe"), "apinex")
+        self.assertEqual(default_provider_for_executable("ScreenAnswer-Ollama.exe"), "ollama")
+        self.assertFalse(provider_requires_api_key("ollama"))
+        self.assertTrue(provider_requires_api_key("apinex"))
+        self.assertEqual(
+            resolve_api_key("ollama", {"ollama": "must-be-ignored"}, {"OLLAMA_API_KEY": "ignored"}),
+            ("", "local Ollama server (no API key required)"),
+        )
+        self.assertEqual(
+            provider_labels_for_executable("LassoV2.exe"),
+            {"openrouter": "OpenRouter"},
+        )
 
+    def test_build_smoke_check_covers_new_providers(self):
+        with patch("sys.argv", ["ScreenAnswer-Diagnostic.exe", "--check-apinex-ollama"]):
+            self.assertEqual(main(), 0)
 
 class MistralRequestTests(unittest.TestCase):
     def test_ocr_then_reasoned_vision_chat_without_search_tools(self):
@@ -1688,213 +1823,6 @@ class MistralRequestTests(unittest.TestCase):
         )
 
 
-class GroqRequestTests(unittest.TestCase):
-    def test_direct_vision_request_uses_image_url_without_ocr_or_tools(self):
-        image_bytes = b"fake png bytes"
-        final_text = (
-            "TRANSCRIPTION: compute 1 + 1; choices A=1, B=2, C=3, D=4.\n"
-            "SOLUTION: 1 + 1 = 2, so the second choice matches.\n"
-            "ANSWER: B"
-        )
-        captured = []
-        diagnostics = []
-        response_payload = {
-            "id": "groq-request-1",
-            "model": DEFAULT_GROQ_MODEL,
-            "choices": [
-                {
-                    "message": {
-                        "role": "assistant",
-                        "content": final_text,
-                        "reasoning": "hidden reasoning must not be returned or logged",
-                    },
-                    "finish_reason": "stop",
-                }
-            ],
-            "usage": {"prompt_tokens": 100, "completion_tokens": 80, "total_tokens": 180},
-        }
-
-        class FakeResponse:
-            status = 200
-            headers = {"x-ratelimit-remaining-tokens": "1000"}
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc_value, traceback):
-                return False
-
-            def read(self, limit=-1):
-                data = json.dumps(response_payload).encode("utf-8")
-                return data if limit < 0 else data[:limit]
-
-        def fake_urlopen(request, timeout):
-            captured.append(
-                {
-                    "url": request.full_url,
-                    "authorization": request.get_header("Authorization"),
-                    "body": json.loads(request.data.decode("utf-8")),
-                    "timeout": timeout,
-                }
-            )
-            return FakeResponse()
-
-        with patch("answer_tray.urllib.request.urlopen", side_effect=fake_urlopen):
-            option, response_text = ask_groq(
-                "groq-test-key", DEFAULT_GROQ_MODEL, image_bytes, diagnostics.append
-            )
-
-        self.assertEqual(option, 2)
-        self.assertEqual(response_text, final_text)
-        self.assertNotIn("hidden reasoning", response_text)
-        self.assertEqual(len(captured), 1)
-        request = captured[0]
-        self.assertEqual(request["url"], GROQ_ENDPOINT)
-        self.assertEqual(request["authorization"], "Bearer groq-test-key")
-        self.assertEqual(request["timeout"], 60)
-        body = request["body"]
-        self.assertEqual(body["model"], DEFAULT_GROQ_MODEL)
-        self.assertEqual(body["max_completion_tokens"], 4096)
-        self.assertEqual(body["reasoning_effort"], "high")
-        self.assertEqual(body["reasoning_format"], "hidden")
-        self.assertNotIn("tools", body)
-        self.assertNotIn("tool_choice", body)
-        self.assertIn("Do not use live web search", body["messages"][0]["content"])
-        content = body["messages"][1]["content"]
-        self.assertEqual(content[1]["type"], "image_url")
-        self.assertEqual(
-            content[1]["image_url"]["url"],
-            "data:image/png;base64," + base64.b64encode(image_bytes).decode("ascii"),
-        )
-        self.assertTrue(any("no separate OCR API is used" in line for line in diagnostics))
-        self.assertFalse(any("hidden reasoning" in line for line in diagnostics))
-
-    def test_optional_local_ocr_transcript_is_context_only(self):
-        captured = []
-        transcript = "Question: x + 1 = 3\nA. 1\nB. 2"
-
-        class FakeResponse:
-            status = 200
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc_value, traceback):
-                return False
-
-            def read(self, limit=-1):
-                data = json.dumps(
-                    {"choices": [{"message": {"content": "ANSWER: B"}}]}
-                ).encode("utf-8")
-                return data if limit < 0 else data[:limit]
-
-        def fake_urlopen(request, timeout):
-            captured.append((request.full_url, json.loads(request.data.decode("utf-8"))))
-            return FakeResponse()
-
-        with patch("answer_tray.urllib.request.urlopen", side_effect=fake_urlopen):
-            option, _ = ask_groq("key", DEFAULT_GROQ_MODEL, b"image", ocr_markdown=transcript)
-
-        self.assertEqual(option, 2)
-        self.assertEqual(len(captured), 1)
-        self.assertEqual(captured[0][0], GROQ_ENDPOINT)
-        self.assertIn(transcript, captured[0][1]["messages"][1]["content"][0]["text"])
-
-    def test_retries_bounded_429_using_retry_after(self):
-        attempts = []
-        diagnostics = []
-
-        class FakeResponse:
-            status = 200
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc_value, traceback):
-                return False
-
-            def read(self, limit=-1):
-                data = json.dumps(
-                    {"choices": [{"message": {"content": "ANSWER: C"}}]}
-                ).encode("utf-8")
-                return data if limit < 0 else data[:limit]
-
-        def fake_urlopen(request, timeout):
-            attempts.append(request.full_url)
-            if len(attempts) == 1:
-                raise urllib.error.HTTPError(
-                    request.full_url,
-                    429,
-                    "Too Many Requests",
-                    {"Retry-After": "2", "x-ratelimit-remaining-tokens": "0"},
-                    io.BytesIO(b'{"error":{"message":"rate limit exceeded"}}'),
-                )
-            return FakeResponse()
-
-        with patch("answer_tray.urllib.request.urlopen", side_effect=fake_urlopen):
-            with patch("answer_tray.time.sleep") as sleep:
-                option, _ = ask_groq("key", DEFAULT_GROQ_MODEL, b"image", diagnostics.append)
-
-        self.assertEqual(option, 3)
-        self.assertEqual(attempts, [GROQ_ENDPOINT, GROQ_ENDPOINT])
-        sleep.assert_called_once_with(2.0)
-        self.assertTrue(any("Retry-After=2" in line for line in diagnostics))
-        self.assertTrue(any("retrying in 2.0 second(s)" in line for line in diagnostics))
-
-    def test_auth_error_diagnostics_redact_api_key(self):
-        api_key = "groq-secret-key"
-        diagnostics = []
-
-        def fake_urlopen(request, timeout):
-            raise urllib.error.HTTPError(
-                GROQ_ENDPOINT,
-                401,
-                "Unauthorized",
-                None,
-                io.BytesIO(
-                    json.dumps({"error": {"message": "invalid key " + api_key}}).encode("utf-8")
-                ),
-            )
-
-        with patch("answer_tray.urllib.request.urlopen", side_effect=fake_urlopen):
-            with self.assertRaisesRegex(RuntimeError, "Groq rejected the API key"):
-                ask_groq(api_key, DEFAULT_GROQ_MODEL, b"image", diagnostics.append)
-
-        self.assertTrue(any("[REDACTED API KEY]" in line for line in diagnostics))
-        self.assertFalse(any(api_key in line for line in diagnostics))
-
-    def test_groq_and_openrouter_model_ids_are_restricted_to_free_vision_allowlists(self):
-        self.assertEqual(GROQ_FREE_VISION_REASONING_MODELS, {DEFAULT_GROQ_MODEL})
-        self.assertTrue(valid_model_name("groq", DEFAULT_GROQ_MODEL))
-        self.assertFalse(valid_model_name("groq", "openai/gpt-oss-120b"))
-        self.assertFalse(valid_model_name("groq", "qwen/qwen3.6-27b"))
-        self.assertFalse(valid_model_name("gemini", DEFAULT_GROQ_MODEL))
-        self.assertFalse(valid_model_name("groq", "qwen/model?bad"))
-
-        self.assertEqual(len(OPENROUTER_FREE_VISION_REASONING_MODELS), 2)
-        for free_model in OPENROUTER_FREE_VISION_REASONING_MODELS:
-            self.assertTrue(free_model.endswith(":free"))
-            self.assertTrue(valid_model_name("openrouter", free_model))
-        self.assertTrue(valid_model_name("openrouter", DEFAULT_OPENROUTER_MODEL))
-        self.assertFalse(valid_model_name("openrouter", "google/gemini-3.8-flash"))
-        self.assertFalse(valid_model_name("openrouter", "openai/gpt-oss-120b:free"))
-        self.assertFalse(valid_model_name("openrouter", "openrouter/free"))
-        self.assertFalse(valid_model_name("openrouter", "google/model:online"))
-        self.assertEqual(default_provider_for_executable("ScreenAnswer-Groq.exe"), "groq")
-        self.assertEqual(default_provider_for_executable("ScreenAnswer.exe"), "gemini")
-
-    def test_groq_blocks_paid_or_nonvision_models_before_network_access(self):
-        with patch("answer_tray.urllib.request.urlopen") as urlopen:
-            for rejected_model in (
-                "openai/gpt-oss-120b",
-                "qwen/qwen3.6-27b",
-                "paid/vision-model",
-            ):
-                with self.assertRaisesRegex(RuntimeError, "free-tier vision/reasoning allowlist"):
-                    ask_groq("key", rejected_model, b"image")
-        urlopen.assert_not_called()
-
-
 class OpenRouterRequestTests(unittest.TestCase):
     def test_direct_vision_request_uses_base64_image_without_search_or_ocr(self):
         image_bytes = b"fake OpenRouter screenshot"
@@ -2125,36 +2053,40 @@ class OpenRouterRequestTests(unittest.TestCase):
 
 
 class PortableConfigTests(unittest.TestCase):
-    def test_saves_and_loads_key_and_model(self):
+    def test_saves_and_loads_apinex_key_and_model_by_default(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "screen_answer_config.json")
-            save_portable_config("example-key", "gemini-3.8-flash", path)
+            save_portable_config("example-key", DEFAULT_APINEX_MODEL, path)
             self.assertEqual(
                 load_portable_config(path),
                 {
-                    "provider": "gemini",
-                    "api_keys": {"gemini": "example-key"},
-                    "models": {"gemini": "gemini-3.8-flash"},
+                    "provider": "apinex",
+                    "api_keys": {"apinex": "example-key"},
+                    "models": {"apinex": DEFAULT_APINEX_MODEL},
                     "ocr_backend": "provider",
                 },
             )
 
-    def test_saves_all_provider_keys_and_models_and_migrates_legacy_gemini_config(self):
+    def test_saves_supported_keys_models_and_ignores_retired_providers(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "screen_answer_config.json")
             save_portable_config(
                 path=path,
                 provider="mistral",
                 api_keys={
-                    "gemini": "gemini-key",
+                    "gemini": "retired-google-key",
+                    "apinex": "apinex-key",
+                    "ollama": "must-not-be-saved",
                     "mistral": "mistral-key",
-                    "groq": "groq-key",
+                    "groq": "retired-groq-key",
                     "openrouter": "openrouter-key",
                 },
                 models={
                     "gemini": "gemini-3.8-flash",
+                    "apinex": DEFAULT_APINEX_MODEL,
+                    "ollama": DEFAULT_OLLAMA_MODEL,
                     "mistral": "ministral-14b-2512",
-                    "groq": DEFAULT_GROQ_MODEL,
+                    "groq": "qwen/qwen3.8-27b",
                     "openrouter": DEFAULT_OPENROUTER_MODEL,
                 },
                 ocr_backend="pix2text",
@@ -2164,71 +2096,130 @@ class PortableConfigTests(unittest.TestCase):
                 {
                     "provider": "mistral",
                     "api_keys": {
-                        "gemini": "gemini-key",
+                        "apinex": "apinex-key",
                         "mistral": "mistral-key",
-                        "groq": "groq-key",
                         "openrouter": "openrouter-key",
                     },
                     "models": {
-                        "gemini": "gemini-3.8-flash",
-                        "mistral": "mistral-medium-latest",
-                        "groq": DEFAULT_GROQ_MODEL,
+                        "apinex": DEFAULT_APINEX_MODEL,
+                        "ollama": DEFAULT_OLLAMA_MODEL,
+                        "mistral": DEFAULT_MISTRAL_MODEL,
                         "openrouter": DEFAULT_OPENROUTER_MODEL,
                     },
                     "ocr_backend": "pix2text",
                 },
             )
-            with open(path, "w", encoding="utf-8") as config_file:
-                json.dump({"api_key": "legacy-key", "model": "gemini-3.8-flash"}, config_file)
-            self.assertEqual(
-                load_portable_config(path),
-                {
-                    "provider": "gemini",
-                    "api_keys": {"gemini": "legacy-key"},
-                    "models": {"gemini": "gemini-3.8-flash"},
-                    "ocr_backend": "provider",
-                },
-            )
+            with open(path, "r", encoding="utf-8") as config_file:
+                saved = json.load(config_file)
+            self.assertNotIn("gemini", saved["api_keys"])
+            self.assertNotIn("groq", saved["api_keys"])
+            self.assertNotIn("ollama", saved["api_keys"])
+            self.assertNotIn("gemini", saved["models"])
+            self.assertNotIn("groq", saved["models"])
 
-    def test_invalid_saved_groq_and_openrouter_models_are_migrated_to_free_defaults(self):
+    def test_old_google_and_groq_credentials_are_scrubbed_not_reused_for_apinex(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "screen_answer_config.json")
             with open(path, "w", encoding="utf-8") as config_file:
                 json.dump(
                     {
-                        "provider": "groq",
-                        "api_keys": {"groq": "groq-key", "openrouter": "router-key"},
+                        "provider": "gemini",
+                        "api_keys": {
+                            "gemini": "old-google-secret",
+                            "groq": "old-groq-secret",
+                            "mistral": "keep-mistral-key",
+                            "openrouter": "keep-openrouter-key",
+                        },
                         "models": {
-                            "groq": "openai/gpt-oss-120b",
-                            "openrouter": "google/gemini-3.8-flash",
+                            "gemini": "gemini-3.8-flash",
+                            "groq": "qwen/qwen3.8-27b",
+                            "mistral": "ministral-14b-2512",
+                            "openrouter": DEFAULT_OPENROUTER_MODEL,
                         },
                     },
                     config_file,
                 )
 
-            loaded = load_portable_config(path)
-            self.assertEqual(loaded["models"]["groq"], DEFAULT_GROQ_MODEL)
-            self.assertEqual(loaded["models"]["openrouter"], DEFAULT_OPENROUTER_MODEL)
-            self.assertEqual(loaded["api_keys"], {"groq": "groq-key", "openrouter": "router-key"})
+            migrated = load_portable_config(path)
+            self.assertEqual(migrated["provider"], "apinex")
+            self.assertEqual(
+                migrated["api_keys"],
+                {"mistral": "keep-mistral-key", "openrouter": "keep-openrouter-key"},
+            )
+            self.assertNotIn("apinex", migrated["api_keys"])
+            self.assertEqual(migrated["models"]["mistral"], DEFAULT_MISTRAL_MODEL)
+            self.assertEqual(migrated["models"]["openrouter"], DEFAULT_OPENROUTER_MODEL)
 
+            with open(path, "r", encoding="utf-8") as config_file:
+                scrubbed = json.load(config_file)
+            serialized = json.dumps(scrubbed)
+            self.assertNotIn("old-google-secret", serialized)
+            self.assertNotIn("old-groq-secret", serialized)
+            self.assertNotIn("gemini", scrubbed["api_keys"])
+            self.assertNotIn("groq", scrubbed["api_keys"])
+            self.assertEqual(scrubbed["provider"], "apinex")
+
+    def test_legacy_flat_google_key_and_model_are_discarded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "screen_answer_config.json")
+            with open(path, "w", encoding="utf-8") as config_file:
+                json.dump({"api_key": "old-google-key", "model": "gemini-3.8-flash"}, config_file)
+
+            migrated = load_portable_config(path)
+            self.assertEqual(migrated["provider"], "apinex")
+            self.assertEqual(migrated["api_keys"], {})
+            self.assertEqual(migrated["models"], {})
+            with open(path, "r", encoding="utf-8") as config_file:
+                scrubbed = json.load(config_file)
+            self.assertNotIn("old-google-key", json.dumps(scrubbed))
+            self.assertNotIn("api_key", scrubbed)
+            self.assertNotIn("model", scrubbed)
+
+    def test_ollama_never_stores_or_resolves_an_api_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "screen_answer_config.json")
             save_portable_config(
                 path=path,
-                provider="gemini",
-                models={
-                    "groq": "openai/gpt-oss-120b",
-                    "openrouter": "google/gemini-3.8-flash",
-                },
+                provider="ollama",
+                api_key="should-not-be-saved",
+                model=DEFAULT_OLLAMA_MODEL,
+                api_keys={"ollama": "also-ignored"},
             )
             with open(path, "r", encoding="utf-8") as config_file:
                 saved = json.load(config_file)
-            self.assertEqual(
-                saved["models"],
-                {"groq": DEFAULT_GROQ_MODEL, "openrouter": DEFAULT_OPENROUTER_MODEL},
-            )
+            self.assertNotIn("ollama", saved["api_keys"])
+            self.assertNotIn("should-not-be-saved", json.dumps(saved))
+        self.assertEqual(
+            resolve_api_key(
+                "ollama",
+                {"ollama": "old-key"},
+                {"OLLAMA_API_KEY": "environment-key"},
+            ),
+            ("", "local Ollama server (no API key required)"),
+        )
 
-    def test_missing_or_invalid_config_falls_back_to_empty(self):
+    def test_invalid_apinex_and_ollama_models_fall_back_to_safe_names(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "screen_answer_config.json")
+            with open(path, "w", encoding="utf-8") as config_file:
+                json.dump(
+                    {
+                        "provider": "apinex",
+                        "api_keys": {"apinex": "apinex-key"},
+                        "models": {
+                            "apinex": "paid/gemini-3.8-flash",
+                            "ollama": "qwen3-vl:8b?invalid",
+                        },
+                    },
+                    config_file,
+                )
+            loaded = load_portable_config(path)
+        self.assertEqual(loaded["models"]["apinex"], DEFAULT_APINEX_MODEL)
+        self.assertEqual(loaded["models"]["ollama"], DEFAULT_OLLAMA_MODEL)
+
+    def test_missing_or_invalid_config_falls_back_to_empty_apinex_settings(self):
         empty_config = {
-            "provider": "gemini",
+            "provider": "apinex",
             "api_keys": {},
             "models": {},
             "ocr_backend": "provider",
@@ -2239,20 +2230,6 @@ class PortableConfigTests(unittest.TestCase):
             with open(path, "w", encoding="utf-8") as config_file:
                 config_file.write("not json")
             self.assertEqual(load_portable_config(path), empty_config)
-
-
-    def test_groq_executable_defaults_to_groq_but_keeps_gemini_legacy_migration(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = os.path.join(directory, "screen_answer_config.json")
-            with patch("answer_tray.APP_DEFAULT_PROVIDER", "groq"):
-                self.assertEqual(load_portable_config(path)["provider"], "groq")
-                with open(path, "w", encoding="utf-8") as config_file:
-                    json.dump({"api_key": "old-gemini-key", "model": "gemini-3.8-flash"}, config_file)
-                migrated = load_portable_config(path)
-
-        self.assertEqual(migrated["provider"], "gemini")
-        self.assertEqual(migrated["api_keys"], {"gemini": "old-gemini-key"})
-        self.assertEqual(migrated["models"], {"gemini": "gemini-3.8-flash"})
 
 
 class PngEncodingTests(unittest.TestCase):
