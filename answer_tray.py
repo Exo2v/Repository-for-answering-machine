@@ -52,35 +52,53 @@ MISTRAL_OCR_MODEL = "mistral-ocr-latest"
 DEFAULT_PROVIDER = "gemini"
 LASSO1_CONFIG_DIRECTORY = "Lasso1"
 LASSV7_CONFIG_DIRECTORY = "LassV7"
+LASSOV2_CONFIG_DIRECTORY = "LassoV2"
+LASSV27_CONFIG_DIRECTORY = "LassV27"
 LASSO1_CONFIG_FILENAME = "config.json"
 _DEFAULT_EXE_NAME = os.path.splitext(os.path.basename(sys.executable))[0].lower()
+_LASSO_CONFIG_DIRECTORIES = {
+    "lasso1": LASSO1_CONFIG_DIRECTORY,
+    "lassv7": LASSV7_CONFIG_DIRECTORY,
+    "lassov2": LASSOV2_CONFIG_DIRECTORY,
+    "lassv27": LASSV27_CONFIG_DIRECTORY,
+}
+_LASSO_APP_NAMES = {
+    "lasso1": "Lasso1",
+    "lassv7": "LassV7",
+    "lassov2": "LassoV2",
+    "lassv27": "LassV27",
+}
 
 
 def lasso_config_directory_for_executable(executable_name: Optional[str] = None) -> Optional[str]:
     """Return the private config directory for a dedicated Lasso executable."""
     name = executable_name or sys.executable
     name = os.path.splitext(os.path.basename(name))[0].lower()
-    return {
-        "lasso1": LASSO1_CONFIG_DIRECTORY,
-        "lassv7": LASSV7_CONFIG_DIRECTORY,
-    }.get(name)
+    return _LASSO_CONFIG_DIRECTORIES.get(name)
+
+
+def lasso_app_name_for_executable(executable_name: Optional[str] = None) -> Optional[str]:
+    """Return the display name for a supported legacy or current Lasso executable."""
+    name = executable_name or sys.executable
+    name = os.path.splitext(os.path.basename(name))[0].lower()
+    return _LASSO_APP_NAMES.get(name)
 
 
 def is_lasso1_executable(executable_name: Optional[str] = None) -> bool:
-    """Identify either OpenRouter-only, tray-only Lasso executable."""
+    """Identify any dedicated OpenRouter-only, tray-only Lasso executable."""
     return lasso_config_directory_for_executable(executable_name) is not None
 
 
 def is_lassv7_executable(executable_name: Optional[str] = None) -> bool:
-    """Identify the Python 3.8 / Windows 7-compatible Lasso package."""
+    """Identify the Python 3.8 / Windows 7-compatible Lasso packages."""
     name = executable_name or sys.executable
-    return os.path.splitext(os.path.basename(name))[0].lower() == "lassv7"
+    return os.path.splitext(os.path.basename(name))[0].lower() in ("lassv7", "lassv27")
 
 
 LASSOV7_MODE = is_lassv7_executable()
 LASSO1_MODE = is_lasso1_executable()
-APP_NAME = "LassV7" if LASSOV7_MODE else "Lasso1" if LASSO1_MODE else "Screen Answer"
-APP_VERSION = "lassv7" if LASSOV7_MODE else "lasso1" if LASSO1_MODE else "1.5.0-experimental"
+APP_NAME = lasso_app_name_for_executable() or "Screen Answer"
+APP_VERSION = APP_NAME.lower() if LASSO1_MODE else "1.5.0-experimental"
 
 
 def default_provider_for_executable(executable_name: str) -> str:
@@ -246,12 +264,18 @@ def _queue_diagnostic_event(
         events.put(("diagnostic", time.strftime("%Y-%m-%d %H:%M:%S"), str(message)))
 
 
-def lasso1_config_path(app_data_root: Optional[str] = None) -> str:
-    """Return the per-user config path for the running Lasso executable."""
+def lasso1_config_path(
+    app_data_root: Optional[str] = None,
+    executable_name: Optional[str] = None,
+) -> str:
+    """Return the per-user config path for the running or named Lasso executable."""
     root = app_data_root or os.environ.get("APPDATA") or os.environ.get("LOCALAPPDATA")
     if not root:
         root = os.path.expanduser("~")
-    config_directory = LASSV7_CONFIG_DIRECTORY if LASSOV7_MODE else LASSO1_CONFIG_DIRECTORY
+    config_directory = lasso_config_directory_for_executable(executable_name)
+    if config_directory is None:
+        # Preserve the historical test/source fallback if no Lasso EXE is selected.
+        config_directory = LASSV7_CONFIG_DIRECTORY if LASSOV7_MODE else LASSO1_CONFIG_DIRECTORY
     return os.path.join(root, config_directory, LASSO1_CONFIG_FILENAME)
 
 
@@ -398,7 +422,9 @@ def schedule_lasso1_self_cleanup(
 ) -> bool:
     """Delete only the running Lasso executable and its matching private config."""
     exe_path = os.path.abspath(executable_path or sys.executable)
-    saved_config_path = os.path.abspath(config_path or lasso1_config_path())
+    saved_config_path = os.path.abspath(
+        config_path or lasso1_config_path(executable_name=exe_path)
+    )
     config_directory = os.path.dirname(saved_config_path)
     expected_config_directory = lasso_config_directory_for_executable(exe_path)
     if (
@@ -3941,7 +3967,11 @@ class ScreenAnswerApp:
             ctypes.c_uint,
         ]
         message_box.restype = ctypes.c_int
-        config_directory = LASSV7_CONFIG_DIRECTORY if LASSOV7_MODE else LASSO1_CONFIG_DIRECTORY
+        config_directory = lasso_config_directory_for_executable(sys.executable)
+        if config_directory is None:
+            config_directory = (
+                LASSV7_CONFIG_DIRECTORY if LASSOV7_MODE else LASSO1_CONFIG_DIRECTORY
+            )
         message = (
             "This permanently deletes %s.exe and %s's config.json "
             "(including its saved OpenRouter key), then closes the app. "
@@ -4322,6 +4352,40 @@ def main() -> int:
             and struct.calcsize("P") == 4
             and diagnostics_page_available((), "LassV7.exe")
             and diagnostics_mode_enabled(("--diagnostics",), "LassV7.exe") is False
+        ) else 1
+    if "--check-lassov2-build" in sys.argv[1:]:
+        return 0 if (
+            LASSO1_MODE
+            and not LASSOV7_MODE
+            and APP_NAME == "LassoV2"
+            and APP_DEFAULT_PROVIDER == "openrouter"
+            and tuple(PROVIDER_LABELS) == ("openrouter",)
+            and tuple(API_KEY_ENV_VARS) == ("openrouter",)
+            and tuple(DEFAULT_MODELS) == ("openrouter",)
+            and DEFAULT_MODELS["openrouter"] == DEFAULT_OPENROUTER_MODEL
+            and valid_model_name("openrouter", DEFAULT_OPENROUTER_MODEL)
+            and lasso_config_directory_for_executable("LassoV2.exe")
+            == LASSOV2_CONFIG_DIRECTORY
+            and diagnostics_page_available((), "LassoV2.exe")
+            and diagnostics_mode_enabled(("--diagnostics",), "LassoV2.exe") is False
+        ) else 1
+    if "--check-lassv27-build" in sys.argv[1:]:
+        return 0 if (
+            LASSO1_MODE
+            and LASSOV7_MODE
+            and APP_NAME == "LassV27"
+            and APP_DEFAULT_PROVIDER == "openrouter"
+            and tuple(PROVIDER_LABELS) == ("openrouter",)
+            and tuple(API_KEY_ENV_VARS) == ("openrouter",)
+            and tuple(DEFAULT_MODELS) == ("openrouter",)
+            and DEFAULT_MODELS["openrouter"] == DEFAULT_OPENROUTER_MODEL
+            and valid_model_name("openrouter", DEFAULT_OPENROUTER_MODEL)
+            and lasso_config_directory_for_executable("LassV27.exe")
+            == LASSV27_CONFIG_DIRECTORY
+            and sys.version_info[:3] == (3, 8, 10)
+            and struct.calcsize("P") == 4
+            and diagnostics_page_available((), "LassV27.exe")
+            and diagnostics_mode_enabled(("--diagnostics",), "LassV27.exe") is False
         ) else 1
     if os.name != "nt":
         print("%s runs on Windows 7/10 and later." % APP_NAME, file=sys.stderr)

@@ -18,6 +18,8 @@ from answer_tray import (
     DEFAULT_GROQ_MODEL,
     DEFAULT_OPENROUTER_MODEL,
     GROQ_FREE_VISION_REASONING_MODELS,
+    LASSOV2_CONFIG_DIRECTORY,
+    LASSV27_CONFIG_DIRECTORY,
     OPENROUTER_FREE_VISION_REASONING_MODELS,
     GROQ_ENDPOINT,
     ScreenAnswerApp,
@@ -41,6 +43,7 @@ from answer_tray import (
     is_lassv7_executable,
     hotkey_specs_for_variant,
     hotkey_event_for_id,
+    lasso_app_name_for_executable,
     lasso_config_directory_for_executable,
     lasso1_config_path,
     lasso1_config_template,
@@ -68,6 +71,8 @@ class DiagnosticsModeTests(unittest.TestCase):
         self.assertFalse(diagnostics_mode_enabled(("--diagnostics",), "LassV7.exe"))
         self.assertTrue(diagnostics_page_available((), "Lasso1.exe"))
         self.assertTrue(diagnostics_page_available((), "LassV7.exe"))
+        self.assertTrue(diagnostics_page_available((), "LassoV2.exe"))
+        self.assertTrue(diagnostics_page_available((), "LassV27.exe"))
         self.assertTrue(
             diagnostics_page_available((), "ScreenAnswer-Diagnostic.exe")
         )
@@ -78,8 +83,12 @@ class Lasso1ModeTests(unittest.TestCase):
     def test_lasso_executables_keep_diagnostics_on_demand_not_autostarted(self):
         self.assertTrue(is_lasso1_executable("Lasso1.exe"))
         self.assertTrue(is_lasso1_executable("LassV7.exe"))
+        self.assertTrue(is_lasso1_executable("LassoV2.exe"))
+        self.assertTrue(is_lasso1_executable("LassV27.exe"))
         self.assertTrue(is_lassv7_executable("LassV7.exe"))
+        self.assertTrue(is_lassv7_executable("LassV27.exe"))
         self.assertFalse(is_lassv7_executable("Lasso1.exe"))
+        self.assertFalse(is_lassv7_executable("LassoV2.exe"))
         self.assertFalse(is_lasso1_executable("ScreenAnswer.exe"))
         self.assertEqual(
             provider_labels_for_executable("Lasso1.exe"),
@@ -91,9 +100,34 @@ class Lasso1ModeTests(unittest.TestCase):
         )
         self.assertEqual(default_provider_for_executable("Lasso1.exe"), "openrouter")
         self.assertEqual(default_provider_for_executable("LassV7.exe"), "openrouter")
+        self.assertEqual(default_provider_for_executable("LassoV2.exe"), "openrouter")
+        self.assertEqual(default_provider_for_executable("LassV27.exe"), "openrouter")
+        self.assertEqual(lasso_config_directory_for_executable("Lasso1.exe"), "Lasso1")
         self.assertEqual(lasso_config_directory_for_executable("LassV7.exe"), "LassV7")
+        self.assertEqual(lasso_app_name_for_executable("Lasso1.exe"), "Lasso1")
+        self.assertEqual(lasso_app_name_for_executable("LassV7.exe"), "LassV7")
+        self.assertEqual(
+            lasso_config_directory_for_executable("LassoV2.exe"),
+            LASSOV2_CONFIG_DIRECTORY,
+        )
+        self.assertEqual(
+            lasso_config_directory_for_executable("LassV27.exe"),
+            LASSV27_CONFIG_DIRECTORY,
+        )
+        self.assertEqual(lasso_app_name_for_executable("LassoV2.exe"), "LassoV2")
+        self.assertEqual(lasso_app_name_for_executable("LassV27.exe"), "LassV27")
+        self.assertEqual(
+            provider_labels_for_executable("LassoV2.exe"),
+            {"openrouter": "OpenRouter"},
+        )
+        self.assertEqual(
+            provider_labels_for_executable("LassV27.exe"),
+            {"openrouter": "OpenRouter"},
+        )
         self.assertFalse(diagnostics_mode_enabled(("--diagnostics",), "Lasso1.exe"))
         self.assertFalse(diagnostics_mode_enabled(("--diagnostics",), "LassV7.exe"))
+        self.assertFalse(diagnostics_mode_enabled(("--diagnostics",), "LassoV2.exe"))
+        self.assertFalse(diagnostics_mode_enabled(("--diagnostics",), "LassV27.exe"))
 
     def test_lasso_only_delete_hotkey_and_config_only_model_default(self):
         ordinary_hotkeys = hotkey_specs_for_variant(False)
@@ -115,6 +149,24 @@ class Lasso1ModeTests(unittest.TestCase):
             with patch("answer_tray.LASSOV7_MODE", True):
                 lassv7_path = lasso1_config_path(directory)
             self.assertEqual(lassv7_path, os.path.join(directory, "LassV7", "config.json"))
+            self.assertEqual(
+                lasso1_config_path(directory, "LassoV2.exe"),
+                os.path.join(directory, LASSOV2_CONFIG_DIRECTORY, "config.json"),
+            )
+            self.assertEqual(
+                lasso1_config_path(directory, "LassV27.exe"),
+                os.path.join(directory, LASSV27_CONFIG_DIRECTORY, "config.json"),
+            )
+            for executable_name in ("LassoV2.exe", "LassV27.exe"):
+                new_path = lasso1_config_path(directory, executable_name)
+                self.assertTrue(ensure_lasso1_config(new_path))
+                with open(new_path, "r", encoding="utf-8") as config_file:
+                    new_config = json.load(config_file)
+                self.assertEqual(new_config["api_keys"], {"openrouter": ""})
+                self.assertEqual(
+                    new_config["models"]["openrouter"], DEFAULT_OPENROUTER_MODEL
+                )
+                self.assertIs(new_config["allow_screenshot_uploads"], False)
 
             self.assertTrue(ensure_lasso1_config(path))
             with open(path, "r", encoding="utf-8") as config_file:
@@ -793,6 +845,17 @@ class Lasso1ModeTests(unittest.TestCase):
             self.assertFalse(
                 schedule_lasso1_self_cleanup(wrong_executable, config_path)
             )
+            self.assertFalse(
+                schedule_lasso1_self_cleanup(
+                    os.path.join(directory, "LassoV2.exe"), config_path
+                )
+            )
+            self.assertFalse(
+                schedule_lasso1_self_cleanup(
+                    os.path.join(directory, "LassV27.exe"),
+                    os.path.join(directory, "LassV7", "config.json"),
+                )
+            )
         self.assertEqual(
             _powershell_string_literal("C:\\Users\\O'Neil\\Lasso1.exe"),
             "'C:\\Users\\O''Neil\\Lasso1.exe'",
@@ -826,6 +889,36 @@ class Lasso1ModeTests(unittest.TestCase):
             with patch("answer_tray.sys.version_info", (3, 8, 10, "final", 0)):
                 with patch("answer_tray.struct.calcsize", return_value=4):
                     with patch("sys.argv", ["LassV7.exe", "--check-lassv7-build"]):
+                        self.assertEqual(main(), 0)
+
+    def test_packaged_lassov2_build_check(self):
+        with patch.multiple(
+            "answer_tray",
+            LASSO1_MODE=True,
+            LASSOV7_MODE=False,
+            APP_NAME="LassoV2",
+            APP_DEFAULT_PROVIDER="openrouter",
+            PROVIDER_LABELS={"openrouter": "OpenRouter"},
+            API_KEY_ENV_VARS={"openrouter": "OPENROUTER_API_KEY"},
+            DEFAULT_MODELS={"openrouter": DEFAULT_OPENROUTER_MODEL},
+        ):
+            with patch("sys.argv", ["LassoV2.exe", "--check-lassov2-build"]):
+                self.assertEqual(main(), 0)
+
+    def test_packaged_lassv27_build_check(self):
+        with patch.multiple(
+            "answer_tray",
+            LASSO1_MODE=True,
+            LASSOV7_MODE=True,
+            APP_NAME="LassV27",
+            APP_DEFAULT_PROVIDER="openrouter",
+            PROVIDER_LABELS={"openrouter": "OpenRouter"},
+            API_KEY_ENV_VARS={"openrouter": "OPENROUTER_API_KEY"},
+            DEFAULT_MODELS={"openrouter": DEFAULT_OPENROUTER_MODEL},
+        ):
+            with patch("answer_tray.sys.version_info", (3, 8, 10, "final", 0)):
+                with patch("answer_tray.struct.calcsize", return_value=4):
+                    with patch("sys.argv", ["LassV27.exe", "--check-lassv27-build"]):
                         self.assertEqual(main(), 0)
 
 
