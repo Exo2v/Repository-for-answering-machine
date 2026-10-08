@@ -1,6 +1,6 @@
 # Screen Answer
 
-A small, user-triggered Windows study helper. The default app uses Python's standard library (including Tkinter from the official Python installer) and Windows APIs through `ctypes`; no `pip` runtime dependencies are required. The experimental Pix2Text build bundles its Python runtime and OCR dependencies, but downloads model weights on first use.
+A small, user-triggered Windows study helper. The default app uses Python's standard library (including Tkinter from the official Python installer) and Windows APIs through `ctypes`; no `pip` runtime dependencies are required. The experimental Pix2Text build bundles its Python runtime and OCR dependencies, but downloads model weights on first use. For the complete v1.6.0 APInex/Ollama architecture, request flow, privacy model, validation status, and setup steps, see the [detailed implementation guide](docs/v1.6.0-apinex-ollama-implementation-guide.md).
 
 ## Privacy and behavior
 
