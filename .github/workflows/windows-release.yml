@@ -12,6 +12,7 @@ on:
       - "**"
     tags:
       - "v*"
+      - "otter*"
 
 permissions:
   contents: write
@@ -59,11 +60,16 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Attach assets to a v* release
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Attach assets to a release
+        if: startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/otter')
         uses: softprops/action-gh-release@v2
         with:
+          name: ${{ github.ref_name }}
           files: |
             dist/ScreenAnswer.exe
             dist/ScreenAnswer-Diagnostic.exe
+          body: |
+            Screen Answer v1 — silent tray sphere (color = answer: red=1, yellow=2, green=3, blue=4), GUI + diagnostics console, Ctrl+Alt+S capture, Ctrl+Alt+O silent deletion, FreeLLMAPI gateway with live web search.
+
+            Setup: docs/gateway-setup.md · Design: docs/freellmapi-gateway-architecture.md
           prerelease: ${{ contains(github.ref_name, '-') }}
