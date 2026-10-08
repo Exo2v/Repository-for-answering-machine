@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+/build/
+/dist/
+*.spec
+/screen_answer_config.json
