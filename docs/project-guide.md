@@ -25,18 +25,18 @@ The app is not a continuous screen recorder, browser extension, hosted backend, 
 
 The project has evolved to accommodate two different use cases:
 
-- **Standard Screen Answer:** a general Windows app where the user can choose among hosted providers and a local model. The v1.6.0 line introduced APInex as the default and Ollama for local inference; the v1.7.0 build adds `free/gpt-6-luna` as an optional APInex model while keeping the existing default. Mistral and OpenRouter remain available.
+- **Standard Screen Answer:** a general Windows app where the user can choose among APInex, direct Google Gemini, Mistral, OpenRouter, and local Ollama. APInex remains the default, while direct Gemini uses Google's official API and a separate Google AI Studio key. The v1.7.0 build adds `free/gpt-6-luna` as an optional APInex model without changing that default.
 - **Lasso variants:** the existing Lasso1/LassV7 and LassoV2/LassV27 families remain OpenRouter-only and unchanged. A new Lasso family adds APInex plus OpenRouter, with model IDs kept only in per-user config, explicit upload consent, silent scoped cleanup, and on-demand diagnostics. Its Windows 11 and Windows 7 builds use separate names/config folders.
 - **Optional Pix2Text build:** a much larger experimental 64-bit build that adds local OCR. OCR extracts text and formulas; it does not solve the problem. The solver still receives the screenshot and, depending on provider, its OCR transcript.
 - **Diagnostic build:** the standard program with a live diagnostics window opened automatically, for detailed testing of captures, OCR, network requests, response parsing, and errors.
 
-The direct Google Gemini and Groq integrations were removed from the standard v1.6.0 test version because they were not working for the user. This is a provider change, not a rule banning every Google-family model name: APInex's default catalog alias still contains `gemini`, and OpenRouter's approved models still contain `google/gemma`. Those requests go through APInex or OpenRouter, not Google's direct API. If all Google-family model IDs are prohibited, the model choices must be replaced explicitly.
+The direct Google Gemini route was removed from the v1.6.0 test snapshot, then restored as a separate standard-app provider using Google's direct API. It requires its own Google AI Studio key and uses direct Google model IDs (default `gemini-3.8-flash`), distinct from APInex's `free/gemini-3.8-flash` alias. Groq remains removed. The dedicated Lasso families still do not include direct Gemini.
 
 ## 3. Product/build families at a glance
 
 | Family | Main executables | Providers | Settings and behavior | Distribution status |
 | --- | --- | --- | --- | --- |
-| Standard | `ScreenAnswer.exe` | APInex (default), Ollama (local), Mistral, OpenRouter | Provider/model/OCR controls in standard Settings; consent starts off for every run | Current `v1.7.0-experimental` release |
+| Standard | `ScreenAnswer.exe` | APInex (default), Google Gemini, Ollama (local), Mistral, OpenRouter | Provider/model/OCR controls in standard Settings; Gemini has its own API key and direct model ID; consent starts off for every run | Current `v1.7.0-experimental` release; new Gemini integration is in the current branch build |
 | Standard diagnostics | `ScreenAnswer-Diagnostic.exe` | Same standard provider set | Same app, but opens the live diagnostic window at startup | Included in `v1.7.0-experimental` |
 | Optional local OCR | `ScreenAnswer-Pix2Text.exe` | Same solver set; Pix2Text OCR is selected by default in that named build | 64-bit Windows 10+ experimental package; large dependencies, model weights downloaded separately | Published in `v1.3.0-experimental`; source/workflow can build it again on demand |
 | Legacy Lasso | `Lasso1.exe`, `LassV7.exe` | OpenRouter only | Per-user config; Settings opens only on demand; no model field in GUI; `LassV7` suppresses balloons/tooltips | Public `lasso1` release |
@@ -52,6 +52,7 @@ The direct Google Gemini and Groq integrations were removed from the standard v1
 - **v1.4.0-experimental and v1.5.0-experimental:** continued the standard experimental line. The v1.5.0 release included standard/diagnostic builds and a historical Groq executable.
 - **v1.6.0-experimental:** replaced direct Google Gemini and Groq integrations in the standard test version with APInex and local Ollama, while keeping Mistral and OpenRouter as choices. This tests a hosted intermediary and an on-device alternative without changing the separate Lasso provider scope.
 - **v1.7.0-experimental:** adds the optional APInex free-category vision ID `free/gpt-6-luna`; `free/gemini-3.8-flash` remains the default. The account-level allowance and billing behavior still need live confirmation.
+- **Current branch update:** restores Google Gemini as an independent standard Screen Answer provider through Google's `generateContent` REST API. It uses `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) and defaults to `gemini-3.8-flash`; it does not alter APInex's alias or any Lasso provider set.
 - **Lasso releases/builds:** the legacy Lasso1/LassV7 and LassoV2/LassV27 families remain OpenRouter-only. The new Lasso family adds APInex and OpenRouter with config-only model IDs and Windows 11/Windows 7 builds; it does not overwrite the earlier families.
 
 The overall reason for these branches is controlled experimentation: compare a small, explicit provider set, local OCR and inference options, response reliability, cost/quota behavior, and the privacy consequences of each route before expanding distribution. The project's latest release remains marked experimental for that reason.
@@ -86,9 +87,9 @@ Capture full Windows virtual desktop to PNG in memory
                       │
                       ▼
 Dispatch one selected backend (provider default varies)
-       ┌─────────┬─────────┬─────────┬─────────────┐
-       │ APInex  │ Ollama  │ Mistral │ OpenRouter  │
-       └─────────┴─────────┴─────────┴─────────────┘
+┌─────────┬─────────────┬─────────┬─────────┬─────────────┐
+│ APInex  │ Google Gemini │ Ollama  │ Mistral │ OpenRouter  │
+└─────────┴─────────────┴─────────┴─────────┴─────────────┘
                       │
                       ▼
 Parse an explicit ANSWER line; do not infer from arbitrary digits
@@ -116,13 +117,14 @@ Tray color for positions 1–4; neutral on no reliable result/error
 | Provider | App endpoint | Default model | Credential | Default image/OCR route |
 | --- | --- | --- | --- | --- |
 | APInex | `https://api.apinex.bond/v1/chat/completions` | `free/gemini-3.8-flash` | `APINEX_API_KEY` | Direct screenshot to APInex vision chat; no separate OCR request |
+| Google Gemini | `https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent` | `gemini-3.8-flash` | `GEMINI_API_KEY` or `GOOGLE_API_KEY` | Direct screenshot to Google's vision API; one request normally; no search/tools |
 | Ollama | `http://127.0.0.1:11434/api/chat` | `qwen3-vl:8b` | None | Screenshot to local Ollama vision chat; no cloud API request from this app |
 | Mistral | `https://api.mistral.ai/v1/chat/completions` and `https://api.mistral.ai/v1/ocr` | `mistral-medium-latest` | `MISTRAL_API_KEY` | Provider-default OCR request then chat; Pix2Text can replace hosted OCR |
 | OpenRouter | `https://openrouter.ai/api/v1/chat/completions` | `google/gemma-4-31b-it:free` | `OPENROUTER_API_KEY` | Direct vision chat through OpenRouter; no separate OCR request |
 
-APInex, Mistral, and OpenRouter are the only hosted providers with API-key support in standard Screen Answer; Ollama has no key. The exact model IDs and policies are enforced by code. There is no cross-provider failover.
+APInex, Google Gemini, Mistral, and OpenRouter are the hosted providers with API-key support in standard Screen Answer; Ollama has no key. Gemini uses a distinct Google key and direct Google model ID. The exact model prefix and policies are validated by code. There is no cross-provider failover.
 
-Hosted requests make at most three attempts for retryable errors. Rate-limit handling uses the provider's `Retry-After` value when available but will not wait indefinitely; temporary server errors use short bounded backoff. Per-attempt timeouts are 120 seconds for APInex, 60 seconds for Mistral and OpenRouter, and 300 seconds for Ollama. The response-body limit is 2 MiB. Output token caps are 2,048 for APInex/Ollama and 4,096 for Mistral/OpenRouter. These are bounds, not promises about end-to-end completion time (Mistral can make separate OCR and chat requests).
+Hosted requests make at most three attempts for retryable errors. Google Gemini does not retry HTTP 429 quota/rate-limit responses; transient 5xx responses use bounded backoff. Other providers use their existing bounded retry behavior and provider `Retry-After` values when available. Per-attempt timeouts are 120 seconds for APInex, 60 seconds for Gemini, Mistral and OpenRouter, and 300 seconds for Ollama. The response-body limit is 2 MiB. Output token caps are 2,048 for APInex/Gemini/Ollama and 4,096 for Mistral/OpenRouter. These are bounds, not promises about end-to-end completion time (Mistral can make separate OCR and chat requests).
 
 ### 5.1 APInex
 
@@ -138,7 +140,13 @@ The app handles authentication, account quota, payload-size, rate-limit, missing
 
 APInex publicly describes a 1-million-token daily allowance for free-category models and a 5-request/minute/IP rate limit. Its [pricing page](https://apinex.bond/pricing) marks `free/gpt-6-luna` free in APInex's price columns, while the [live developer model catalog](https://apinex.bond/developers/models) lists $0.75 per 1M tokens for that same ID. This conflict means the exact account-level allowance and post-quota billing behavior remain unverified. The app treats the ID as a curated free-category choice, not a guarantee of zero cost; check the account usage/balance before use. GPT-6 Luna's [model specification](https://developers.openai.com/api/docs/models/gpt-6-luna) lists text and image input, and APInex's [chat API documentation](https://apinex.bond/developers/models/chat) documents image content parts; this project has not tested live image inference through APInex.
 
-### 5.2 Ollama
+### 5.2 Google Gemini (direct)
+
+The standard app can call Google's Gemini API directly using the REST `generateContent` method at `https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent`. The model defaults to `gemini-3.8-flash`, which Google's current [model catalog](https://ai.google.dev/gemini-api/docs/models) lists as stable and multimodal. The app sends the API key in the `x-goog-api-key` header, never in the URL; `GEMINI_API_KEY` is the preferred environment variable, with `GOOGLE_API_KEY` supported as an alias. The standard Settings model field accepts only a bounded `gemini-*` model ID. Billing, quotas, model availability, and data terms are those of the user's Google project—not APInex's free-category allowance.
+
+The request includes the user's prompt and in-memory PNG as `inlineData`; it does not enable Google Search, tools, or server-side conversation state. Gemini thought parts are filtered from the visible answer. HTTP 429 quota/rate-limit errors are not retried; transient server errors may use up to three attempts. Provider tests mock the REST endpoint; no live Gemini key or paid request was used.
+
+### 5.3 Ollama
 
 Ollama is a local-service option, not a hosted key provider. The app posts to the fixed loopback URL `127.0.0.1:11434` and supplies the PNG as base64 in the chat message's `images` list. It sends no Authorization header. The default `qwen3-vl:8b` must be downloaded separately:
 
@@ -148,7 +156,7 @@ ollama pull qwen3-vl:8b
 
 The model listing reviewed for this project requires Ollama 0.12.7 or later and is about 6 GB. Hardware requirements, load time, speed, and answer quality vary. The app does not bundle Ollama, weights, or a remote Ollama URL. If the local service is unreachable, the app asks the user to start it; a missing model error includes a `ollama pull <model>` hint. Custom model names can be syntax-validated, but the app cannot guarantee they exist or accept images before calling the service.
 
-### 5.3 Mistral
+### 5.4 Mistral
 
 Mistral is retained as an editable hosted provider. With **Provider default** OCR, the flow is:
 
@@ -159,7 +167,7 @@ screenshot → Mistral OCR → first-page Markdown transcript
 
 If the OCR request fails, the app may continue with the original image in chat. When local Pix2Text is selected, the app skips the separate Mistral OCR endpoint but still sends the screenshot and OCR transcript to Mistral chat. Existing config values for the retired default `ministral-14b-2512` are upgraded to `mistral-medium-latest`.
 
-### 5.4 OpenRouter
+### 5.5 OpenRouter
 
 OpenRouter remains in both the standard app and dedicated Lasso builds. Standard app provider choices are restricted to two exact explicit `:free` IDs:
 
@@ -172,7 +180,7 @@ Paid/unqualified/online-search IDs are rejected by validation; the app does not 
 
 ### Provider default versus Pix2Text
 
-- **Provider default:** APInex, Ollama, and OpenRouter receive a direct image+prompt request. Mistral performs a separate hosted OCR request before chat.
+- **Provider default:** APInex, Google Gemini, Ollama, and OpenRouter receive a direct image+prompt request. Mistral performs a separate hosted OCR request before chat.
 - **Pix2Text (local):** Pix2Text runs locally and produces text/formula Markdown. The model still receives the original screenshot along with a bounded, explicitly untrusted OCR transcript. Pix2Text is not an AI answer solver and is not a way to keep data private when the chosen solver is hosted.
 - If local OCR errors or returns no text, the app continues with the screenshot and no OCR context when the solver supports vision.
 - OCR context is capped at 48,000 characters. Diagnostic OCR excerpts are capped, but can include text seen on screen.
@@ -194,15 +202,15 @@ That file pins Pix2Text 1.1.7, constrains NumPy below 2, and keeps Transformers 
 
 ### Standard Screen Answer
 
-- The default provider is APInex. The standard Settings GUI has a provider menu, OCR menu, hosted API-key entry, model field, optional portable-config checkbox, data-path consent checkbox, capture/save/exit controls, and status text.
+- The default provider is APInex. The standard Settings GUI has a provider menu, OCR menu, hosted API-key entry, model field, optional portable-config checkbox, data-path consent checkbox, capture/save/exit controls, and status text. Direct Google Gemini has its own key/model entry and Google consent notice.
 - Provider/model settings are user-selectable in the standard GUI. This is different from the dedicated Lasso GUI, which has no model field.
 - The default standard configuration path is `screen_answer_config.json` beside the Python source or frozen executable. The file is only written when the user selects portable saving.
 - With portable saving off, saved settings stay in memory for that run. If a portable sidecar exists and the user turns the option off when saving, the app removes that sidecar.
 - The sidecar is plaintext. It can contain hosted provider keys and model names, so protect it like a password file. Do not put it in a public archive or release.
 - Standard upload consent is session-only; every new run starts with consent off, even when a sidecar contains API keys/models.
-- Environment key lookup supports `APINEX_API_KEY`, `MISTRAL_API_KEY`, and `OPENROUTER_API_KEY`. An environment key may prefill the masked Settings entry. Ollama always resolves to no key.
+- Environment key lookup supports `APINEX_API_KEY`, `GEMINI_API_KEY` (or `GOOGLE_API_KEY`), `MISTRAL_API_KEY`, and `OPENROUTER_API_KEY`. An environment key may prefill the masked Settings entry. Ollama always resolves to no key.
 
-The loader filters retired/unknown provider fields, resets invalid APInex/OpenRouter model IDs to safe defaults, rejects malformed Ollama model strings, and does not reinterpret an old unscoped Google/Groq key as an APInex key. If it can write the sidecar, it removes retired Google/Groq settings. The config migrates the old Mistral model default as noted above. The sidecar path is ignored by `.gitignore` and is not included in release artifacts.
+The loader filters unknown provider aliases and Groq settings, resets invalid APInex/Gemini/OpenRouter model IDs to safe defaults, rejects malformed Ollama model strings, and never moves an unscoped legacy key to another provider. A scoped `gemini` key is retained only for the direct Google Gemini provider; it is never treated as an APInex key. The config migrates the old Mistral model default as noted above. The sidecar path is ignored by `.gitignore` and is not included in release artifacts.
 
 ### Dedicated Lasso builds
 
@@ -285,11 +293,11 @@ Run the platform-independent test suite with:
 python -m unittest discover -s tests -v
 ```
 
-The v1.7.0 baseline had 68 tests; the current working-tree suite has 81. Provider tests mock `urllib.request.urlopen`; they inspect payloads, model allowlists, redaction, retries, local endpoint errors, OCR context, and answer parsing without using a real key or service. Tests also cover config migration, no-key Ollama Settings behavior, upload consent, Lasso config paths and UI behavior, the new APInex/OpenRouter Lasso family, on-demand diagnostic-console lifecycle, tray notification suppression, self-cleanup scope, PNG encoding, and Pix2Text API import/behavior. No live inference is performed.
+The v1.7.0 baseline had 68 tests; the current working-tree suite has 86. Provider tests mock `urllib.request.urlopen`; they inspect payloads, model allowlists, redaction, retries, local endpoint errors, OCR context, Gemini image payloads, and answer parsing without using a real key or service. Tests also cover config migration, provider selection and consent behavior, Lasso config paths and UI behavior, the APInex/OpenRouter Lasso family, on-demand diagnostic-console lifecycle, tray notification suppression, self-cleanup scope, PNG encoding, and Pix2Text API import/behavior. No live inference is performed.
 
 The EXEs support build smoke-check flags:
 
-- `--check-apinex-ollama` — checks standard defaults, provider registry, endpoints, valid default models, and keyless Ollama policy.
+- `--check-apinex-ollama` — checks the standard provider registry (including direct Gemini), endpoints, valid models, and keyless Ollama policy.
 - `--check-openrouter-support` — checks OpenRouter provider/key/model/endpoint wiring.
 - `--check-lasso1-build`, `--check-lassv7-build`, `--check-lassov2-build`, `--check-lassv27-build`, `--check-lasso-build`, `--check-lassowin7-build` — verify expected executable identity, provider scope, model policy, config folder, diagnostics mode, and Python version/bitness where applicable.
 - `--check-pix2text` — smoke-tests that the bundled Pix2Text API imports; it does not download model weights or test recognition quality.
@@ -301,7 +309,7 @@ The v1.6.0 Windows release workflow and a subsequent branch build have previousl
 
 ### Standard Windows packages
 
-The standard release workflow runs on branch pushes and on `v*` tags. It uses Windows Server 2022, 32-bit Python 3.8.10, and PyInstaller 5.13.2, runs the tests, builds `ScreenAnswer.exe` and `ScreenAnswer-Diagnostic.exe`, and smoke-checks APInex/Ollama and OpenRouter. A `v*` tag then attaches the two EXEs to a prerelease/release according to the tag name. For the best chance of Windows 7 compatibility, the standard package uses 32-bit Python 3.8.10. The CI runner is Windows Server 2022, not Windows 7, so Windows 7 is a compatibility target rather than an OS version exercised by that workflow.
+The standard release workflow runs on branch pushes and on `v*` tags. It uses Windows Server 2022, 32-bit Python 3.8.10, and PyInstaller 5.13.2, runs the tests, builds `ScreenAnswer.exe` and `ScreenAnswer-Diagnostic.exe`, and smoke-checks APInex, direct Gemini, Ollama, and OpenRouter. A `v*` tag then attaches the two EXEs to a prerelease/release according to the tag name. For the best chance of Windows 7 compatibility, the standard package uses 32-bit Python 3.8.10. The CI runner is Windows Server 2022, not Windows 7, so Windows 7 is a compatibility target rather than an OS version exercised by that workflow.
 
 A local standard build can be made on Windows with a compatible Python/Tkinter environment:
 
@@ -363,15 +371,15 @@ For `lasso2`, use the equivalent command only after verifying that the LassoV2/L
 ### Basic standard-app use
 
 1. Download the current `ScreenAnswer.exe` from [v1.7.0-experimental](https://github.com/Exo2v/indigo-otter-731/releases/tag/v1.7.0-experimental), or run `answer_tray.py` with Python/Tkinter.
-2. Open Settings from the tray and select APInex, Ollama, Mistral, or OpenRouter.
-3. For APInex/Mistral/OpenRouter, enter the appropriate key (or configure the documented environment variable). Never ask anyone to paste a key into a public issue/chat.
+2. Open Settings from the tray and select APInex, Google Gemini, Ollama, Mistral, or OpenRouter.
+3. For APInex/Gemini/Mistral/OpenRouter, enter the appropriate key (or configure the documented environment variable). Never ask anyone to paste a key into a public issue/chat.
 4. For Ollama, install Ollama 0.12.7+ and run `ollama pull qwen3-vl:8b`. Start the local server and select Ollama; no key is required.
 5. Read the matching upload/data-path notice, select consent, and save. Standard consent starts unchecked after each app launch.
 6. Use a synthetic/non-sensitive screenshot first; press `Ctrl+Alt+S` only after checking the screen contents.
 
 ### New Lasso family (when the `lasso3` release is published)
 
-1. Choose `Lasso.exe` for the 64-bit Windows 11 target or `LassoWin7.exe` for the 32-bit Windows 7 target. The CI workflow is configured for both; neither Windows build has been executed from this worktree yet.
+1. Choose `Lasso.exe` for the 64-bit Windows 11 target or `LassoWin7.exe` for the 32-bit Windows 7 target. CI has packaged both targets; neither was runtime-tested on a physical Windows 11/Windows 7 machine.
 2. On first launch the app creates its matching `%APPDATA%` config with blank APInex/OpenRouter keys and screenshot consent off, then opens Settings automatically because the selected provider key is missing. Choose a provider, enter its key, and explicitly enable consent if you accept the upload route. **Save** closes Settings; after a key is stored, Settings is available from the tray on demand.
 3. APInex is the default provider/model. OpenRouter is limited to two explicit Gemma `:free` vision IDs; this Lasso family accepts only `free/gemini-3.8-flash` and `free/gemini-3.1-pro` on APInex. Model names are never shown in Settings: change the selected provider's `models` entry in the config and restart. The GPT-6 Luna alternative is confined to standard Screen Answer. No paid or cross-provider fallback is used; verify APInex quota/pricing in the user's account.
 4. **Ctrl+Alt+S** sends the full desktop only after consent. A separate diagnostic console opens only when explicitly requested. It can contain OCR/model text or provider errors; API keys and screenshot pixels are omitted. `Ctrl+Alt+O` silently schedules cleanup of only the running executable and matching config; the tray-menu self-destruct command remains confirmation-gated.
@@ -383,6 +391,7 @@ For `lasso2`, use the equivalent command only after verifying that the LassoV2/L
 | --- | --- |
 | Capture blocked before a request | Enter a hosted key if needed, acknowledge the current provider/OCR notice, and save. Switching provider/OCR resets consent. |
 | APInex key/account error | Check `APINEX_API_KEY` or Settings entry, account permissions, rate limit, free allowance, and billing state. A `402` should prompt account/allowance review; do not assume free status. |
+| Gemini key/model/quota error | Check `GEMINI_API_KEY`/`GOOGLE_API_KEY`, the Google AI Studio project, direct model ID (default `gemini-3.8-flash`), billing/quota and image input support. HTTP 429 is not retried. |
 | Ollama connection error | Ensure Ollama is installed and running at `127.0.0.1:11434`; the app does not install/start the service for you. |
 | Ollama model not found | Pull the exact model ID (default `ollama pull qwen3-vl:8b`) and ensure the selected model supports vision. |
 | Grey result after successful request | Check diagnostic output for a missing/ambiguous `ANSWER: n`, multiple questions, unreadable image, or unsupported question type. Neutral means no reliable position was extracted. |
@@ -395,8 +404,8 @@ For `lasso2`, use the equivalent command only after verifying that the LassoV2/L
 
 ### Implemented in source and workflow configuration
 
-- Standard APInex/Ollama/Mistral/OpenRouter provider set, consent UX, config filtering, and API request implementations.
-- Direct Google/Gemini and Groq provider paths removed from the standard build; historical Groq release assets remain historical, not current.
+- Standard APInex/direct Gemini/Ollama/Mistral/OpenRouter provider set, consent UX, config filtering, and API request implementations. Direct Gemini uses a separate Google API key/model ID and is intentionally limited to standard Screen Answer.
+- Groq provider support remains removed from the standard build; historical Groq release assets are not current.
 - Existing Lasso1/LassV7 and LassoV2/LassV27 remain OpenRouter-only and separate. The new Lasso source adds APInex/OpenRouter, per-variant config, config-only model selection, explicit consent, and on-demand console diagnostics.
 - Full-desktop capture, tray color reporting, OCR options, diagnostics, and multiple-choice parsing.
 - Offline test coverage, including mocked API request formatting and new Lasso behavior. Separate Win11/x64 and Win7/x86 build/release jobs are configured.

@@ -30,6 +30,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Optional, Tuple
 
 DEFAULT_APINEX_MODEL = "free/gemini-3.8-flash"
+DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
 DEFAULT_OLLAMA_MODEL = "qwen3-vl:8b"
 DEFAULT_MISTRAL_MODEL = "mistral-medium-latest"
 DEFAULT_OPENROUTER_MODEL = "google/gemma-4-31b-it:free"
@@ -150,17 +151,21 @@ APP_DEFAULT_PROVIDER = default_provider_for_executable(sys.executable)
 DEFAULT_OCR_BACKEND = "pix2text" if "pix2text" in _DEFAULT_EXE_NAME else "provider"
 _ALL_PROVIDER_LABELS = {
     "apinex": "APInex",
+    "gemini": "Google Gemini",
     "ollama": "Ollama (local)",
     "mistral": "Mistral",
     "openrouter": "OpenRouter",
 }
 _ALL_API_KEY_ENV_VARS = {
     "apinex": "APINEX_API_KEY",
+    "gemini": "GEMINI_API_KEY",
     "mistral": "MISTRAL_API_KEY",
     "openrouter": "OPENROUTER_API_KEY",
 }
+_API_KEY_ENV_ALIASES = {"gemini": ("GOOGLE_API_KEY",)}
 _ALL_DEFAULT_MODELS = {
     "apinex": DEFAULT_APINEX_MODEL,
+    "gemini": DEFAULT_GEMINI_MODEL,
     "ollama": DEFAULT_OLLAMA_MODEL,
     "mistral": DEFAULT_MISTRAL_MODEL,
     "openrouter": DEFAULT_OPENROUTER_MODEL,
@@ -201,6 +206,8 @@ def valid_model_name(provider: str, model: str) -> bool:
     provider = provider.lower()
     if provider == "apinex":
         return model in APINEX_FREE_VISION_MODELS
+    if provider == "gemini":
+        return bool(re.fullmatch(r"gemini-[A-Za-z0-9._-]{1,100}", model))
     if provider == "ollama":
         # Ollama model names may include a namespace and a tag (for example
         # qwen3-vl:8b); block whitespace, query strings, and header-like input.
@@ -261,6 +268,7 @@ def hotkey_event_for_id(hotkey_id: int, lasso1_mode: bool) -> Optional[Tuple[Any
 
 
 APINEX_ENDPOINT = "https://api.apinex.bond/v1/chat/completions"
+GEMINI_API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 OLLAMA_ENDPOINT = "http://127.0.0.1:11434/api/chat"
 MISTRAL_ENDPOINT = "https://api.mistral.ai/v1/chat/completions"
 MISTRAL_OCR_ENDPOINT = "https://api.mistral.ai/v1/ocr"
@@ -285,6 +293,7 @@ MAX_API_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_API_ATTEMPTS = 3
 MAX_RETRY_AFTER_SECONDS = 30
 MAX_APINEX_OUTPUT_TOKENS = 2048
+MAX_GEMINI_OUTPUT_TOKENS = 2048
 MAX_OLLAMA_OUTPUT_TOKENS = 2048
 OLLAMA_TIMEOUT_SECONDS = 300
 MAX_MISTRAL_OUTPUT_TOKENS = 4096
@@ -792,7 +801,7 @@ def _empty_portable_config() -> Dict[str, Any]:
 
 
 def load_portable_config(path: Optional[str] = None) -> Dict[str, Any]:
-    """Load current provider settings and safely discard retired Google/Groq credentials."""
+    """Load supported provider settings and discard unknown legacy provider aliases."""
     config_path = path or portable_config_path()
     try:
         with open(config_path, "r", encoding="utf-8") as config_file:
@@ -806,8 +815,8 @@ def load_portable_config(path: Optional[str] = None) -> Dict[str, Any]:
     if isinstance(raw_provider, str) and raw_provider.lower() in PROVIDER_LABELS:
         provider = raw_provider.lower()
     else:
-        # A provider-less legacy config came from the retired Gemini-only app.
-        # Never reinterpret its old key as an APInex credential.
+        # Do not infer a provider from an unscoped key or model; choose the safe
+        # standard default and leave any unsupported credentials unused.
         provider = APP_DEFAULT_PROVIDER
 
     api_keys: Dict[str, str] = {}
@@ -823,8 +832,8 @@ def load_portable_config(path: Optional[str] = None) -> Dict[str, Any]:
             ):
                 api_keys[normalized_provider] = key_value.strip()
     legacy_key = raw_config.get("api_key")
-    # Only migrate an unscoped key when the old config explicitly named a provider
-    # that still exists. In particular, do not send an old Google/Groq key to APInex.
+    # Only migrate an unscoped key when the config explicitly names a supported
+    # provider; never guess that a legacy Google/Groq key belongs to APInex.
     if (
         isinstance(raw_provider, str)
         and raw_provider.lower() in PROVIDER_LABELS
@@ -858,6 +867,7 @@ def load_portable_config(path: Optional[str] = None) -> Dict[str, Any]:
         models["mistral"] = DEFAULT_MISTRAL_MODEL
     for restricted_provider, default_model in (
         ("apinex", DEFAULT_APINEX_MODEL),
+        ("gemini", DEFAULT_GEMINI_MODEL),
         ("ollama", DEFAULT_OLLAMA_MODEL),
         ("openrouter", DEFAULT_OPENROUTER_MODEL),
     ):
@@ -942,9 +952,14 @@ def resolve_api_key(
 
     env = os.environ if environment is None else environment
     env_name = API_KEY_ENV_VARS.get(provider)
-    environment_key = env.get(env_name, "").strip() if env_name else ""
-    if environment_key:
-        return environment_key, "environment variable"
+    env_names = ([env_name] if env_name else []) + list(_API_KEY_ENV_ALIASES.get(provider, ()))
+    for candidate_name in env_names:
+        environment_key = env.get(candidate_name, "").strip()
+        if environment_key:
+            source = "environment variable"
+            if candidate_name != env_name:
+                source += " (%s)" % candidate_name
+            return environment_key, source
     return (saved_key, "portable config sidecar" if saved_key else "not configured")
 
 
@@ -997,6 +1012,7 @@ def save_portable_config(
         saved_models[selected_provider] = model.strip()
     for restricted_provider, default_model in (
         ("apinex", DEFAULT_APINEX_MODEL),
+        ("gemini", DEFAULT_GEMINI_MODEL),
         ("ollama", DEFAULT_OLLAMA_MODEL),
         ("openrouter", DEFAULT_OPENROUTER_MODEL),
     ):
@@ -1358,6 +1374,54 @@ def _extract_mistral_text(response_data: Dict[str, Any]) -> str:
     return ""
 
 
+def _extract_gemini_text(response_data: Dict[str, Any]) -> str:
+    """Return user-facing text while omitting Gemini thought parts."""
+    if not isinstance(response_data, dict):
+        return ""
+    candidates = response_data.get("candidates")
+    if not isinstance(candidates, list) or not candidates or not isinstance(candidates[0], dict):
+        return ""
+    content = candidates[0].get("content")
+    if not isinstance(content, dict):
+        return ""
+    parts = content.get("parts")
+    if not isinstance(parts, list):
+        return ""
+    return "".join(
+        part.get("text", "")
+        for part in parts
+        if isinstance(part, dict)
+        and part.get("thought") is not True
+        and isinstance(part.get("text"), str)
+    ).strip()
+
+
+def _log_gemini_response_metadata(
+    response_data: Dict[str, Any],
+    report: Callable[[str], None],
+) -> None:
+    """Log Gemini model and token counts without logging response reasoning."""
+    model = response_data.get("modelVersion", "not provided")
+    if not isinstance(model, str):
+        model = "not provided"
+    model = model.replace("\\r", " ").replace("\\n", " ")[:100]
+    report("Google Gemini response metadata: model=%s." % model)
+    usage = response_data.get("usageMetadata")
+    if isinstance(usage, dict):
+        fields = (
+            ("promptTokenCount", "input tokens"),
+            ("candidatesTokenCount", "output tokens"),
+            ("totalTokenCount", "total tokens"),
+        )
+        counts = [
+            "%s=%d" % (label, usage[field])
+            for field, label in fields
+            if isinstance(usage.get(field), int) and not isinstance(usage.get(field), bool)
+        ]
+        if counts:
+            report("Google Gemini token usage: %s." % ", ".join(counts))
+
+
 def _log_apinex_response_metadata(
     response_data: Dict[str, Any],
     report: Callable[[str], None],
@@ -1516,6 +1580,200 @@ def _apinex_post_json(
             report("APInex request timed out after %.2f seconds." % (time.monotonic() - attempt_started))
             raise RuntimeError("The APInex request timed out. Please try again.")
     raise RuntimeError("APInex did not return a response.")
+
+
+def _gemini_post_json(
+    api_key: str,
+    model: str,
+    request_body: Dict[str, Any],
+    report: Callable[[str], None],
+) -> Dict[str, Any]:
+    """POST a bounded Gemini generateContent request; do not retry quota HTTP 429s."""
+    if not isinstance(api_key, str) or not api_key.strip():
+        raise RuntimeError("Enter a Google Gemini API key before sending a screenshot.")
+    encoded_body = json.dumps(request_body, separators=(",", ":")).encode("utf-8")
+    endpoint = "%s/models/%s:generateContent" % (GEMINI_API_BASE_URL, model)
+    for attempt in range(MAX_API_ATTEMPTS):
+        request = urllib.request.Request(
+            endpoint,
+            data=encoded_body,
+            headers={
+                "Content-Type": "application/json; charset=utf-8",
+                "x-goog-api-key": api_key.strip(),
+            },
+            method="POST",
+        )
+        attempt_started = time.monotonic()
+        report(
+            "Google Gemini HTTP attempt %d/%d started (request body %d bytes; key omitted)."
+            % (attempt + 1, MAX_API_ATTEMPTS, len(encoded_body))
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                response_bytes = response.read(MAX_API_RESPONSE_BYTES + 1)
+                headers = getattr(response, "headers", None)
+                status = getattr(response, "status", None)
+                if status is None:
+                    getcode = getattr(response, "getcode", None)
+                    status = getcode() if getcode is not None else "unknown"
+            _report_rate_limit_headers(headers, "Google Gemini", report)
+            report(
+                "Google Gemini HTTP attempt %d/%d received status %s and %d response bytes in %.2f seconds."
+                % (
+                    attempt + 1,
+                    MAX_API_ATTEMPTS,
+                    status,
+                    len(response_bytes),
+                    time.monotonic() - attempt_started,
+                )
+            )
+            if len(response_bytes) > MAX_API_RESPONSE_BYTES:
+                raise RuntimeError("Google Gemini returned an unexpectedly large response.")
+            try:
+                response_data = json.loads(response_bytes.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                raise RuntimeError("Google Gemini returned a response that could not be read.")
+            if not isinstance(response_data, dict):
+                raise RuntimeError("Google Gemini returned an invalid response.")
+            return response_data
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            headers = getattr(exc, "headers", None)
+            error_message = ""
+            try:
+                error_bytes = exc.read(4096)
+                error_payload = json.loads(error_bytes.decode("utf-8")) if error_bytes else {}
+                error_value = error_payload.get("error") if isinstance(error_payload, dict) else None
+                if isinstance(error_value, dict):
+                    error_value = error_value.get("message") or error_value.get("status")
+                if isinstance(error_value, str):
+                    error_message = error_value.replace("\\r", " ").replace("\\n", " ")[:400]
+            except (AttributeError, UnicodeDecodeError, ValueError):
+                pass
+            finally:
+                exc.close()
+            _report_rate_limit_headers(headers, "Google Gemini", report)
+            report(
+                "Google Gemini HTTP attempt %d/%d failed with status %d after %.2f seconds."
+                % (attempt + 1, MAX_API_ATTEMPTS, status, time.monotonic() - attempt_started)
+            )
+            if error_message:
+                report("Google Gemini error detail: %s" % error_message)
+            if status in RETRYABLE_HTTP_STATUSES and attempt < MAX_API_ATTEMPTS - 1:
+                delay = 2 ** attempt
+                report("Temporary Google Gemini server error; retrying in %d second(s)." % delay)
+                time.sleep(delay)
+                continue
+            if status in (401, 403):
+                raise RuntimeError("Google Gemini rejected the API key or project access (HTTP %d)." % status)
+            if status == 404:
+                raise RuntimeError("Google Gemini could not find the selected model or API route (HTTP 404).")
+            if status == 429:
+                raise RuntimeError(
+                    "Google Gemini rate limit or quota was reached (HTTP 429). "
+                    "No automatic retry was sent; check the model's quota and billing."
+                )
+            if status == 400:
+                raise RuntimeError(
+                    "Google Gemini rejected the model or screenshot request (HTTP 400). "
+                    "Check the model name and image size."
+                )
+            if status in RETRYABLE_HTTP_STATUSES:
+                raise RuntimeError("Google Gemini is temporarily unavailable (HTTP %d)." % status)
+            raise RuntimeError("Google Gemini returned an HTTP error (%d)." % status)
+        except urllib.error.URLError as exc:
+            reason = getattr(exc, "reason", None)
+            if isinstance(reason, TimeoutError):
+                report("Google Gemini request timed out after %.2f seconds." % (time.monotonic() - attempt_started))
+                raise RuntimeError("The Google Gemini request timed out. Please try again.")
+            reason_name = type(reason).__name__ if reason is not None else type(exc).__name__
+            report("Could not reach Google Gemini; network error type: %s." % reason_name)
+            raise RuntimeError("Could not reach Google Gemini. Check the internet connection.")
+        except TimeoutError:
+            report("Google Gemini request timed out after %.2f seconds." % (time.monotonic() - attempt_started))
+            raise RuntimeError("The Google Gemini request timed out. Please try again.")
+    raise RuntimeError("Google Gemini did not return a response.")
+
+
+def ask_gemini(
+    api_key: str,
+    model: str,
+    png_image: bytes,
+    diagnostic: Optional[Callable[[str], None]] = None,
+    ocr_markdown: str = "",
+) -> Tuple[Optional[int], str]:
+    """Send the screenshot directly to Google's Gemini generateContent API."""
+    def report(message: str) -> None:
+        if diagnostic is not None:
+            safe_message = str(message)
+            if api_key:
+                safe_message = safe_message.replace(api_key, "[REDACTED API KEY]")
+            diagnostic(safe_message)
+
+    if not valid_model_name("gemini", model):
+        raise RuntimeError("Enter a valid Google Gemini model ID, such as %s." % DEFAULT_GEMINI_MODEL)
+    markdown = ocr_markdown.strip() if isinstance(ocr_markdown, str) else ""
+    if len(markdown) > MAX_OCR_CONTEXT_CHARS:
+        original_characters = len(markdown)
+        markdown = markdown[:MAX_OCR_CONTEXT_CHARS]
+        report(
+            "Local OCR Markdown truncated from %d to %d characters for the solver request."
+            % (original_characters, len(markdown))
+        )
+    request_body = {
+        "systemInstruction": {"parts": [{"text": SYSTEM_INSTRUCTION}]},
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    {"text": _append_ocr_context(USER_PROMPT, markdown)},
+                    {
+                        "inlineData": {
+                            "mimeType": "image/png",
+                            "data": base64.b64encode(png_image).decode("ascii"),
+                        }
+                    },
+                ],
+            }
+        ],
+        "generationConfig": {"maxOutputTokens": MAX_GEMINI_OUTPUT_TOKENS},
+    }
+    report(
+        "Sending screenshot to Google Gemini model %s; direct Google API, no search or tools."
+        % model
+    )
+    response_data = _gemini_post_json(api_key, model, request_body, report)
+    if response_data.get("error") is not None:
+        error_value = response_data.get("error")
+        error_message = error_value.get("message") if isinstance(error_value, dict) else ""
+        if isinstance(error_message, str) and error_message:
+            report("Google Gemini inference error detail: %s" % error_message[:400])
+        raise RuntimeError("Google Gemini reported an inference error. See Diagnostics.")
+    if diagnostic is not None:
+        _log_gemini_response_metadata(response_data, report)
+    response_text = _extract_gemini_text(response_data)
+    if not response_text:
+        prompt_feedback = response_data.get("promptFeedback")
+        block_reason = prompt_feedback.get("blockReason") if isinstance(prompt_feedback, dict) else None
+        candidates = response_data.get("candidates")
+        finish_reason = (
+            candidates[0].get("finishReason")
+            if isinstance(candidates, list) and candidates and isinstance(candidates[0], dict)
+            else None
+        )
+        reason = block_reason or finish_reason
+        if isinstance(reason, str) and reason:
+            report("Google Gemini returned no text (reason: %s)." % reason[:100])
+            raise RuntimeError("Google Gemini did not return answer text (reason: %s)." % reason[:100])
+        raise RuntimeError("Google Gemini returned no answer text. See Diagnostics.")
+    if diagnostic is not None:
+        _report_model_output("Google Gemini", response_text, report)
+    option = parse_option(response_text)
+    if option is None:
+        report("Google Gemini response contained no explicit, reliable ANSWER line.")
+    else:
+        report("Google Gemini response parsing recognized option position %d." % option)
+    return option, response_text
 
 
 def ask_apinex(
@@ -3992,8 +4250,8 @@ class ScreenAnswerApp:
             outer,
             text=(
                 "AI only — no live web search or tools. Ctrl+Alt+S captures all monitors. "
-                "APInex/OpenRouter/Mistral use hosted APIs; Ollama sends the image to the local "
-                "server at 127.0.0.1:11434."
+                "APInex/Gemini/Mistral/OpenRouter use hosted APIs; Ollama sends the image to the "
+                "local server at 127.0.0.1:11434."
             ),
             justify="left",
             wraplength=430,
@@ -4023,7 +4281,7 @@ class ScreenAnswerApp:
             outer,
             text=(
                 "Provider default sends the screenshot directly to the selected vision model "
-                "(APInex, Ollama, and OpenRouter make no separate OCR call; Mistral uses hosted OCR). "
+                "(APInex, Gemini, Ollama, and OpenRouter make no separate OCR call; Mistral uses hosted OCR). "
                 "Optional Pix2Text runs locally but needs its own install/model download; the "
                 "screenshot and OCR text are still sent to the selected solver."
             ),
@@ -4096,7 +4354,7 @@ class ScreenAnswerApp:
             outer,
             text=(
                 "The screenshot is not saved to disk. Mistral provider-default sends it to separate "
-                "OCR and chat APIs; APInex and OpenRouter send it to hosted vision APIs; Ollama "
+                "OCR and chat APIs; APInex, Google Gemini, and OpenRouter send it to hosted vision APIs; Ollama "
                 "sends it only to the local server at 127.0.0.1:11434. Local Pix2Text skips Mistral's "
                 "OCR API call. Verify answers and use only where AI assistance is permitted."
             ),
@@ -4137,6 +4395,12 @@ class ScreenAnswerApp:
                     "go through APInex and its upstream model provider. APInex data terms and "
                     "free-quota limits apply; do not upload sensitive screens."
                 )
+            if provider == "gemini":
+                return (
+                    "I understand Pix2Text reads locally, then the full screenshot and OCR text "
+                    "are sent directly to Google's Gemini API. Google's data terms, project "
+                    "quota, and billing apply; do not upload sensitive screens."
+                )
             if provider == "openrouter":
                 return (
                     "I understand Pix2Text reads locally, then the full screenshot and OCR text "
@@ -4153,6 +4417,12 @@ class ScreenAnswerApp:
                 "to its selected upstream vision model. APInex privacy terms, provider terms, "
                 "free allowance and rate limits apply. No web search or tools are used. Do not "
                 "upload sensitive screens."
+            )
+        if provider == "gemini":
+            return (
+                "I understand each capture sends the full desktop screenshot directly to "
+                "Google's Gemini API for vision inference. Google's data terms, project quota, "
+                "and billing apply. No search or tools are used. Do not upload sensitive screens."
             )
         if provider == "ollama":
             return (
@@ -4686,6 +4956,14 @@ class ScreenAnswerApp:
                         diagnostic=diagnostic_callback,
                         ocr_markdown=local_ocr_markdown or "",
                     )
+                elif provider == "gemini":
+                    option, response_text = ask_gemini(
+                        api_key,
+                        model,
+                        image,
+                        diagnostic=diagnostic_callback,
+                        ocr_markdown=local_ocr_markdown or "",
+                    )
                 elif provider == "ollama":
                     option, response_text = ask_ollama(
                         model,
@@ -4868,14 +5146,20 @@ def main() -> int:
     if "--check-pix2text" in sys.argv[1:]:
         return 0 if pix2text_bundle_importable() else 1
     if "--check-apinex-ollama" in sys.argv[1:]:
+        standard_providers = provider_labels_for_executable("ScreenAnswer.exe")
         return 0 if (
             APP_DEFAULT_PROVIDER == "apinex"
-            and provider_labels_for_executable("ScreenAnswer.exe").get("apinex") == "APInex"
-            and provider_labels_for_executable("ScreenAnswer.exe").get("ollama") == "Ollama (local)"
-            and "gemini" not in provider_labels_for_executable("ScreenAnswer.exe")
-            and "groq" not in provider_labels_for_executable("ScreenAnswer.exe")
+            and standard_providers.get("apinex") == "APInex"
+            and standard_providers.get("gemini") == "Google Gemini"
+            and standard_providers.get("ollama") == "Ollama (local)"
+            and "groq" not in standard_providers
+            and "gemini" not in provider_labels_for_executable("Lasso.exe")
             and APINEX_ENDPOINT == "https://api.apinex.bond/v1/chat/completions"
+            and GEMINI_API_BASE_URL == "https://generativelanguage.googleapis.com/v1beta"
             and OLLAMA_ENDPOINT == "http://127.0.0.1:11434/api/chat"
+            and API_KEY_ENV_VARS.get("gemini") == "GEMINI_API_KEY"
+            and DEFAULT_MODELS.get("gemini") == DEFAULT_GEMINI_MODEL
+            and valid_model_name("gemini", DEFAULT_GEMINI_MODEL)
             and valid_model_name("apinex", DEFAULT_APINEX_MODEL)
             and valid_model_name("apinex", "free/gpt-6-luna")
             and valid_model_name("ollama", DEFAULT_OLLAMA_MODEL)

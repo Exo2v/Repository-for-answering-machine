@@ -19,6 +19,7 @@ from answer_tray import (
     APINEX_ENDPOINT,
     APINEX_FREE_VISION_MODELS,
     DEFAULT_APINEX_MODEL,
+    DEFAULT_GEMINI_MODEL,
     DEFAULT_OLLAMA_MODEL,
     DEFAULT_MISTRAL_MODEL,
     DEFAULT_OPENROUTER_MODEL,
@@ -28,6 +29,7 @@ from answer_tray import (
     LASSOWIN7_CONFIG_DIRECTORY,
     LASSV27_CONFIG_DIRECTORY,
     OLLAMA_ENDPOINT,
+    GEMINI_API_BASE_URL,
     OPENROUTER_FREE_VISION_REASONING_MODELS,
     ScreenAnswerApp,
     WindowsTray,
@@ -39,6 +41,7 @@ from answer_tray import (
     _extract_mistral_ocr_markdown,
     _extract_mistral_text,
     ask_apinex,
+    ask_gemini,
     ask_mistral,
     ask_ollama,
     ask_openrouter,
@@ -1360,6 +1363,35 @@ class NewLassoVariantTests(unittest.TestCase):
 
 
 class StandardSettingsTests(unittest.TestCase):
+    def test_switching_to_gemini_updates_key_model_and_data_consent(self):
+        app = object.__new__(ScreenAnswerApp)
+        app.form_provider = "apinex"
+        app.form_ocr_backend = "provider"
+        app.api_keys = {"apinex": "apinex-key", "gemini": ""}
+        app.models = {"apinex": DEFAULT_APINEX_MODEL, "gemini": DEFAULT_GEMINI_MODEL}
+        app.api_key_var = MagicMock()
+        app.api_key_var.get.return_value = "apinex-key"
+        app.model_var = MagicMock()
+        app.model_var.get.return_value = DEFAULT_APINEX_MODEL
+        app.api_key_label = MagicMock()
+        app.api_entry = MagicMock()
+        app.privacy_var = MagicMock()
+        app.privacy_checkbutton = MagicMock()
+        app._log_diagnostic = MagicMock()
+
+        app._provider_changed("Google Gemini")
+
+        self.assertEqual(app.form_provider, "gemini")
+        self.assertEqual(app.api_keys["apinex"], "apinex-key")
+        app.api_key_var.set.assert_called_once_with("")
+        app.api_entry.configure.assert_called_once_with(state="normal")
+        app.api_key_label.configure.assert_called_once_with(text="Google Gemini API key:")
+        app.model_var.set.assert_called_once_with(DEFAULT_GEMINI_MODEL)
+        app.privacy_var.set.assert_called_once_with(False)
+        consent = app.privacy_checkbutton.configure.call_args.kwargs["text"]
+        self.assertIn("directly to Google's Gemini API", consent)
+        self.assertIn("billing", consent)
+
     def test_switching_to_ollama_disables_key_entry_and_resets_consent(self):
         app = object.__new__(ScreenAnswerApp)
         app.form_provider = "apinex"
@@ -1844,32 +1876,45 @@ class OllamaRequestTests(unittest.TestCase):
 
 
 class ProviderRegistryTests(unittest.TestCase):
-    def test_standard_app_replaces_google_and_groq_with_apinex_and_ollama(self):
+    def test_standard_app_exposes_direct_gemini_while_lasso_stays_restricted(self):
         providers = provider_labels_for_executable("ScreenAnswer.exe")
         self.assertEqual(
             providers,
             {
                 "apinex": "APInex",
+                "gemini": "Google Gemini",
                 "ollama": "Ollama (local)",
                 "mistral": "Mistral",
                 "openrouter": "OpenRouter",
             },
         )
-        self.assertNotIn("gemini", providers)
         self.assertNotIn("groq", providers)
+        self.assertNotIn("gemini", provider_labels_for_executable("Lasso.exe"))
         self.assertEqual(
             API_KEY_ENV_VARS,
             {
                 "apinex": "APINEX_API_KEY",
+                "gemini": "GEMINI_API_KEY",
                 "mistral": "MISTRAL_API_KEY",
                 "openrouter": "OPENROUTER_API_KEY",
             },
         )
+        self.assertTrue(valid_model_name("gemini", DEFAULT_GEMINI_MODEL))
+        self.assertFalse(valid_model_name("gemini", "models/gemini-3.8-flash?key=bad"))
         self.assertEqual(default_provider_for_executable("ScreenAnswer.exe"), "apinex")
         self.assertEqual(default_provider_for_executable("ScreenAnswer-APInex.exe"), "apinex")
         self.assertEqual(default_provider_for_executable("ScreenAnswer-Ollama.exe"), "ollama")
         self.assertFalse(provider_requires_api_key("ollama"))
         self.assertTrue(provider_requires_api_key("apinex"))
+        self.assertTrue(provider_requires_api_key("gemini"))
+        self.assertEqual(
+            resolve_api_key("gemini", {}, {"GEMINI_API_KEY": "gemini-env-key"}),
+            ("gemini-env-key", "environment variable"),
+        )
+        self.assertEqual(
+            resolve_api_key("gemini", {}, {"GOOGLE_API_KEY": "google-env-key"}),
+            ("google-env-key", "environment variable (GOOGLE_API_KEY)"),
+        )
         self.assertEqual(
             resolve_api_key("ollama", {"ollama": "must-be-ignored"}, {"OLLAMA_API_KEY": "ignored"}),
             ("", "local Ollama server (no API key required)"),
@@ -1882,6 +1927,157 @@ class ProviderRegistryTests(unittest.TestCase):
     def test_build_smoke_check_covers_new_providers(self):
         with patch("sys.argv", ["ScreenAnswer-Diagnostic.exe", "--check-apinex-ollama"]):
             self.assertEqual(main(), 0)
+
+class GeminiRequestTests(unittest.TestCase):
+    def test_direct_gemini_sends_png_once_and_omits_thought_parts(self):
+        image_bytes = b"direct Gemini screenshot"
+        final_text = "TRANSCRIPTION: sample question.\nSOLUTION: the answer is C.\nANSWER: C"
+        captured = []
+        diagnostics = []
+        response_payload = {
+            "modelVersion": DEFAULT_GEMINI_MODEL,
+            "candidates": [
+                {
+                    "content": {
+                        "role": "model",
+                        "parts": [
+                            {"text": "private internal thought", "thought": True},
+                            {"text": final_text},
+                        ],
+                    },
+                    "finishReason": "STOP",
+                }
+            ],
+            "usageMetadata": {
+                "promptTokenCount": 50,
+                "candidatesTokenCount": 20,
+                "totalTokenCount": 70,
+            },
+        }
+
+        class FakeResponse:
+            status = 200
+            headers = {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+            def read(self, limit=-1):
+                data = json.dumps(response_payload).encode("utf-8")
+                return data if limit < 0 else data[:limit]
+
+        def fake_urlopen(request, timeout):
+            captured.append(
+                {
+                    "url": request.full_url,
+                    "api_key": request.get_header("X-goog-api-key"),
+                    "authorization": request.get_header("Authorization"),
+                    "body": json.loads(request.data.decode("utf-8")),
+                    "timeout": timeout,
+                }
+            )
+            return FakeResponse()
+
+        with patch("answer_tray.urllib.request.urlopen", side_effect=fake_urlopen):
+            option, response_text = ask_gemini(
+                "private-gemini-key",
+                DEFAULT_GEMINI_MODEL,
+                image_bytes,
+                diagnostic=diagnostics.append,
+                ocr_markdown="OCR transcript example",
+            )
+
+        self.assertEqual(option, 3)
+        self.assertEqual(response_text, final_text)
+        self.assertEqual(len(captured), 1)
+        request = captured[0]
+        self.assertEqual(
+            request["url"],
+            GEMINI_API_BASE_URL + "/models/" + DEFAULT_GEMINI_MODEL + ":generateContent",
+        )
+        self.assertNotIn("?key=", request["url"])
+        self.assertEqual(request["api_key"], "private-gemini-key")
+        self.assertIsNone(request["authorization"])
+        self.assertEqual(request["timeout"], 60)
+        body = request["body"]
+        self.assertIn("Do not use live web search", body["systemInstruction"]["parts"][0]["text"])
+        self.assertIn("OCR transcript example", body["contents"][0]["parts"][0]["text"])
+        self.assertEqual(
+            body["contents"][0]["parts"][1]["inlineData"],
+            {
+                "mimeType": "image/png",
+                "data": base64.b64encode(image_bytes).decode("ascii"),
+            },
+        )
+        self.assertEqual(body["generationConfig"]["maxOutputTokens"], 2048)
+        self.assertNotIn("tools", body)
+        self.assertNotIn("googleSearch", body)
+        self.assertFalse(any("private-gemini-key" in line for line in diagnostics))
+        self.assertFalse(any("private internal thought" in line for line in diagnostics))
+        self.assertTrue(any("total tokens=70" in line for line in diagnostics))
+
+    def test_rejects_invalid_model_before_network_access(self):
+        with patch("answer_tray.urllib.request.urlopen") as urlopen:
+            with self.assertRaisesRegex(RuntimeError, "valid Google Gemini model"):
+                ask_gemini("key", "free/gemini-3.8-flash", b"image")
+        urlopen.assert_not_called()
+
+    def test_rate_limit_429_is_not_retried(self):
+        calls = []
+
+        def fake_urlopen(request, timeout):
+            calls.append(request.full_url)
+            raise urllib.error.HTTPError(
+                request.full_url,
+                429,
+                "Too Many Requests",
+                {},
+                io.BytesIO(b'{"error":{"message":"quota exceeded"}}'),
+            )
+
+        with patch("answer_tray.urllib.request.urlopen", side_effect=fake_urlopen):
+            with patch("answer_tray.time.sleep") as sleep:
+                with self.assertRaisesRegex(RuntimeError, "No automatic retry was sent"):
+                    ask_gemini("key", DEFAULT_GEMINI_MODEL, b"image")
+        self.assertEqual(len(calls), 1)
+        sleep.assert_not_called()
+
+    def test_retries_temporary_server_error_with_bounded_attempts(self):
+        calls = []
+        response_payload = {
+            "candidates": [{"content": {"parts": [{"text": "ANSWER: A"}]}}]
+        }
+
+        class FakeResponse:
+            status = 200
+            headers = {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+            def read(self, limit=-1):
+                data = json.dumps(response_payload).encode("utf-8")
+                return data if limit < 0 else data[:limit]
+
+        def fake_urlopen(request, timeout):
+            calls.append(request.full_url)
+            if len(calls) == 1:
+                raise urllib.error.HTTPError(request.full_url, 503, "Unavailable", {}, io.BytesIO(b""))
+            return FakeResponse()
+
+        with patch("answer_tray.urllib.request.urlopen", side_effect=fake_urlopen):
+            with patch("answer_tray.time.sleep") as sleep:
+                option, _ = ask_gemini("key", DEFAULT_GEMINI_MODEL, b"image")
+        self.assertEqual(option, 1)
+        self.assertEqual(len(calls), 2)
+        sleep.assert_called_once_with(1)
+
 
 class MistralRequestTests(unittest.TestCase):
     def test_ocr_then_reasoned_vision_chat_without_search_tools(self):
@@ -2546,7 +2742,7 @@ class PortableConfigTests(unittest.TestCase):
                 path=path,
                 provider="mistral",
                 api_keys={
-                    "gemini": "retired-google-key",
+                    "gemini": "direct-gemini-key",
                     "apinex": "apinex-key",
                     "ollama": "must-not-be-saved",
                     "mistral": "mistral-key",
@@ -2569,11 +2765,13 @@ class PortableConfigTests(unittest.TestCase):
                     "provider": "mistral",
                     "api_keys": {
                         "apinex": "apinex-key",
+                        "gemini": "direct-gemini-key",
                         "mistral": "mistral-key",
                         "openrouter": "openrouter-key",
                     },
                     "models": {
                         "apinex": DEFAULT_APINEX_MODEL,
+                        "gemini": DEFAULT_GEMINI_MODEL,
                         "ollama": DEFAULT_OLLAMA_MODEL,
                         "mistral": DEFAULT_MISTRAL_MODEL,
                         "openrouter": DEFAULT_OPENROUTER_MODEL,
@@ -2583,10 +2781,10 @@ class PortableConfigTests(unittest.TestCase):
             )
             with open(path, "r", encoding="utf-8") as config_file:
                 saved = json.load(config_file)
-            self.assertNotIn("gemini", saved["api_keys"])
+            self.assertEqual(saved["api_keys"]["gemini"], "direct-gemini-key")
             self.assertNotIn("groq", saved["api_keys"])
             self.assertNotIn("ollama", saved["api_keys"])
-            self.assertNotIn("gemini", saved["models"])
+            self.assertEqual(saved["models"]["gemini"], DEFAULT_GEMINI_MODEL)
             self.assertNotIn("groq", saved["models"])
 
     def test_old_google_and_groq_credentials_are_scrubbed_not_reused_for_apinex(self):
@@ -2595,15 +2793,15 @@ class PortableConfigTests(unittest.TestCase):
             with open(path, "w", encoding="utf-8") as config_file:
                 json.dump(
                     {
-                        "provider": "gemini",
+                        "provider": "google",
                         "api_keys": {
-                            "gemini": "old-google-secret",
+                            "google": "old-google-secret",
                             "groq": "old-groq-secret",
                             "mistral": "keep-mistral-key",
                             "openrouter": "keep-openrouter-key",
                         },
                         "models": {
-                            "gemini": "gemini-3.8-flash",
+                            "google": "gemini-3.8-flash",
                             "groq": "qwen/qwen3.8-27b",
                             "mistral": "ministral-14b-2512",
                             "openrouter": DEFAULT_OPENROUTER_MODEL,
@@ -2627,7 +2825,8 @@ class PortableConfigTests(unittest.TestCase):
             serialized = json.dumps(scrubbed)
             self.assertNotIn("old-google-secret", serialized)
             self.assertNotIn("old-groq-secret", serialized)
-            self.assertNotIn("gemini", scrubbed["api_keys"])
+            self.assertNotIn("google", scrubbed["api_keys"])
+            self.assertNotIn("google", scrubbed["models"])
             self.assertNotIn("groq", scrubbed["api_keys"])
             self.assertEqual(scrubbed["provider"], "apinex")
 
@@ -2680,6 +2879,7 @@ class PortableConfigTests(unittest.TestCase):
                         "api_keys": {"apinex": "apinex-key"},
                         "models": {
                             "apinex": "paid/gemini-3.8-flash",
+                            "gemini": "models/gemini-3.8-flash?invalid",
                             "ollama": "qwen3-vl:8b?invalid",
                         },
                     },
@@ -2687,6 +2887,7 @@ class PortableConfigTests(unittest.TestCase):
                 )
             loaded = load_portable_config(path)
         self.assertEqual(loaded["models"]["apinex"], DEFAULT_APINEX_MODEL)
+        self.assertEqual(loaded["models"]["gemini"], DEFAULT_GEMINI_MODEL)
         self.assertEqual(loaded["models"]["ollama"], DEFAULT_OLLAMA_MODEL)
 
     def test_missing_or_invalid_config_falls_back_to_empty_apinex_settings(self):

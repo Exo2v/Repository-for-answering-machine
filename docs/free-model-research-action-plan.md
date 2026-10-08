@@ -1,7 +1,7 @@
 # Free-Model Research, Action Plan, and Request Pipeline
 
 **Prepared:** 8 October 2026
-**Status:** APInex and local Ollama are implemented in the standard ScreenAnswer source. The v1.7.0-experimental Windows release includes `free/gpt-6-luna` as an optional APInex model; all 68 offline unit tests pass. No APInex account/key or live inference request was used, and Ollama was not tested against a running local service, so live provider/quota behavior remains unverified. Dedicated LassoV2/LassV27 builds remain OpenRouter-only.
+**Status:** APInex, direct Google Gemini, local Ollama, Mistral, and OpenRouter are implemented in the standard ScreenAnswer source. A new direct-Gemini REST path defaults to `gemini-3.8-flash`; it is a separate Google provider, not an APInex alias, and was tested only with mocked requests. The APInex GPT-6 Luna alias remains optional. All 86 offline unit tests pass in the current worktree; no live provider key/inference was used. Dedicated Lasso provider scopes remain unchanged.
 
 ## Executive summary
 
@@ -11,7 +11,7 @@ The target workload is approximately **80–120 screenshot questions in four hou
 
 The open-source **FreeLLMAPI** project is a second, more resilient architecture candidate: it runs a local gateway and can distribute requests among a user's own provider keys, with vision-aware routing and automatic failover. Its stated aggregate model capacity is not a guarantee for this workload, though; provider caps, terms, and model quality still apply, and its documentation warns that free-tier performance can degrade as quotas are used.
 
-**Implementation status:** the standard ScreenAnswer app offers APInex (default), local Ollama, Mistral, and OpenRouter. APInex is restricted to three curated free-category vision IDs (`free/gemini-3.8-flash`, `free/gemini-3.1-pro`, and `free/gpt-6-luna`); the GPT-6 Luna ID is optional and does not replace the default. Ollama uses a local vision model without a key. Direct Google/Gemini and Groq providers were removed from the standard app. The APInex base64 request and Ollama local request are covered by offline unit tests only. **Next:** validate APInex with a user's own account and synthetic screenshots, resolve the `free/gpt-6-luna` pricing/allowance discrepancy, verify measured usage/quotas and data terms, and run Ollama against an installed local model. Do not treat these provider integrations as live-verified. FreeLLMAPI remains research-only; it is not integrated and is not an automatic fallback.
+**Implementation status:** standard ScreenAnswer offers APInex (default), direct Google Gemini, local Ollama, Mistral, and OpenRouter. APInex retains its three configured free-category vision aliases; direct Gemini separately uses Google model IDs (default `gemini-3.8-flash`) and its own Google key/quota/billing. No direct Gemini model call has been live-tested. Ollama uses a local vision model without a key; Groq remains removed. **Next:** validate APInex and Gemini with non-sensitive synthetic screenshots and the user's own account, resolve the `free/gpt-6-luna` pricing/allowance caveat, verify measured quotas/data terms, and run Ollama against an installed local model. FreeLLMAPI remains research-only and is not an automatic fallback.
 
 ## 1. Goal and existing constraints
 
@@ -22,7 +22,7 @@ The open-source **FreeLLMAPI** project is a second, more resilient architecture 
 - Screenshot consent remains off until the user explicitly enables it.
 - No live web search or tool execution in the solving request.
 - Keep the Lasso tray behavior: answer color is the normal tray feedback; Diagnostics stays on-demand.
-- The **standard ScreenAnswer** provider choices are APInex, local Ollama, Mistral, and OpenRouter. Direct Google/Gemini and Groq support has been removed from this standard test version. The direct model alias `free/gemini-3.8-flash` is still an APInex catalog ID; it does not use Google's API or require a Google key. OpenRouter's allowlisted `google/gemma-4-...:free` model IDs remain behind OpenRouter.
+- The **standard ScreenAnswer** provider choices are APInex, direct Google Gemini, local Ollama, Mistral, and OpenRouter. Direct Gemini uses Google's REST API, a separate key, and direct model IDs; it is independent of APInex's `free/gemini-3.8-flash` alias and does not add Gemini to the Lasso builds. Groq remains removed. OpenRouter's allowlisted `google/gemma-4-...:free` IDs still route through OpenRouter.
 - Dedicated `LassoV2.exe` / `LassV27.exe` builds remain OpenRouter-only, with model selection in their config files and no model control in Settings. Legacy Lasso1/LassV7 behavior and config paths are unchanged. FreeLLMAPI remains research-only and is not a configured fallback.
 - The current app captures the full virtual desktop in memory. Do not assume a crop or a reduced capture is in scope; measure the current capture first.
 
@@ -94,11 +94,11 @@ The 5 RPM free-tier rate limit is not the bottleneck: one request every 2–3 mi
 
 ### Phase 0 — Source implementation status
 
-- [x] Standard ScreenAnswer offers APInex (default), local Ollama, Mistral, and OpenRouter.
-- [x] Direct Google/Gemini API and Groq provider implementations/options were removed from the standard app. APInex's `free/gemini-...` IDs are APInex aliases; Google-family model IDs behind APInex/OpenRouter are not direct Google API integrations.
+- [x] Standard ScreenAnswer offers APInex (default), direct Google Gemini, local Ollama, Mistral, and OpenRouter. Groq remains removed.
+- [x] Direct Google Gemini uses its own `GEMINI_API_KEY`/`GOOGLE_API_KEY` and Google model IDs; APInex's `free/gemini-...` aliases and OpenRouter's Google-family IDs still use their respective intermediary APIs.
 - [x] APInex and OpenRouter use exact vision-model allowlists; there is no paid-model or cross-provider fallback. Ollama uses a loopback API and requires no API key.
-- [x] Legacy provider credentials/models are filtered from portable config; retired Google/Groq keys are not reused as APInex keys. User keys and config files are not packaged.
-- [x] APInex and Ollama request construction, config migration, provider registry, and safety behavior have offline unit coverage. `python -m unittest discover -s tests -v` passes (67 tests); `python -m py_compile answer_tray.py` passes.
+- [x] Legacy provider credentials/models are filtered from portable config; no Google or Groq key is silently repurposed as an APInex key. User keys and config files are not packaged.
+- [x] APInex, direct Gemini, Ollama, provider registry, and safety behavior have offline unit coverage. `python -m unittest discover -s tests -v` passes (86 tests); `python -m py_compile answer_tray.py` passes.
 - [x] Dedicated LassoV2/LassV27 builds remain OpenRouter-only. Their Settings GUI stays model-free; models remain in their per-user config files. Lasso startup, consent, tray feedback, cleanup scope, and config paths are not expanded by this integration.
 - [ ] Build and smoke-test the Windows executables in CI or on a Windows machine. No Windows build has run yet.
 
@@ -171,7 +171,7 @@ Standard ScreenAnswer can select a provider/model in its Settings GUI. The dedic
 
 ## 7. Remaining decisions before relying on the test build
 
-- [ ] **Interpretation of “remove Google”:** the direct Google Gemini provider/key is removed. The APInex default model ID includes `gemini`, and OpenRouter's allowlist includes Google Gemma IDs, but neither route uses Google's direct API. If all Google-family model IDs are prohibited—not just the direct provider—the APInex/OpenRouter model allowlists and defaults need a different explicitly approved vision model.
+- [x] **Google provider scope:** direct Gemini is available only in standard ScreenAnswer as a separate provider; the dedicated Lasso builds remain restricted to APInex/OpenRouter. APInex aliases and OpenRouter Google-family models continue using those intermediaries.
 - [ ] **APInex:** Is sending the full desktop screenshot through APInex and its upstream provider acceptable after reviewing its current terms/privacy policy? Does a real account confirm free quota and no unexpected wallet debit?
 - [ ] **Ollama:** Does the user's test computer have enough disk, memory, and compute for the selected local vision model and acceptable latency?
 - [ ] **Quota and quality:** Is a measured best-effort free quota acceptable, and what minimum answer accuracy/maximum latency should the pilot require?
