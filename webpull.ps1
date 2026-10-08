@@ -1,6 +1,6 @@
 $ErrorActionPreference = 'Stop'
 
-$releaseRoot = 'https://github.com/Exo2v/Repository-for-answering-machine/releases/download/lasso1'
+$releaseRoot = 'https://github.com/Exo2v/indigo-otter-731/releases/download/lasso1'
 $downloads = Join-Path $env:USERPROFILE 'Downloads'
 if (-not (Test-Path -LiteralPath $downloads -PathType Container)) {
     New-Item -ItemType Directory -Path $downloads -Force | Out-Null

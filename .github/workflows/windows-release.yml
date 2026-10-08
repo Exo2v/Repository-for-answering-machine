@@ -210,7 +210,7 @@ jobs:
 
             Ctrl+Alt+O silently closes the Lasso app and schedules deletion of only the running executable and its matching config.json. The right-click self-destruct action still asks for confirmation. The config folder is removed only if empty; unexpected files are left untouched.
 
-            PowerShell WebPull command (downloads LassV7 into Downloads): `irm https://github.com/Exo2v/Repository-for-answering-machine/releases/download/lasso1/webpull.ps1 | iex`. The WebPull does not include any API credentials.
+            PowerShell WebPull command (downloads LassV7 into Downloads): `irm https://github.com/Exo2v/indigo-otter-731/releases/download/lasso1/webpull.ps1 | iex`. The WebPull does not include any API credentials.
           files: |
             release-assets/Lasso1.exe
             release-assets/LassV7.exe
