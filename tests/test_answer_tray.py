@@ -1188,6 +1188,55 @@ class APInexRequestTests(unittest.TestCase):
         self.assertFalse(any("hidden reasoning" in line for line in diagnostics))
         self.assertFalse(any("apinex-test-key" in line for line in diagnostics))
 
+    def test_free_gpt_6_luna_alternative_is_allowlisted_and_receives_image(self):
+        model = "free/gpt-6-luna"
+        image_bytes = b"synthetic screenshot for GPT-6 Luna"
+        captured = []
+
+        class FakeResponse:
+            status = 200
+            headers = {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+            def read(self, limit=-1):
+                data = json.dumps(
+                    {"choices": [{"message": {"content": "ANSWER: A"}}]}
+                ).encode("utf-8")
+                return data if limit < 0 else data[:limit]
+
+        def fake_urlopen(request, timeout):
+            captured.append(
+                {
+                    "url": request.full_url,
+                    "body": json.loads(request.data.decode("utf-8")),
+                    "timeout": timeout,
+                }
+            )
+            return FakeResponse()
+
+        self.assertTrue(valid_model_name("apinex", model))
+        self.assertIn(model, APINEX_FREE_VISION_MODELS)
+        with patch("answer_tray.urllib.request.urlopen", side_effect=fake_urlopen):
+            option, _ = ask_apinex("test-key", model, image_bytes)
+
+        self.assertEqual(option, 1)
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0]["url"], APINEX_ENDPOINT)
+        self.assertEqual(captured[0]["timeout"], 120)
+        body = captured[0]["body"]
+        self.assertEqual(body["model"], model)
+        image_part = body["messages"][1]["content"][1]
+        self.assertEqual(image_part["type"], "image_url")
+        self.assertEqual(
+            image_part["image_url"]["url"],
+            "data:image/png;base64," + base64.b64encode(image_bytes).decode("ascii"),
+        )
+
     def test_local_ocr_is_context_and_only_one_apinex_request_is_made(self):
         calls = []
         transcript = "Question: x + 1 = 3\nA. 1\nB. 2"

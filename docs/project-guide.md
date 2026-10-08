@@ -2,7 +2,7 @@
 
 **Prepared:** 8 October 2026<br>
 **Project:** Screen Answer (repository historically named `Repository-for-answering-machine`; GitHub resolves to `Exo2v/indigo-otter-731`)<br>
-**Current standard release:** [v1.6.0-experimental](https://github.com/Exo2v/indigo-otter-731/releases/tag/v1.6.0-experimental)<br>
+**Current standard release:** [v1.7.0-experimental](https://github.com/Exo2v/indigo-otter-731/releases/tag/v1.7.0-experimental)<br>
 **Audience:** users, testers, maintainers, and anyone preparing a build or release.
 
 > This document describes the project as a whole: the standard Screen Answer program, optional OCR, diagnostic builds, the separate Lasso family, settings and data flow, tests, CI, release assets, and current limitations. For a deeper request-by-request APInex/Ollama explanation, see the [v1.6.0 implementation guide](v1.6.0-apinex-ollama-implementation-guide.md).
@@ -25,7 +25,7 @@ The app is not a continuous screen recorder, browser extension, hosted backend, 
 
 The project has evolved to accommodate two different use cases:
 
-- **Standard Screen Answer:** a general Windows app where the user can choose among hosted providers and a local model. In v1.6.0, APInex is the default and Ollama is available for local inference. Mistral and OpenRouter remain available.
+- **Standard Screen Answer:** a general Windows app where the user can choose among hosted providers and a local model. The v1.6.0 line introduced APInex as the default and Ollama for local inference; the v1.7.0 build adds `free/gpt-6-luna` as an optional APInex model while keeping the existing default. Mistral and OpenRouter remain available.
 - **Lasso variants:** separate tray-only builds with a narrower, OpenRouter-only configuration model. They preserve dedicated per-user settings, a model value in the config file (not the Settings GUI), explicit upload consent, and variant-specific cleanup/notification behavior.
 - **Optional Pix2Text build:** a much larger experimental 64-bit build that adds local OCR. OCR extracts text and formulas; it does not solve the problem. The solver still receives the screenshot and, depending on provider, its OCR transcript.
 - **Diagnostic build:** the standard program with a live diagnostics window opened automatically, for detailed testing of captures, OCR, network requests, response parsing, and errors.
@@ -36,8 +36,8 @@ The direct Google Gemini and Groq integrations were removed from the standard v1
 
 | Family | Main executables | Providers | Settings and behavior | Distribution status |
 | --- | --- | --- | --- | --- |
-| Standard | `ScreenAnswer.exe` | APInex (default), Ollama (local), Mistral, OpenRouter | Provider/model/OCR controls in standard Settings; consent starts off for every run | Current `v1.6.0-experimental` release |
-| Standard diagnostics | `ScreenAnswer-Diagnostic.exe` | Same standard provider set | Same app, but opens the live diagnostic window at startup | Included in `v1.6.0-experimental` |
+| Standard | `ScreenAnswer.exe` | APInex (default), Ollama (local), Mistral, OpenRouter | Provider/model/OCR controls in standard Settings; consent starts off for every run | Current `v1.7.0-experimental` release |
+| Standard diagnostics | `ScreenAnswer-Diagnostic.exe` | Same standard provider set | Same app, but opens the live diagnostic window at startup | Included in `v1.7.0-experimental` |
 | Optional local OCR | `ScreenAnswer-Pix2Text.exe` | Same solver set; Pix2Text OCR is selected by default in that named build | 64-bit Windows 10+ experimental package; large dependencies, model weights downloaded separately | Published in `v1.3.0-experimental`; source/workflow can build it again on demand |
 | Legacy Lasso | `Lasso1.exe`, `LassV7.exe` | OpenRouter only | Per-user config; Settings opens only on demand; no model field in GUI; `LassV7` suppresses balloons/tooltips | Public `lasso1` release |
 | Newer Lasso design | `LassoV2.exe`, `LassV27.exe` | OpenRouter only | Per-user config; Settings opens only on demand; no model field in GUI; `LassV27` suppresses balloons/tooltips | Workflow and WebPull script exist; no `lasso2` release/tag was listed on GitHub as of 8 October 2026. Verify availability before using the `lasso2` download URL. |
@@ -50,6 +50,7 @@ The names `LassV7` and `LassV27` identify 32-bit Python 3.8.10 Windows 7-compati
 - **v1.3.0-experimental:** added a separate Pix2Text executable, exploring local text/formula extraction without replacing the model-based solver.
 - **v1.4.0-experimental and v1.5.0-experimental:** continued the standard experimental line. The v1.5.0 release included standard/diagnostic builds and a historical Groq executable.
 - **v1.6.0-experimental:** replaced direct Google Gemini and Groq integrations in the standard test version with APInex and local Ollama, while keeping Mistral and OpenRouter as choices. This tests a hosted intermediary and an on-device alternative without changing the separate Lasso provider scope.
+- **v1.7.0-experimental:** adds the optional APInex free-category vision ID `free/gpt-6-luna`; `free/gemini-3.8-flash` remains the default. The account-level allowance and billing behavior still need live confirmation.
 - **Lasso releases/builds:** evolved as distinct OpenRouter-only tray products rather than settings presets inside the standard app. Lasso1/LassV7 are publicly released; the LassoV2/LassV27 build flow exists but its release is not currently published.
 
 The overall reason for these branches is controlled experimentation: compare a small, explicit provider set, local OCR and inference options, response reliability, cost/quota behavior, and the privacy consequences of each route before expanding distribution. The project's latest release remains marked experimental for that reason.
@@ -124,16 +125,17 @@ Hosted requests make at most three attempts for retryable errors. Rate-limit han
 
 ### 5.1 APInex
 
-APInex is the standard default. The app restricts it to two configured IDs:
+APInex is the standard default. The app restricts it to three configured free-category vision IDs:
 
 - `free/gemini-3.8-flash` (default)
 - `free/gemini-3.1-pro`
+- `free/gpt-6-luna` (added as an optional alternative in v1.7.0; it does not replace the default)
 
 It sends an OpenAI-compatible chat-completions request with the PNG as an `image_url` base64 data URL, `temperature: 0`, `reasoning_effort: "medium"`, and a 2,048-token output cap. The request contains no tool/plugin declaration. The key is sent in an HTTP Bearer Authorization header and never embedded in the EXE.
 
 The app handles authentication, account quota, payload-size, rate-limit, missing-model, and temporary-upstream errors with provider-specific messages. Transient hosted calls are bounded to three attempts where the response class is retryable. The release tests mocked the HTTP endpoint; they did not make an APInex inference call.
 
-APInex publicly advertises a free-category daily allowance and a 5-request/minute/IP rate limit. Its public pricing/model materials have shown a discrepancy between free-category allowance claims and nonzero retail prices beside some `free/...` IDs. Account billing and post-quota behavior remain unverified. A model name containing `free` is not a guarantee of zero cost; check the account usage/balance before sustained use.
+APInex publicly describes a 1-million-token daily allowance for free-category models and a 5-request/minute/IP rate limit. Its [pricing page](https://apinex.bond/pricing) marks `free/gpt-6-luna` free in APInex's price columns, while the [live developer model catalog](https://apinex.bond/developers/models) lists $0.75 per 1M tokens for that same ID. This conflict means the exact account-level allowance and post-quota billing behavior remain unverified. The app treats the ID as a curated free-category choice, not a guarantee of zero cost; check the account usage/balance before use. GPT-6 Luna's [model specification](https://developers.openai.com/api/docs/models/gpt-6-luna) lists text and image input, and APInex's [chat API documentation](https://apinex.bond/developers/models/chat) documents image content parts; this project has not tested live image inference through APInex.
 
 ### 5.2 Ollama
 
@@ -275,7 +277,7 @@ Run the platform-independent test suite with:
 python -m unittest discover -s tests -v
 ```
 
-The suite has 67 tests as of v1.6.0. Provider tests mock `urllib.request.urlopen`; they inspect payloads, model allowlists, redaction, retries, local endpoint errors, OCR context, and answer parsing without using a real key or service. The suite also covers config migration, no-key Ollama Settings behavior, upload consent, Lasso config paths and UI behavior, tray notification suppression, self-cleanup scope, PNG encoding, and Pix2Text API import/behavior using mocks.
+The suite has 68 tests as of v1.7.0. Provider tests mock `urllib.request.urlopen`; they inspect payloads, model allowlists, redaction, retries, local endpoint errors, OCR context, and answer parsing without using a real key or service. The suite also covers config migration, no-key Ollama Settings behavior, upload consent, Lasso config paths and UI behavior, tray notification suppression, self-cleanup scope, PNG encoding, and Pix2Text API import/behavior using mocks.
 
 The EXEs support build smoke-check flags:
 
@@ -317,14 +319,15 @@ The workflow builds Pix2Text only by manual dispatch or a push whose head commit
 
 | Release/tag | Known purpose/assets | Status |
 | --- | --- | --- |
-| `v1.6.0-experimental` | `ScreenAnswer.exe`, `ScreenAnswer-Diagnostic.exe`; APInex/Ollama standard test version | Current standard prerelease |
-| `v1.5.0-experimental` | `ScreenAnswer.exe`, `ScreenAnswer-Diagnostic.exe`, historical `ScreenAnswer-Groq.exe` | Older release; use v1.6 for current provider set |
+| `v1.7.0-experimental` | `ScreenAnswer.exe`, `ScreenAnswer-Diagnostic.exe`; adds `free/gpt-6-luna` as an optional APInex model | Current standard prerelease |
+| `v1.6.0-experimental` | `ScreenAnswer.exe`, `ScreenAnswer-Diagnostic.exe`; introduced APInex/Ollama standard test version | Previous standard prerelease |
+| `v1.5.0-experimental` | `ScreenAnswer.exe`, `ScreenAnswer-Diagnostic.exe`, historical `ScreenAnswer-Groq.exe` | Older release; use v1.7 for current provider set |
 | `v1.3.0-experimental` | `ScreenAnswer.exe`, `ScreenAnswer-Diagnostic.exe`, `ScreenAnswer-Pix2Text.exe` | Experimental x64 local OCR package |
 | `lasso1` | `Lasso1.exe`, `LassV7.exe`, `webpull.ps1` | Public OpenRouter-only Lasso release |
 | `lasso2` | Workflow is prepared for `LassoV2.exe`, `LassV27.exe`, `webpull.ps1` | Not present in public release list at check time |
 | `v1.0.0`, `v1.0.1`, `v1.0.2`, `v1.0.3`, `v1.0.4`, `v1.1.0`, `v1.2.0`, `v1.2.1`, `v1.4.0-experimental` | Earlier standard iterations | See GitHub release notes for per-version asset/change history |
 
-The v1.6.0 release assets do not include `screen_answer_config.json`, any API key, `servomotor`, Ollama, Ollama model files, or Pix2Text weights. The release is experimental and does not certify inference quality, quotas, or provider billing. The current workflow defines no Authenticode-signing or separate checksum-publication step; users should verify the source and release provenance before running an EXE.
+The v1.7.0 release assets do not include `screen_answer_config.json`, any API key, `servomotor`, Ollama, Ollama model files, or Pix2Text weights. The release is experimental and does not certify inference quality, quotas, or provider billing. The current workflow defines no Authenticode-signing or separate checksum-publication step; users should verify the source and release provenance before running an EXE.
 
 ## 13. WebPull scripts
 
@@ -347,7 +350,7 @@ For `lasso2`, use the equivalent command only after verifying that the LassoV2/L
 
 ### Basic standard-app use
 
-1. Download the current `ScreenAnswer.exe` from [v1.6.0-experimental](https://github.com/Exo2v/indigo-otter-731/releases/tag/v1.6.0-experimental), or run `answer_tray.py` with Python/Tkinter.
+1. Download the current `ScreenAnswer.exe` from [v1.7.0-experimental](https://github.com/Exo2v/indigo-otter-731/releases/tag/v1.7.0-experimental), or run `answer_tray.py` with Python/Tkinter.
 2. Open Settings from the tray and select APInex, Ollama, Mistral, or OpenRouter.
 3. For APInex/Mistral/OpenRouter, enter the appropriate key (or configure the documented environment variable). Never ask anyone to paste a key into a public issue/chat.
 4. For Ollama, install Ollama 0.12.7+ and run `ollama pull qwen3-vl:8b`. Start the local server and select Ollama; no key is required.
@@ -395,7 +398,8 @@ For `lasso2`, use the equivalent command only after verifying that the LassoV2/L
 
 ## 16. Reference links
 
-- [Current v1.6.0 release](https://github.com/Exo2v/indigo-otter-731/releases/tag/v1.6.0-experimental)
+- [Current v1.7.0 release](https://github.com/Exo2v/indigo-otter-731/releases/tag/v1.7.0-experimental)
+- [Previous v1.6.0 release](https://github.com/Exo2v/indigo-otter-731/releases/tag/v1.6.0-experimental)
 - [Lasso1 release](https://github.com/Exo2v/indigo-otter-731/releases/tag/lasso1)
 - [GitHub release history](https://github.com/Exo2v/indigo-otter-731/releases)
 - [Detailed v1.6 APInex/Ollama implementation guide](v1.6.0-apinex-ollama-implementation-guide.md)

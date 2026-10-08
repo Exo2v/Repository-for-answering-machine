@@ -37,6 +37,7 @@ APINEX_FREE_VISION_MODELS = frozenset(
     (
         DEFAULT_APINEX_MODEL,
         "free/gemini-3.1-pro",
+        "free/gpt-6-luna",
     )
 )
 # Keep OpenRouter on explicitly priced :free variants, not openrouter/free (whose
@@ -98,7 +99,7 @@ def is_lassv7_executable(executable_name: Optional[str] = None) -> bool:
 LASSOV7_MODE = is_lassv7_executable()
 LASSO1_MODE = is_lasso1_executable()
 APP_NAME = lasso_app_name_for_executable() or "Screen Answer"
-APP_VERSION = APP_NAME.lower() if LASSO1_MODE else "1.6.0-experimental"
+APP_VERSION = APP_NAME.lower() if LASSO1_MODE else "1.7.0-experimental"
 
 
 def default_provider_for_executable(executable_name: str) -> str:
@@ -4232,6 +4233,7 @@ def main() -> int:
             and APINEX_ENDPOINT == "https://api.apinex.bond/v1/chat/completions"
             and OLLAMA_ENDPOINT == "http://127.0.0.1:11434/api/chat"
             and valid_model_name("apinex", DEFAULT_APINEX_MODEL)
+            and valid_model_name("apinex", "free/gpt-6-luna")
             and valid_model_name("ollama", DEFAULT_OLLAMA_MODEL)
             and not provider_requires_api_key("ollama")
         ) else 1
