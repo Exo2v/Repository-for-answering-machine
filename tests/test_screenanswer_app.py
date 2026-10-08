@@ -16,7 +16,7 @@ class RecordingShell(NullShell):
     pass
 
 
-def make_app(settings=None, gateway=None, capture=None):
+def make_app(settings=None, gateway=None, capture=None, cleanup=None):
     shell = RecordingShell()
     logs = []
     scheduled = []
@@ -31,6 +31,7 @@ def make_app(settings=None, gateway=None, capture=None):
                 text="SOLUTION: work\nANSWER: 2", model="m", attempts=1
             )
         ),
+        cleanup_fn=cleanup or (lambda: True),
         scheduler=lambda delay, cb: scheduled.append((delay, cb)),
         status_fn=logs.append,
     )
@@ -128,6 +129,29 @@ class EventTests(unittest.TestCase):
         app.handle_event(("fatal", "tray died"))
         self.assertTrue(any("tray died" in line for line in logs))
         self.assertEqual(shell.states[-1][1], "Screen Answer (error)")
+
+    def test_silent_delete_closes_when_cleanup_schedules(self):
+        calls = []
+        app, shell, logs, _ = make_app(cleanup=lambda: calls.append(1) or True)
+        app.handle_event(("delete",))
+        self.assertTrue(app._closed)
+        self.assertEqual(calls, [1])
+        self.assertTrue(any("Self-cleanup scheduled (silent)" in line for line in logs))
+
+    def test_silent_delete_stays_open_when_cleanup_refused(self):
+        app, shell, logs, _ = make_app(cleanup=lambda: False)
+        app.handle_event(("delete",))
+        self.assertFalse(app._closed)
+        self.assertTrue(any("staying open" in line for line in logs))
+
+    def test_silent_delete_survives_cleanup_crash(self):
+        def boom():
+            raise RuntimeError("no powershell")
+
+        app, shell, logs, _ = make_app(cleanup=boom)
+        app.handle_event(("delete",))
+        self.assertFalse(app._closed)
+        self.assertTrue(any("Self-cleanup raised" in line for line in logs))
 
 
 if __name__ == "__main__":

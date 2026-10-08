@@ -1,12 +1,16 @@
-"""Notification-area tray icon and global hotkeys.
+"""Notification-area tray: a silent colored sphere.
 
-`WindowsTray` is a simplified port of the proven v1.7 ctypes tray: message
-loop on a worker thread, colored icon states, right-click menu
-(Capture & ask / Settings / Diagnostics / Exit), and Ctrl+Alt+S / Ctrl+Alt+Q.
-Lasso, self-destruct, and balloon-suppression behaviours are not part of v1.
+Product spec for v1:
+- The icon is a sphere whose color IS the answer: red=1, yellow=2, green=3,
+  blue=4, grey=ready/no answer. Color is the only runtime feedback.
+- No hover tooltip, no balloon notifications — ever (silent shell).
+- Left-click does nothing. Right-click shows exactly two entries:
+  "Open GUI" and "Diagnostics console".
+- Binds: Ctrl+Alt+S captures; Ctrl+Alt+O silently schedules deletion of the
+  running executable and its config, then exits (no prompt, no notification).
 
-`NullShell` is the non-Windows / test stand-in: same interface, logs state
-changes instead of touching the OS.
+`WindowsTray` is a simplified port of the proven v1.7 ctypes tray.
+`NullShell` is the non-Windows / test stand-in with the same interface.
 """
 
 from __future__ import annotations
@@ -19,7 +23,7 @@ from typing import Any, Callable, Dict, Optional, Tuple
 from .parser import NEUTRAL_RGB
 
 HOTKEY_CAPTURE_ID = 1
-HOTKEY_EXIT_ID = 2
+HOTKEY_DELETE_ID = 2
 
 RESULT_HOLD_MS = 10_000
 FADE_DURATION_MS = 1_500
@@ -119,15 +123,11 @@ class WindowsTray(ShellBase):
         NIM_DELETE = 0x00000002
         NIF_MESSAGE = 0x00000001
         NIF_ICON = 0x00000002
-        NIF_TIP = 0x00000004
         WS_POPUP = 0x80000000
         MF_STRING = 0x00000000
-        MF_SEPARATOR = 0x00000800
         TPM_RETURNCMD = 0x0100
         TPM_RIGHTBUTTON = 0x0002
-        CMD_CAPTURE = 101
         CMD_OPEN = 102
-        CMD_EXIT = 103
         CMD_DIAGNOSTICS = 104
         TRAY_UID = 1
 
@@ -241,16 +241,17 @@ class WindowsTray(ShellBase):
                 if wparam == HOTKEY_CAPTURE_ID:
                     self.events.put(("capture",))
                     return 0
-                if wparam == HOTKEY_EXIT_ID:
-                    self.events.put(("exit",))
+                if wparam == HOTKEY_DELETE_ID:
+                    self.events.put(("delete",))
                     return 0
             elif message == WM_TRAY:
                 event = int(lparam) & 0xFFFF
-                if event in (WM_LBUTTONUP, WM_LBUTTONDBLCLK):
-                    self.events.put(("open",))
-                    return 0
                 if event == WM_RBUTTONUP:
                     self._show_context_menu(hwnd)
+                    return 0
+                # Left-click / double-click: deliberately silent (spec: only
+                # right-click reveals the menu). Swallow the message.
+                if event in (WM_LBUTTONUP, WM_LBUTTONDBLCLK):
                     return 0
             elif message == WM_CLOSE:
                 user32.DestroyWindow(hwnd)
@@ -293,10 +294,10 @@ class WindowsTray(ShellBase):
         self._nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
         self._nid.hWnd = hwnd
         self._nid.uID = TRAY_UID
-        self._nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
+        # Silent sphere: no NIF_TIP — Windows shows no hover tooltip.
+        self._nid.uFlags = NIF_MESSAGE | NIF_ICON
         self._nid.uCallbackMessage = WM_TRAY
         self._nid.hIcon = self._create_icon(NEUTRAL_RGB)
-        self._nid.szTip = "Screen Answer (ready)"
         if not shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(self._nid)):
             error_code = ctypes.get_last_error()
             self._ready.set()
@@ -304,7 +305,7 @@ class WindowsTray(ShellBase):
 
         for hotkey_id, modifiers, key in (
             (HOTKEY_CAPTURE_ID, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, ord("S")),
-            (HOTKEY_EXIT_ID, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, ord("Q")),
+            (HOTKEY_DELETE_ID, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, ord("O")),
         ):
             user32.RegisterHotKey(hwnd, hotkey_id, modifiers, key)
 
@@ -316,16 +317,14 @@ class WindowsTray(ShellBase):
         self._cleanup_icons()
 
     def _show_context_menu(self, hwnd: int) -> None:
+        """Right-click menu — exactly two entries per spec."""
         user32 = self._user32
         menu = user32.CreatePopupMenu()
         if not menu:
             return
         try:
-            user32.AppendMenuW(menu, MF_STRING, CMD_CAPTURE, "Capture && ask\tCtrl+Alt+S")
-            user32.AppendMenuW(menu, MF_STRING, CMD_OPEN, "Settings")
-            user32.AppendMenuW(menu, MF_STRING, CMD_DIAGNOSTICS, "Diagnostics")
-            user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
-            user32.AppendMenuW(menu, MF_STRING, CMD_EXIT, "Exit\tCtrl+Alt+Q")
+            user32.AppendMenuW(menu, MF_STRING, CMD_OPEN, "Open GUI")
+            user32.AppendMenuW(menu, MF_STRING, CMD_DIAGNOSTICS, "Diagnostics console")
             point = POINT()
             user32.GetCursorPos(ctypes.byref(point))
             user32.SetForegroundWindow(hwnd)
@@ -340,12 +339,10 @@ class WindowsTray(ShellBase):
             )
         finally:
             user32.DestroyMenu(menu)
-        if command == CMD_CAPTURE:
-            self.events.put(("capture",))
-        elif command in (CMD_OPEN, CMD_DIAGNOSTICS):
-            self.events.put(("open",) if command == CMD_OPEN else ("diagnostics",))
-        elif command == CMD_EXIT:
-            self.events.put(("exit",))
+        if command == CMD_OPEN:
+            self.events.put(("open",))
+        elif command == CMD_DIAGNOSTICS:
+            self.events.put(("diagnostics",))
 
     def _create_icon(self, rgb: Tuple[int, int, int]) -> int:
         """Build a small alpha-blended circle icon via GDI; no icon asset needed."""
@@ -493,31 +490,17 @@ class WindowsTray(ShellBase):
                 pass
 
     def set_state(self, rgb: Tuple[int, int, int], tooltip: str = "") -> None:
+        """Change the sphere color. `tooltip` is ignored — the shell is silent."""
         if not self._nid or not self.hwnd:
             return
         with self._lock:
             self._nid.hIcon = self._create_icon(rgb)
-            if tooltip:
-                self._nid.szTip = tooltip[:127]
+            self._nid.uFlags = 0x00000001 | 0x00000002  # MESSAGE|ICON only; no NIF_TIP
         self._shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(self._nid))
 
     def show_balloon(self, title: str, message: str) -> None:
-        if not self._nid or not self.hwnd:
-            return
-        NIF_INFO = 0x00000010
-        NIIF_INFO = 0x00000001
-        import ctypes
-
-        with self._lock:
-            notification = self._nid_type()
-            notification.cbSize = ctypes.sizeof(self._nid_type)
-            notification.hWnd = self._nid.hWnd
-            notification.uID = self._nid.uID
-            notification.uFlags = NIF_INFO
-            notification.szInfo = message[:255]
-            notification.szInfoTitle = title[:63]
-            notification.dwInfoFlags = NIIF_INFO
-        self._shell32.Shell_NotifyIconW(0x00000001, ctypes.byref(notification))
+        """Silent shell: no balloon notifications, ever. Color is the feedback."""
+        return
 
     def stop(self) -> None:
         if self.hwnd:

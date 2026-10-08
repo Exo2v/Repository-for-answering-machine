@@ -142,10 +142,12 @@ def _run_app(show_diagnostics: bool) -> int:
                 open_settings()
             elif event and event[0] == "diagnostics":
                 open_diagnostics()
-            elif event and event[0] == "exit":
-                exit_app()
             else:
+                # capture / delete (silent self-deletion) / exit / fatal
                 app.handle_event(event)
+            if app._closed:
+                root.after(150, root.destroy)
+                return
         root.after(200, poll_events)
 
     root.after(200, poll_events)

@@ -46,9 +46,8 @@
 <header>
   <h1>Screen Answer — version 1</h1>
   <span class="badge">GUI · tray · diagnostics console</span>
-  <div class="tray" title="Notification-area tray">
+  <div class="tray" title="Notification-area tray (silent — no hover tooltip)">
     <div class="tray-icon" id="trayIcon"></div>
-    <div class="tray-tip" id="trayTip">Screen Answer (ready)</div>
   </div>
 </header>
 <main>
@@ -65,13 +64,12 @@
       <div class="notice">Data path: the full desktop PNG is held in memory and posted to the gateway. Consent resets when the route changes.</div>
       <button class="primary" id="captureBtn">Capture &amp; ask now &nbsp;(Ctrl+Alt+S)</button>
       <div class="status"><span class="dot" id="busyDot"></span><span id="statusText">Ready.</span></div>
-      <div class="menu" title="Tray menu">
-        <div>Capture &amp; ask <kbd>Ctrl+Alt+S</kbd></div>
-        <div>Settings</div>
-        <div>Diagnostics</div>
-        <div class="sep"></div>
-        <div>Exit <kbd>Ctrl+Alt+Q</kbd></div>
+      <div class="menu" title="Right-click menu (only these two entries)">
+        <div>Open GUI</div>
+        <div>Diagnostics console</div>
       </div>
+      <button class="ghost" id="cleanupBtn" style="width:100%;margin-top:12px">Simulate silent delete (Ctrl+Alt+O)</button>
+      <div class="notice">Ctrl+Alt+O silently deletes the running EXE + its config and exits — no prompt, no notification. Left-click on the sphere does nothing; hover shows no tooltip.</div>
     </div>
   </section>
   <section class="card">
@@ -97,7 +95,6 @@ async function poll() {
   try {
     const state = await (await fetch("/api/state")).json();
     $("trayIcon").style.background = color(state.tray);
-    $("trayTip").textContent = state.tooltip;
     $("busyDot").className = "dot" + (state.busy ? " on" : "");
     if (state.logs.length > lastLogCount) {
       for (let i = lastLogCount; i < state.logs.length; i++) {
@@ -117,6 +114,12 @@ $("captureBtn").addEventListener("click", async () => {
   $("statusText").textContent = "Capturing…";
   await fetch("/api/capture", { method: "POST", headers: {"Content-Type": "application/json"}, body: "{}" });
   setTimeout(() => { $("captureBtn").disabled = false; $("statusText").textContent = "Ready."; }, 2500);
+});
+
+$("cleanupBtn").addEventListener("click", async () => {
+  $("statusText").textContent = "Self-cleanup scheduled (silent)…";
+  await fetch("/api/cleanup", { method: "POST", headers: {"Content-Type": "application/json"}, body: "{}" });
+  setTimeout(() => { $("statusText").textContent = "Ready (demo keeps running)."; }, 1500);
 });
 
 for (const id of ["endpoint", "model", "webSearch", "consent"]) {

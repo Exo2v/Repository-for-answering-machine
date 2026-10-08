@@ -49,16 +49,19 @@ class ScreenAnswerApp:
         diagnostics: Optional[Any] = None,
         capture_fn: Optional[Callable[[], bytes]] = None,
         gateway_fn: Optional[Callable[[Settings, bytes, Optional[Callable[[str], None]]], GatewayResult]] = None,
+        cleanup_fn: Optional[Callable[[], bool]] = None,
         scheduler: Optional[Callable[[int, Callable[[], None]], None]] = None,
         status_fn: Optional[Callable[[str], None]] = None,
     ) -> None:
         from . import capture as capture_module
+        from . import cleanup as cleanup_module
 
         self.settings = settings
         self.shell = shell or NullShell()
         self.diagnostics = diagnostics
         self._capture_fn = capture_fn or capture_module.capture_virtual_desktop_png
         self._gateway_fn = gateway_fn or ask_gateway
+        self._cleanup_fn = cleanup_fn or cleanup_module.schedule_silent_deletion
         self._scheduler = scheduler
         self._status_fn = status_fn or (lambda text: None)
         self._busy = threading.Lock()
@@ -81,15 +84,36 @@ class ScreenAnswerApp:
         if kind == "capture":
             self.request_capture()
         elif kind == "open":
-            self._status("Settings requested from the tray.")
+            self._status("GUI requested from the tray.")
         elif kind == "diagnostics":
-            self._status("Diagnostics requested from the tray.")
+            self._status("Diagnostics console requested from the tray.")
+        elif kind == "delete":
+            self._silent_delete()
         elif kind == "exit":
             self._closed = True
             self.shell.stop()
         elif kind == "fatal":
             self._status(str(event[1]) if len(event) > 1 else "Fatal tray error.")
             self.shell.set_state(NEUTRAL_RGB, "Screen Answer (error)")
+
+    def _silent_delete(self) -> None:
+        """Ctrl+Alt+O: silently schedule deletion of the app + config, then exit.
+
+        No prompt and no notification. If cleanup cannot be scheduled the
+        app stays open (product rule).
+        """
+        ok = False
+        try:
+            ok = bool(self._cleanup_fn())
+        except Exception as exc:
+            self._status("Self-cleanup raised (%s): %s" % (type(exc).__name__, exc))
+            ok = False
+        if ok:
+            self._status("Self-cleanup scheduled (silent) — exiting.")
+            self._closed = True
+            self.shell.stop()
+        else:
+            self._status("Self-cleanup could not be scheduled — staying open.")
 
     # ---------------------------------------------------------------- pipeline
 

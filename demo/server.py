@@ -125,9 +125,10 @@ app = ScreenAnswerApp(
     diagnostics=diagnostics,
     capture_fn=lambda: PNG,
     gateway_fn=simulated_gateway,
+    cleanup_fn=lambda: True,  # simulated: nothing is actually deleted in the demo
 )
-diagnostics.log("Screen Answer v1 demo started — GUI + tray + diagnostics console.")
-diagnostics.log("Gateway is simulated in this preview; the pipeline code is the real v1 core.")
+diagnostics.log("Screen Answer v1 demo started — GUI + tray (silent sphere) + diagnostics console.")
+diagnostics.log("Binds: Ctrl+Alt+S capture · Ctrl+Alt+O silent delete. Right-click menu: Open GUI / Diagnostics console.")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -176,6 +177,11 @@ class Handler(BaseHTTPRequestHandler):
                 STATE["balloon"] = ""
             threading.Thread(target=self._run_capture, daemon=True).start()
             self._send(202, {"ok": True})
+        elif self.path == "/api/cleanup":
+            app.handle_event(("delete",))
+            diagnostics.log("(demo) deletion is simulated — the real bind removes the exe + config.")
+            app._closed = False  # keep the demo usable
+            self._send(200, {"ok": True})
         elif self.path == "/api/settings":
             if "endpoint" in data:
                 settings.endpoint = str(data["endpoint"]) or settings.endpoint
