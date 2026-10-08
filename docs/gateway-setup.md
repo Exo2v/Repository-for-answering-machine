@@ -43,6 +43,38 @@ Open **http://localhost:3001** — the dashboard. By default it binds to `127.0.
 3. **Fallback Chain page** — create a named profile called **`search`** containing **only Google vision models** (e.g. Gemini 2.5/3.x vision entries), top to bottom. This is what `auto:search` routes through — it guarantees grounded requests land on a search-capable model, and an unknown/missing profile returns a clear `400` rather than silently going elsewhere.
 4. Reorder the **active** chain (what plain `auto` uses) with your other vision models — remember the Vision badge: image requests only route to vision-capable models, otherwise the gateway returns `422 no_vision_model`.
 
+### Recommended multi-model failover chain ("if one dies, the next answers")
+
+Failover is built in: `auto` / `auto:reliable` walks the chain top to bottom and
+skips anything that is disabled, has no key, or is cooling down (`exhausted`).
+The first model that is **ready** serves the request. Add these models on the
+**Models** page and order them like this:
+
+| # | Model | Provider route | Why it's here |
+|---|-------|----------------|---------------|
+| 1 | `google/gemini-3.8-flash` (or 2.5 Flash) | Google key | Fastest free tier (80–120/4h) and the **only** route that supports `google_search` grounding |
+| 2 | `google/gemini-2.5-flash` | Google key | Second Google tier — keeps search alive when tier 1 is cooling down |
+| 3 | `meta/llama-4-scout-17b-16e-instruct` | Groq | Solid vision, 100/8h, no Google dependency |
+| 4 | `zai/glm-4.6v-flash` | Z.ai key | Cheap fast vision, 100/3h once the key is added |
+| 5 | `github/gpt-4o` | GitHub key | 50/day backup |
+| 6 | `nvidia/nemotron-nano-12b-vl` | OpenRouter (NVIDIA NIM) | 60/hr if you add the OpenRouter key |
+| last | anything OpenRouter | OpenRouter | **Keep last** — your tier is 50 requests/day; save it as the final fallback |
+
+The `search` profile should be Google-only rows in the same top-to-bottom order.
+Image requests never hit text-only models (vision filter), and when a row shows
+`exhausted` on the dashboard it simply gets skipped — the next ready model
+answers automatically. **You do not need to change anything in Screen Answer
+when a provider dies.**
+
+### Watching provider status
+
+- **In the app** — Settings GUI → **Providers & status**. Live table of every
+  model behind the gateway with status badges: `● ready` (green — serves now),
+  `● exhausted` (red — cooling down), `● needs key` (orange — add the key),
+  `◆ router` (blue — `auto`/profile entries). Auto-refreshes every 5 seconds.
+- **On the dashboard** — the Models page shows the same statuses highlighted;
+  that's where you add keys and drag chain order.
+
 ## 4. Point Screen Answer at the gateway
 
 ```powershell

@@ -34,6 +34,7 @@ class SettingsWindow:
         on_capture: Callable[[], None],
         on_diagnostics: Callable[[], None],
         on_exit: Callable[[], None],
+        on_providers: Optional[Callable[[], None]] = None,
         status_fn: Optional[Callable[[str], None]] = None,
     ) -> None:
         self.settings = settings
@@ -41,6 +42,7 @@ class SettingsWindow:
         self._on_capture = on_capture
         self._on_diagnostics = on_diagnostics
         self._on_exit = on_exit
+        self._on_providers = on_providers
         self._status_fn = status_fn or (lambda text: None)
         self.root = None
         self._suspend_traces = False
@@ -128,6 +130,10 @@ class SettingsWindow:
         ttk.Button(buttons, text="Diagnostics", command=self._on_diagnostics).pack(
             side="left"
         )
+        if self._on_providers is not None:
+            ttk.Button(buttons, text="Providers & status", command=self._on_providers).pack(
+                side="left", padx=6
+            )
         ttk.Button(buttons, text="Exit", command=self._on_exit).pack(side="right")
 
         # Changing the route or search mode resets consent (project rule).

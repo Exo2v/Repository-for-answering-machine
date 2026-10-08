@@ -40,6 +40,12 @@
   .status { margin-top:10px; font-size:12px; color:var(--dim); }
   .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#3a4652; margin-right:6px; }
   .dot.on { background:#57d9a3; }
+  .providers { width:100%; border-collapse:collapse; font-size:12px; }
+  .providers th { text-align:left; color:var(--dim); font-weight:500; padding:4px 8px 8px 0; border-bottom:1px solid var(--border); }
+  .providers td { padding:5px 8px 5px 0; border-bottom:1px solid rgba(255,255,255,.04); }
+  .b-ready { color:#3fb950; } .b-exhausted { color:#f85149; }
+  .b-needsKey { color:#d29922; } .b-router { color:#58a6ff; } .b-unknown { color:#8b949e; }
+  .prov-note { margin-top:10px; font-size:11px; color:var(--dim); line-height:1.5; }
 </style>
 </head>
 <body>
@@ -73,6 +79,14 @@
     </div>
   </section>
   <section class="card">
+    <h2>Providers &amp; status</h2>
+    <table class="providers">
+      <thead><tr><th>Status</th><th>Model</th><th>Provider</th><th>Note</th></tr></thead>
+      <tbody id="provBody"></tbody>
+    </table>
+    <div class="prov-note">Failover is automatic: requests use <b>auto:reliable</b> and walk the fallback chain — when a model shows <span class="b-exhausted">● exhausted</span> (or dies), the next <span class="b-ready">● ready</span> model answers. Keys and chain order are managed on the FreeLLMAPI dashboard.</div>
+  </section>
+  <section class="card">
     <h2>Diagnostics console</h2>
     <div id="console"></div>
   </section>
@@ -83,6 +97,21 @@ const consoleEl = $("console");
 let lastLogCount = 0;
 
 function color(rgb) { return `rgb(${rgb[0]},${rgb[1]},${rgb[2]})`; }
+
+const STATUS_LABELS = { ready: "● ready", exhausted: "● exhausted", needsKey: "● needs key", router: "◆ router", unknown: "● unknown" };
+
+function renderProviders(models) {
+  const body = document.getElementById("provBody");
+  if (!body || !models) return;
+  body.innerHTML = models.map((m) => {
+    const status = (m.execution_status || "unknown").replace(/[<>&]/g, "");
+    const label = STATUS_LABELS[status] || ("● " + status);
+    const note = status === "ready" ? "serves now"
+      : status === "router" ? "failover chain"
+      : (m.unavailable_reason || "");
+    return `<tr><td class="b-${status}">${label}</td><td>${m.name}</td><td>${m.owned_by}</td><td>${note}</td></tr>`;
+  }).join("");
+}
 
 function classify(line) {
   if (/FAIL|error|failed|rejected|blocked/i.test(line)) return "log-err";
@@ -95,6 +124,7 @@ async function poll() {
   try {
     const state = await (await fetch("/api/state")).json();
     $("trayIcon").style.background = color(state.tray);
+    renderProviders(state.models);
     $("busyDot").className = "dot" + (state.busy ? " on" : "");
     if (state.logs.length > lastLogCount) {
       for (let i = lastLogCount; i < state.logs.length; i++) {

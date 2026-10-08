@@ -85,6 +85,7 @@ def _run_app(show_diagnostics: bool) -> int:
 
     console_holder: dict = {}
     settings_holder: dict = {}
+    providers_holder: dict = {}
 
     shell = None
     try:
@@ -128,6 +129,19 @@ def _run_app(show_diagnostics: bool) -> int:
             console_holder["console"] = DiagnosticConsole(diagnostics)
         console_holder["console"].show()
 
+    def open_providers() -> None:
+        # Live model/provider table with status badges (ready / exhausted /
+        # needs key) — same view as the FreeLLMAPI dashboard, in the app.
+        from .providers_gui import ProvidersWindow
+
+        window = providers_holder.get("window")
+        if window is None or window.root is None:
+            window = ProvidersWindow(settings, diagnostics)
+            window.build()
+            providers_holder["window"] = window
+        else:
+            window.show()
+
     def exit_app() -> None:
         app.handle_event(("exit",))
         root.after(200, root.destroy)
@@ -138,6 +152,7 @@ def _run_app(show_diagnostics: bool) -> int:
         on_capture=app.request_capture,
         on_diagnostics=open_diagnostics,
         on_exit=exit_app,
+        on_providers=open_providers,
     )
     window.build(root)
     settings_holder["window"] = window

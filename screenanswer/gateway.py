@@ -19,7 +19,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
-from .config import Settings
+from .config import Settings, normalize_endpoint
 
 MAX_API_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_API_ATTEMPTS = 3
@@ -140,6 +140,82 @@ def build_payload(
 
 # Indirection so tests can patch the transport.
 _urlopen = urllib.request.urlopen
+
+
+def parse_model_rows(payload: Dict[str, Any]) -> list:
+    """Normalize `GET /v1/models` rows for display. Pure and unit-testable."""
+    rows = []
+    for entry in payload.get("data") or []:
+        if not isinstance(entry, dict):
+            continue
+        model_id = str(entry.get("id") or "")
+        is_router = model_id in ("auto", "fusion") or model_id.startswith("auto:")
+        status = entry.get("execution_status")
+        if is_router:
+            status = "router"
+        elif status not in ("ready", "needsKey", "exhausted"):
+            status = "unknown"
+        rows.append(
+            {
+                "id": model_id,
+                "name": str(entry.get("name") or model_id),
+                "owner": str(entry.get("owned_by") or ""),
+                "status": status,
+                "available": bool(entry.get("available", False)),
+                "context_window": entry.get("context_window") or entry.get("context_length"),
+                "reason": str(entry.get("unavailable_reason") or ""),
+            }
+        )
+    return rows
+
+
+def list_models(
+    settings: Settings,
+    execution_status: Optional[str] = None,
+    available: Optional[bool] = None,
+) -> list:
+    """Fetch the gateway's live model/provider catalog with status badges.
+
+    Same surface the FreeLLMAPI dashboard uses: each row carries
+    `execution_status` (ready / needsKey / exhausted) so the app can show
+    what would serve right now and route around dead models.
+    """
+    from urllib.parse import urlencode
+
+    url = normalize_endpoint(settings.endpoint) + "/models"
+    params = []
+    if execution_status:
+        params.append(("execution_status", execution_status))
+    if available is not None:
+        params.append(("available", "true" if available else "false"))
+    if params:
+        url += "?" + urlencode(params)
+
+    headers = {"Accept": "application/json", "User-Agent": "ScreenAnswer/1.0"}
+    if settings.api_key:
+        headers["Authorization"] = "Bearer " + settings.api_key
+    request = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with _urlopen(request, timeout=15) as response:
+            raw = response.read(MAX_API_RESPONSE_BYTES + 1)
+            if len(raw) > MAX_API_RESPONSE_BYTES:
+                raise GatewayResponseTooLarge("The model list exceeded the 2 MiB safety cap.")
+            payload = json.loads(raw.decode("utf-8", "replace"))
+    except urllib.error.HTTPError as exc:
+        raw = b""
+        try:
+            raw = exc.read(MAX_API_RESPONSE_BYTES)
+        except OSError:
+            raw = b""
+        raise _error_from_body(exc.code, raw)
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise GatewayUpstreamError(
+            "Could not read models from %s (%s). Is FreeLLMAPI running?"
+            % (url, getattr(exc, "reason", exc))
+        )
+    except ValueError as exc:
+        raise GatewayUpstreamError("The gateway returned invalid JSON (%s)." % exc)
+    return parse_model_rows(payload if isinstance(payload, dict) else {})
 
 
 def _retry_after_seconds(headers: Any, attempt: int) -> float:

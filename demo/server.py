@@ -119,6 +119,35 @@ def on_log(line):
 
 
 diagnostics.add_listener(on_log)
+
+# Simulated model/provider catalog — same shape the real gateway serves at
+# GET /v1/models (id, name, owned_by, execution_status, ...). One model is
+# always "exhausted" and rotates, showing how the panel highlights a dead
+# model while auto failover keeps answering on the next one.
+MODEL_ROWS = [
+    {"id": "auto:reliable", "name": "Auto: Reliable (named fallback chain)", "owned_by": "freellmapi", "context_window": 200000, "available": True, "unavailable_reason": None, "execution_status": "router"},
+    {"id": "google/gemini-2.5-flash", "name": "Gemini 2.5 Flash", "owned_by": "google", "context_window": 1048576, "available": True, "unavailable_reason": None, "execution_status": "ready"},
+    {"id": "google/gemini-3.8-flash", "name": "Gemini 3.8 Flash", "owned_by": "google", "context_window": 1048576, "available": True, "unavailable_reason": None, "execution_status": "ready"},
+    {"id": "meta/llama-4-scout-17b-16e", "name": "Llama 4 Scout 17B", "owned_by": "groq", "context_window": 131072, "available": True, "unavailable_reason": None, "execution_status": "ready"},
+    {"id": "zai/glm-4.6v-flash", "name": "GLM-4.6V Flash", "owned_by": "zai", "context_window": 200000, "available": False, "unavailable_reason": "exhausted", "execution_status": "exhausted"},
+    {"id": "nvidia/nemotron-nano-12b-vl", "name": "Nemotron Nano 12B VL", "owned_by": "nvidia", "context_window": 131072, "available": False, "unavailable_reason": "no_key", "execution_status": "needsKey"},
+]
+_ROTATION = {"index": 4, "changed_at": time.time()}
+
+
+def current_models():
+    """Rotate which row is 'exhausted' every 20 s to show live failover."""
+    with STATE_LOCK:
+        if time.time() - _ROTATION["changed_at"] > 20:
+            rows = MODEL_ROWS
+            old = _ROTATION["index"]
+            rows[old].update(available=True, unavailable_reason=None, execution_status="ready")
+            new = 1 + (old % (len(rows) - 2))
+            if rows[new]["execution_status"] != "needsKey":
+                rows[new].update(available=False, unavailable_reason="exhausted", execution_status="exhausted")
+                _ROTATION["index"] = new
+            _ROTATION["changed_at"] = time.time()
+        return [dict(r) for r in MODEL_ROWS]
 app = ScreenAnswerApp(
     settings,
     shell=DemoShell(),
@@ -159,6 +188,7 @@ class Handler(BaseHTTPRequestHandler):
                 "web_search": settings.web_search,
                 "allow_uploads": settings.allow_uploads,
             }
+            snapshot["models"] = current_models()
             self._send(200, snapshot)
         else:
             self._send(404, {"error": "not found"})
