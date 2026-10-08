@@ -1,5 +1,0 @@
-# Optional, experimental local OCR only; the default app does not need these.
-# Keep NumPy/Transformers in the tested compatibility ranges for Pix2Text 1.1.x.
-pix2text==1.1.7
-numpy<2
-transformers>=4.37,<5

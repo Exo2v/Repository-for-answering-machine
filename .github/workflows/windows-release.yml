@@ -1,5 +1,10 @@
 name: Build Windows release
 
+# Version 1 pipeline: test the suite, freeze the `screenanswer` package
+# (GUI + tray + diagnostics console) into two standalone executables,
+# smoke-check the build, and attach assets to `v*` tags. The historical
+# WebPull scripts and the Pix2Text OCR build are out of scope for v1.
+
 on:
   workflow_dispatch:
   push:
@@ -7,16 +12,13 @@ on:
       - "**"
     tags:
       - "v*"
-      - "lasso1"
-      - "lasso2"
 
 permissions:
   contents: write
 
 jobs:
-  build-standard:
-    name: Build legacy-compatible Windows executables
-    if: github.ref != 'refs/tags/lasso1' && github.ref != 'refs/tags/lasso2'
+  build-v1:
+    name: Build Screen Answer v1 Windows executables
     runs-on: windows-2022
     steps:
       - name: Check out source
@@ -31,15 +33,22 @@ jobs:
       - name: Test
         run: python -m unittest discover -s tests -v
 
-      - name: Package standard standalone executables
+      - name: Headless selftest
+        run: python -m screenanswer --selftest
+
+      - name: Package standalone executables
         run: |
           python -m pip install pyinstaller==5.13.2
-          pyinstaller --noconfirm --clean --onefile --windowed --name ScreenAnswer answer_tray.py
-          pyinstaller --noconfirm --clean --onefile --windowed --name ScreenAnswer-Diagnostic answer_tray.py
-          .\dist\ScreenAnswer-Diagnostic.exe --check-apinex-ollama
-          .\dist\ScreenAnswer-Diagnostic.exe --check-openrouter-support
+          pyinstaller --noconfirm --clean --onefile --windowed --name ScreenAnswer screenanswer_entry.py
+          pyinstaller --noconfirm --clean --onefile --windowed --name ScreenAnswer-Diagnostic screenanswer_entry.py
 
-      - name: Upload standard standalone executables
+      - name: Smoke-check the frozen executables
+        run: |
+          .\dist\ScreenAnswer-Diagnostic.exe --selftest
+          if ($LASTEXITCODE -ne 0) { Write-Error "selftest failed"; exit 1 }
+          .\dist\ScreenAnswer-Diagnostic.exe --version
+
+      - name: Upload standalone executables
         uses: actions/upload-artifact@v4
         with:
           name: ScreenAnswer-Windows-32bit
@@ -49,248 +58,11 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  build-lasso1:
-    name: Build Lasso1 and Windows 7-compatible LassV7 executables
-    if: github.ref == 'refs/tags/lasso1' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && contains(github.event.head_commit.message, '[lasso1-build]'))
-    runs-on: windows-2022
-    steps:
-      - name: Check out source
-        uses: actions/checkout@v4
-
-      - name: Set up 32-bit Python 3.8.10 (Windows 7 target)
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.8.10"
-          architecture: "x86"
-
-      - name: Test
-        run: python -m unittest discover -s tests -v
-
-      - name: Validate the legacy Lasso1 WebPull script
-        run: |
-          $tokens = $null
-          $parseErrors = $null
-          [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path webpull-lasso1.ps1), [ref]$tokens, [ref]$parseErrors) | Out-Null
-          if ($parseErrors.Count -gt 0) {
-            $parseErrors | ForEach-Object { Write-Error $_ }
-            exit 1
-          }
-
-      - name: Package Lasso1 and Windows 7-compatible LassV7 executables
-        run: |
-          python -m pip install pyinstaller==5.13.2
-          pyinstaller --noconfirm --clean --onefile --windowed --name Lasso1 answer_tray.py
-          .\dist\Lasso1.exe --check-lasso1-build
-          pyinstaller --noconfirm --onefile --windowed --name LassV7 --distpath dist --workpath build-lassv7\work --specpath build-lassv7\spec answer_tray.py
-          .\dist\LassV7.exe --check-lassv7-build
-          Copy-Item webpull-lasso1.ps1 dist\webpull.ps1
-
-      - name: Upload Lasso executables and WebPull script
-        uses: actions/upload-artifact@v4
-        with:
-          name: Lasso1-Windows-32bit
-          path: |
-            dist/Lasso1.exe
-            dist/LassV7.exe
-            dist/webpull.ps1
-          if-no-files-found: error
-          retention-days: 30
-
-  build-lasso2:
-    name: Build LassoV2 and Windows 7-compatible LassV27 executables
-    if: github.ref == 'refs/tags/lasso2' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && contains(github.event.head_commit.message, '[lasso2-build]'))
-    runs-on: windows-2022
-    steps:
-      - name: Check out source
-        uses: actions/checkout@v4
-
-      - name: Set up 32-bit Python 3.8.10 (Windows 7 target)
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.8.10"
-          architecture: "x86"
-
-      - name: Test
-        run: python -m unittest discover -s tests -v
-
-      - name: Validate the PowerShell WebPull script
-        run: |
-          $tokens = $null
-          $parseErrors = $null
-          [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path webpull.ps1), [ref]$tokens, [ref]$parseErrors) | Out-Null
-          if ($parseErrors.Count -gt 0) {
-            $parseErrors | ForEach-Object { Write-Error $_ }
-            exit 1
-          }
-
-      - name: Package LassoV2 and Windows 7-compatible LassV27 executables
-        run: |
-          python -m pip install pyinstaller==5.13.2
-          pyinstaller --noconfirm --clean --onefile --windowed --name LassoV2 answer_tray.py
-          .\dist\LassoV2.exe --check-lassov2-build
-          pyinstaller --noconfirm --onefile --windowed --name LassV27 --distpath dist --workpath build-lassv27\work --specpath build-lassv27\spec answer_tray.py
-          .\dist\LassV27.exe --check-lassv27-build
-          Copy-Item webpull.ps1 dist\webpull.ps1
-
-      - name: Upload LassoV2 and LassV27 executables and WebPull script
-        uses: actions/upload-artifact@v4
-        with:
-          name: LassoV2-Windows-32bit
-          path: |
-            dist/LassoV2.exe
-            dist/LassV27.exe
-            dist/webpull.ps1
-          if-no-files-found: error
-          retention-days: 30
-
-  build-pix2text:
-    name: Build experimental Pix2Text executable (Windows x64)
-    # The commit-message opt-in also permits test builds where manual dispatch is unavailable.
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && contains(github.event.head_commit.message, '[pix2text-build]'))
-    runs-on: windows-2022
-    timeout-minutes: 120
-    steps:
-      - name: Check out source
-        uses: actions/checkout@v4
-
-      - name: Set up 64-bit Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          architecture: "x64"
-
-      - name: Install CPU-only PyTorch
-        run: >-
-          python -m pip install --extra-index-url https://download.pytorch.org/whl/cpu
-          "torch==2.5.1+cpu" "torchvision==0.20.1+cpu"
-
-      - name: Install Pix2Text runtime
-        run: python -m pip install -r requirements-pix2text.txt
-
-      - name: Install PyInstaller
-        run: python -m pip install pyinstaller==6.22.3
-
-      - name: Test
-        run: python -m unittest discover -s tests -v
-
-      - name: Package experimental standalone executable
-        run: >-
-          pyinstaller --noconfirm --clean --onefile --windowed
-          --name ScreenAnswer-Pix2Text
-          --collect-all pix2text
-          --collect-all cnocr
-          --collect-all cnstd
-          --collect-all doclayout_yolo
-          --collect-all rapidocr
-          --collect-all onnxruntime
-          --collect-all optimum
-          --collect-all transformers
-          --collect-all tokenizers
-          --collect-all torch
-          --collect-all torchvision
-          --collect-all cv2
-          --collect-all PIL
-          --collect-all fitz
-          --collect-all spellchecker
-          answer_tray.py
-
-      - name: Smoke-test bundled Pix2Text imports
-        run: .\dist\ScreenAnswer-Pix2Text.exe --check-pix2text
-
-      - name: Upload experimental standalone executable
-        uses: actions/upload-artifact@v4
-        with:
-          name: ScreenAnswer-Pix2Text-Windows-x64
-          path: dist/ScreenAnswer-Pix2Text.exe
-          if-no-files-found: error
-          retention-days: 30
-
-  release:
-    name: Publish Windows release assets
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs:
-      - build-standard
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download standard executables
-        uses: actions/download-artifact@v4
-        with:
-          name: ScreenAnswer-Windows-32bit
-          path: release-assets
-
-      - name: Attach executables to GitHub Release
+      - name: Attach assets to a v* release
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
-          prerelease: ${{ contains(github.ref, '-experimental') }}
           files: |
-            release-assets/ScreenAnswer.exe
-            release-assets/ScreenAnswer-Diagnostic.exe
-
-  release-lasso1:
-    name: Publish Lasso1 Windows release
-    if: github.ref == 'refs/tags/lasso1'
-    needs:
-      - build-lasso1
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download Lasso1 executable
-        uses: actions/download-artifact@v4
-        with:
-          name: Lasso1-Windows-32bit
-          path: release-assets
-
-      - name: Attach Lasso1 to GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          name: lasso1
-          generate_release_notes: false
-          overwrite_files: true
-          body: |
-            Lasso1 and LassV7 are tray-only, OpenRouter-only Windows builds. LassV7.exe is the dedicated 32-bit Windows 7-compatible build packaged with Python 3.8.10 and PyInstaller 5.13.2.
-
-            On first run, Lasso1 creates `%APPDATA%\Lasso1\config.json`; LassV7 creates `%APPDATA%\LassV7\config.json`. The API-key value starts blank, `google/gemma-4-31b-it:free` is the default OpenRouter model, no credentials or config files are bundled, and screenshot-upload consent is off by default. Only the two curated Gemma `:free` vision models are accepted; paid models are rejected. Right-click the tray and choose Open to configure; Save writes the matching config and closes Settings. Neither Settings GUI displays a model field; edit `models.openrouter` in the config file and restart to change between allowlisted free models. A small Diagnostics button opens the live diagnostic page only on demand; it does not open at startup.
-
-            Capture uses Ctrl+Alt+S; the full virtual desktop is sent through OpenRouter to its free-model host only after explicit config-file consent. The model host's data terms apply; do not upload sensitive screens. Web search and tool execution are disabled. LassV7 issues no notification-area balloons and registers no hover tooltip; its color alone reports state.
-
-            Ctrl+Alt+O silently closes the Lasso app and schedules deletion of only the running executable and its matching config.json. The right-click self-destruct action still asks for confirmation. The config folder is removed only if empty; unexpected files are left untouched.
-
-            PowerShell WebPull command (downloads LassV7 into Downloads): `irm https://github.com/Exo2v/indigo-otter-731/releases/download/lasso1/webpull.ps1 | iex`. The WebPull does not include any API credentials.
-          files: |
-            release-assets/Lasso1.exe
-            release-assets/LassV7.exe
-            release-assets/webpull.ps1
-
-  release-lasso2:
-    name: Publish LassoV2 Windows release
-    if: github.ref == 'refs/tags/lasso2'
-    needs:
-      - build-lasso2
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download LassoV2 and LassV27 executables
-        uses: actions/download-artifact@v4
-        with:
-          name: LassoV2-Windows-32bit
-          path: release-assets
-
-      - name: Attach LassoV2 and LassV27 to GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          name: LassoV2 and LassV27
-          generate_release_notes: false
-          overwrite_files: true
-          body: |
-            LassoV2 and LassV27 are tray-only, OpenRouter-only Windows builds. LassV27.exe is the dedicated 32-bit Windows 7-compatible build packaged with Python 3.8.10 and PyInstaller 5.13.2. Older Lasso1/LassV7 releases and their separate config folders remain unchanged.
-
-            On first run, LassoV2 creates `%APPDATA%\LassoV2\config.json`; LassV27 creates `%APPDATA%\LassV27\config.json`. The API-key value starts blank, `google/gemma-4-31b-it:free` is the default OpenRouter model, no credentials or config files are bundled, and screenshot-upload consent is off by default. Only the two curated Gemma `:free` vision models are accepted; paid models are rejected. Right-click the tray and choose Open to configure; Save writes the matching config and closes Settings. Neither Settings GUI displays a model field; edit `models.openrouter` in the config file and restart to change between allowlisted free models. A small Diagnostics button opens the live diagnostic page only on demand; it does not open at startup.
-
-            Capture uses Ctrl+Alt+S; the full virtual desktop is sent through OpenRouter to its free-model host only after explicit config-file consent. The model host's data terms apply; do not upload sensitive screens. Web search and tool execution are disabled. LassV27 issues no notification-area balloons and registers no hover tooltip; its color alone reports state.
-
-            Ctrl+Alt+O silently closes the Lasso app and schedules deletion of only the running executable and its matching config.json. The right-click self-destruct action still asks for confirmation. The config folder is removed only if empty; unexpected files are left untouched.
-
-            PowerShell WebPull command (downloads LassV27 into Downloads): `irm https://github.com/Exo2v/indigo-otter-731/releases/download/lasso2/webpull.ps1 | iex`. The WebPull does not include any API credentials.
-          files: |
-            release-assets/LassoV2.exe
-            release-assets/LassV27.exe
-            release-assets/webpull.ps1
+            dist/ScreenAnswer.exe
+            dist/ScreenAnswer-Diagnostic.exe
+          prerelease: ${{ contains(github.ref_name, '-') }}
