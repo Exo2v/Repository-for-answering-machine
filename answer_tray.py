@@ -33,7 +33,20 @@ from typing import Any, Callable, Dict, Optional, Tuple
 DEFAULT_MODEL = "gemini-3.8-flash"
 DEFAULT_MISTRAL_MODEL = "mistral-medium-latest"
 DEFAULT_GROQ_MODEL = "qwen/qwen3.8-27b"
-DEFAULT_OPENROUTER_MODEL = "google/gemini-3.8-flash"
+DEFAULT_OPENROUTER_MODEL = "google/gemma-4-31b-it:free"
+# Current Groq free-tier references identify Qwen 3.8 27B as the only supported
+# vision/reasoning candidate; its official model guides confirm both capabilities.
+# All other Groq model IDs are rejected before save or network access. The API
+# has no request-level free switch, so the account plan still determines billing.
+GROQ_FREE_VISION_REASONING_MODELS = frozenset((DEFAULT_GROQ_MODEL,))
+# Keep OpenRouter on explicitly priced :free variants, not openrouter/free (whose
+# model selection is dynamic) or an unqualified model ID that could be paid.
+OPENROUTER_FREE_VISION_REASONING_MODELS = frozenset(
+    (
+        DEFAULT_OPENROUTER_MODEL,
+        "google/gemma-4-26b-a4b-it:free",
+    )
+)
 LEGACY_MISTRAL_MODEL = "ministral-14b-2512"
 MISTRAL_OCR_MODEL = "mistral-ocr-latest"
 DEFAULT_PROVIDER = "gemini"
@@ -121,14 +134,15 @@ DEFAULT_MODELS = {provider: _ALL_DEFAULT_MODELS[provider] for provider in PROVID
 
 
 def valid_model_name(provider: str, model: str) -> bool:
-    """Validate editable model IDs, including namespaced provider model slugs."""
+    """Validate model IDs, with fail-closed free vision allowlists for Groq/OpenRouter."""
+    if not isinstance(provider, str) or not isinstance(model, str):
+        return False
     if provider == "groq":
-        return bool(re.fullmatch(r"[A-Za-z0-9._/-]{1,120}", model))
+        return model in GROQ_FREE_VISION_REASONING_MODELS
     if provider == "openrouter":
-        # OpenRouter slugs may be namespaced and use router/variant suffixes.
-        # Its :online suffix enables web search, which this app intentionally forbids.
-        valid_slug = bool(re.fullmatch(r"[A-Za-z0-9._~:/-]{1,120}", model))
-        return valid_slug and not model.lower().endswith(":online")
+        # Exact :free IDs prevent paid routing and :online/search variants. These
+        # curated entries are verified to accept screenshot images and support reasoning.
+        return model in OPENROUTER_FREE_VISION_REASONING_MODELS
     return bool(re.fullmatch(r"[A-Za-z0-9._-]{1,100}", model))
 
 
@@ -291,7 +305,7 @@ def save_lasso1_config(
     if not key:
         raise ValueError("An OpenRouter API key is required.")
     if not valid_model_name("openrouter", selected_model):
-        raise ValueError("Enter a valid OpenRouter model name.")
+        raise ValueError("Use an OpenRouter model from the curated free vision allowlist.")
 
     config = lasso1_config_template()
     config["api_keys"]["openrouter"] = key
@@ -302,7 +316,7 @@ def save_lasso1_config(
 
 
 def _migrate_lasso1_config_defaults(config_path: str) -> bool:
-    """Fill a missing model default while preserving custom config values."""
+    """Migrate missing/unapproved IDs to free vision choices and retain allowed variants."""
     try:
         with open(config_path, "r", encoding="utf-8") as config_file:
             config = json.load(config_file)
@@ -318,13 +332,20 @@ def _migrate_lasso1_config_defaults(config_path: str) -> bool:
         updated_models = {}
     model = updated_models.get("openrouter")
     changed = False
-    if not isinstance(model, str) or not model.strip():
+    if not valid_model_name("openrouter", model):
         legacy_model = config.get("model")
-        if isinstance(legacy_model, str) and legacy_model.strip():
-            updated_models["openrouter"] = legacy_model.strip()
+        if valid_model_name("openrouter", legacy_model):
+            updated_models["openrouter"] = legacy_model
         else:
             updated_models["openrouter"] = DEFAULT_OPENROUTER_MODEL
         config["models"] = updated_models
+        # Consent for the old model/provider route does not authorize sending to
+        # the newly selected free model endpoint. Require explicit re-consent.
+        if config.get("allow_screenshot_uploads") is True:
+            config["allow_screenshot_uploads"] = False
+        changed = True
+    if "model" in config:
+        config.pop("model", None)
         changed = True
     if "_instructions" in config:
         config.pop("_instructions", None)
@@ -509,13 +530,22 @@ def load_portable_config(path: Optional[str] = None) -> Dict[str, Any]:
     if isinstance(legacy_model, str) and legacy_model.strip():
         models.setdefault(provider, legacy_model.strip())
     # Upgrade the previous Mistral default when it was stored by an older build.
-    # Custom model names remain untouched.
+    # Custom model names remain untouched for providers outside the free-only policy.
     if models.get("mistral") == LEGACY_MISTRAL_MODEL:
         models["mistral"] = DEFAULT_MISTRAL_MODEL
-    if LASSO1_MODE:
-        openrouter_model = models.get("openrouter")
-        if not isinstance(openrouter_model, str) or not openrouter_model.strip():
-            models["openrouter"] = DEFAULT_OPENROUTER_MODEL
+    for restricted_provider, default_model in (
+        ("groq", DEFAULT_GROQ_MODEL),
+        ("openrouter", DEFAULT_OPENROUTER_MODEL),
+    ):
+        stored_model = models.get(restricted_provider)
+        if stored_model is not None and not valid_model_name(
+            restricted_provider, stored_model
+        ):
+            models[restricted_provider] = default_model
+    if LASSO1_MODE and not valid_model_name(
+        "openrouter", models.get("openrouter", "")
+    ):
+        models["openrouter"] = DEFAULT_OPENROUTER_MODEL
 
     ocr_backend = raw_config.get("ocr_backend", DEFAULT_OCR_BACKEND)
     if not isinstance(ocr_backend, str) or ocr_backend not in OCR_BACKEND_LABELS:
@@ -598,6 +628,15 @@ def save_portable_config(
             saved_models[model_provider.lower()] = model_value.strip()
     if model.strip():
         saved_models[selected_provider] = model.strip()
+    for restricted_provider, default_model in (
+        ("groq", DEFAULT_GROQ_MODEL),
+        ("openrouter", DEFAULT_OPENROUTER_MODEL),
+    ):
+        stored_model = saved_models.get(restricted_provider)
+        if stored_model is not None and not valid_model_name(
+            restricted_provider, stored_model
+        ):
+            saved_models[restricted_provider] = default_model
 
     with open(config_path, "w", encoding="utf-8") as config_file:
         json.dump(
@@ -2029,7 +2068,9 @@ def ask_groq(
             diagnostic(safe_message)
 
     if not valid_model_name("groq", model):
-        raise RuntimeError("The Groq model name contains unsupported characters.")
+        raise RuntimeError(
+            "The Groq model is outside this build's free-tier vision/reasoning allowlist."
+        )
 
     markdown = ocr_markdown.strip() if isinstance(ocr_markdown, str) else ""
     if len(markdown) > MAX_OCR_CONTEXT_CHARS:
@@ -2360,7 +2401,8 @@ def ask_openrouter(
 
     if not valid_model_name("openrouter", model):
         raise RuntimeError(
-            "The OpenRouter model name is invalid or uses :online web-search mode, which is disabled."
+            "The OpenRouter model is outside this build's free vision allowlist; "
+            "paid and :online models are disabled."
         )
 
     markdown = ocr_markdown.strip() if isinstance(ocr_markdown, str) else ""
@@ -2395,6 +2437,7 @@ def ask_openrouter(
             },
         ],
         "max_tokens": MAX_OPENROUTER_OUTPUT_TOKENS,
+        "reasoning": {"effort": "medium", "exclude": True},
     }
     report("Preparing OpenRouter vision request for model %s." % model)
     response_data = _openrouter_post_json(api_key, request_body, report)
@@ -3360,7 +3403,8 @@ class ScreenAnswerApp:
             outer,
             text=(
                 "OpenRouter-only tray app. Ctrl+Alt+S captures the full desktop and sends it "
-                "to OpenRouter. Live web search and tool execution are disabled."
+                "through OpenRouter to its selected free inference host. Live web search and "
+                "tool execution are disabled."
             ),
             justify="left",
             wraplength=500,
@@ -3387,8 +3431,9 @@ class ScreenAnswerApp:
         self.privacy_checkbutton = tk.Checkbutton(
             outer,
             text=(
-                "I consent to sending the full desktop screenshot to OpenRouter when I press "
-                "Ctrl+Alt+S. Leave unchecked to block screenshot uploads."
+                "I consent to sending the full desktop screenshot through OpenRouter to its "
+                "free inference host when I press Ctrl+Alt+S. Host data terms apply; do not "
+                "upload sensitive screens. Leave unchecked to block uploads."
             ),
             variable=self.privacy_var,
             wraplength=500,
@@ -3572,6 +3617,18 @@ class ScreenAnswerApp:
     def _consent_text(self, provider: str) -> str:
         provider_label = PROVIDER_LABELS.get(provider, "the selected provider")
         if self.form_ocr_backend == "pix2text":
+            if provider == "openrouter":
+                return (
+                    "I understand Pix2Text reads locally, then the full screenshot and OCR "
+                    "text go through OpenRouter to its selected model host. Host data terms "
+                    "apply; no live web search is used. Do not upload sensitive screens."
+                )
+            if provider == "groq":
+                return (
+                    "I understand Pix2Text reads locally, then the full screenshot and OCR "
+                    "text go to Groq. The model is free only under Groq's Free plan; its "
+                    "Developer plan may bill."
+                )
             return (
                 "I understand Pix2Text reads the screenshot locally, then the full screenshot "
                 "and OCR text are uploaded to %s for AI solving."
@@ -3584,12 +3641,15 @@ class ScreenAnswerApp:
         if provider == "groq":
             return (
                 "I understand each capture uploads the full desktop screenshot directly to "
-                "Groq's vision chat API; no separate OCR service is called."
+                "Groq's vision chat API. This model is free only under Groq's Free plan; "
+                "the Developer plan may bill. No separate OCR service is called."
             )
         if provider == "openrouter":
             return (
-                "I understand each capture uploads the full desktop screenshot directly to "
-                "OpenRouter's vision chat API; no separate OCR service or live web search is used."
+                "I understand each capture sends the full desktop screenshot through "
+                "OpenRouter to its selected free-model host for vision inference. Host data "
+                "terms apply; no separate OCR service or live web search is used. Do not "
+                "upload sensitive screens."
             )
         return "I understand each capture uploads the full desktop screenshot to %s." % provider_label
 
@@ -3663,7 +3723,9 @@ class ScreenAnswerApp:
             return False
         if not valid_model_name("openrouter", model):
             self.show_window()
-            self._show_error("Enter a valid OpenRouter model name.")
+            self._show_error(
+                "OpenRouter is limited to the configured free vision model allowlist."
+            )
             return False
         try:
             save_lasso1_config(
@@ -3717,12 +3779,26 @@ class ScreenAnswerApp:
             self._show_error("Please acknowledge the full-screen upload notice first.")
             return False
         if not valid_model_name(provider, model):
-            self._log_diagnostic("Settings save blocked: model name contains unsupported characters.")
-            self.show_window()
-            self._show_error(
-                "Enter a valid %s model name, such as %s."
-                % (provider_label, DEFAULT_MODELS[provider])
+            self._log_diagnostic(
+                "Settings save blocked: model is outside the provider's allowed model policy."
             )
+            self.show_window()
+            if provider == "groq":
+                model_error = (
+                    "Groq is restricted to its curated Free-plan vision/reasoning model: %s."
+                    % DEFAULT_GROQ_MODEL
+                )
+            elif provider == "openrouter":
+                model_error = (
+                    "OpenRouter is restricted to curated free vision models: %s."
+                    % ", ".join(sorted(OPENROUTER_FREE_VISION_REASONING_MODELS))
+                )
+            else:
+                model_error = "Enter a valid %s model name, such as %s." % (
+                    provider_label,
+                    DEFAULT_MODELS[provider],
+                )
+            self._show_error(model_error)
             return False
         ocr_backend = self.form_ocr_backend
         if ocr_backend == "pix2text" and not pix2text_installed():
@@ -4176,7 +4252,10 @@ def main() -> int:
     if "--check-pix2text" in sys.argv[1:]:
         return 0 if pix2text_bundle_importable() else 1
     if "--check-groq-provider" in sys.argv[1:]:
-        return 0 if APP_DEFAULT_PROVIDER == "groq" else 1
+        return 0 if (
+            APP_DEFAULT_PROVIDER == "groq"
+            and valid_model_name("groq", DEFAULT_GROQ_MODEL)
+        ) else 1
     if "--check-openrouter-support" in sys.argv[1:]:
         return 0 if (
             PROVIDER_LABELS.get("openrouter") == "OpenRouter"
@@ -4194,6 +4273,8 @@ def main() -> int:
             and tuple(PROVIDER_LABELS) == ("openrouter",)
             and tuple(API_KEY_ENV_VARS) == ("openrouter",)
             and tuple(DEFAULT_MODELS) == ("openrouter",)
+            and DEFAULT_MODELS["openrouter"] == DEFAULT_OPENROUTER_MODEL
+            and valid_model_name("openrouter", DEFAULT_OPENROUTER_MODEL)
             and diagnostics_mode_enabled(("--diagnostics",), "Lasso1.exe") is False
         ) else 1
     if "--check-lassv7-build" in sys.argv[1:]:
@@ -4205,6 +4286,8 @@ def main() -> int:
             and tuple(PROVIDER_LABELS) == ("openrouter",)
             and tuple(API_KEY_ENV_VARS) == ("openrouter",)
             and tuple(DEFAULT_MODELS) == ("openrouter",)
+            and DEFAULT_MODELS["openrouter"] == DEFAULT_OPENROUTER_MODEL
+            and valid_model_name("openrouter", DEFAULT_OPENROUTER_MODEL)
             and lasso_config_directory_for_executable("LassV7.exe")
             == LASSV7_CONFIG_DIRECTORY
             and sys.version_info[:3] == (3, 8, 10)

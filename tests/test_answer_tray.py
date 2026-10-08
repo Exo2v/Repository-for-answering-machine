@@ -17,6 +17,8 @@ from answer_tray import (
     DEFAULT_MISTRAL_MODEL,
     DEFAULT_GROQ_MODEL,
     DEFAULT_OPENROUTER_MODEL,
+    GROQ_FREE_VISION_REASONING_MODELS,
+    OPENROUTER_FREE_VISION_REASONING_MODELS,
     GROQ_ENDPOINT,
     ScreenAnswerApp,
     WindowsTray,
@@ -180,7 +182,7 @@ class Lasso1ModeTests(unittest.TestCase):
         self.assertFalse(hasattr(app, "model_var"))
         self.assertNotIn("model", " ".join(labels).lower())
 
-    def test_blank_or_missing_model_is_defaulted_and_custom_values_are_preserved(self):
+    def test_missing_or_unapproved_models_migrate_and_valid_free_custom_is_preserved(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "Lasso1", "config.json")
             os.makedirs(os.path.dirname(path))
@@ -229,9 +231,11 @@ class Lasso1ModeTests(unittest.TestCase):
                 migrated_legacy = json.load(config_file)
             self.assertEqual(
                 migrated_legacy["models"]["openrouter"],
-                "custom/legacy-vision-model",
+                DEFAULT_OPENROUTER_MODEL,
             )
             self.assertEqual(migrated_legacy["api_key"], "saved-key")
+            self.assertNotIn("model", migrated_legacy)
+            self.assertIs(migrated_legacy["allow_screenshot_uploads"], False)
 
             custom_config = {
                 "provider": "openrouter",
@@ -243,10 +247,28 @@ class Lasso1ModeTests(unittest.TestCase):
                 json.dump(custom_config, config_file)
             self.assertFalse(ensure_lasso1_config(path))
             with open(path, "r", encoding="utf-8") as config_file:
-                preserved = json.load(config_file)
-            self.assertEqual(preserved["models"]["openrouter"], "custom/vision-model")
-            self.assertEqual(preserved["api_keys"]["openrouter"], "saved-key")
-            self.assertIs(preserved["allow_screenshot_uploads"], True)
+                migrated_paid = json.load(config_file)
+            self.assertEqual(
+                migrated_paid["models"]["openrouter"], DEFAULT_OPENROUTER_MODEL
+            )
+            self.assertEqual(migrated_paid["api_keys"]["openrouter"], "saved-key")
+            self.assertIs(migrated_paid["allow_screenshot_uploads"], False)
+
+            allowed_free_model = sorted(OPENROUTER_FREE_VISION_REASONING_MODELS)[1]
+            allowed_config = {
+                "provider": "openrouter",
+                "api_keys": {"openrouter": "saved-key"},
+                "models": {"openrouter": allowed_free_model},
+                "allow_screenshot_uploads": True,
+            }
+            with open(path, "w", encoding="utf-8") as config_file:
+                json.dump(allowed_config, config_file)
+            self.assertFalse(ensure_lasso1_config(path))
+            with open(path, "r", encoding="utf-8") as config_file:
+                preserved_free = json.load(config_file)
+            self.assertEqual(preserved_free["models"]["openrouter"], allowed_free_model)
+            self.assertEqual(preserved_free["api_keys"]["openrouter"], "saved-key")
+            self.assertIs(preserved_free["allow_screenshot_uploads"], True)
 
     def test_config_loader_keeps_only_openrouter_and_requires_boolean_consent(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -434,6 +456,26 @@ class Lasso1ModeTests(unittest.TestCase):
             with open(path, "r", encoding="utf-8") as config_file:
                 saved = json.load(config_file)
             self.assertIs(saved["allow_screenshot_uploads"], True)
+
+    def test_free_provider_upload_notices_disclose_billing_and_host_data_terms(self):
+        app = object.__new__(ScreenAnswerApp)
+        app.form_ocr_backend = "provider"
+        groq_notice = app._consent_text("groq")
+        self.assertIn("Free plan", groq_notice)
+        self.assertIn("Developer plan may bill", groq_notice)
+
+        openrouter_notice = app._consent_text("openrouter")
+        self.assertIn("through OpenRouter", openrouter_notice)
+        self.assertIn("Host data terms apply", openrouter_notice)
+        self.assertIn("Do not upload sensitive screens", openrouter_notice)
+        self.assertIn("no separate OCR service", openrouter_notice)
+        self.assertIn("live web search", openrouter_notice)
+
+        app.form_ocr_backend = "pix2text"
+        local_ocr_notice = app._consent_text("openrouter")
+        self.assertIn("OCR text", local_ocr_notice)
+        self.assertIn("Host data terms apply", local_ocr_notice)
+        self.assertIn("Do not upload sensitive screens", local_ocr_notice)
 
     def test_lasso1_settings_window_can_be_shown_on_demand(self):
         app = object.__new__(ScreenAnswerApp)
@@ -1705,14 +1747,36 @@ class GroqRequestTests(unittest.TestCase):
         self.assertTrue(any("[REDACTED API KEY]" in line for line in diagnostics))
         self.assertFalse(any(api_key in line for line in diagnostics))
 
-    def test_namespaced_model_id_and_groq_executable_default(self):
+    def test_groq_and_openrouter_model_ids_are_restricted_to_free_vision_allowlists(self):
+        self.assertEqual(GROQ_FREE_VISION_REASONING_MODELS, {DEFAULT_GROQ_MODEL})
         self.assertTrue(valid_model_name("groq", DEFAULT_GROQ_MODEL))
+        self.assertFalse(valid_model_name("groq", "openai/gpt-oss-120b"))
+        self.assertFalse(valid_model_name("groq", "qwen/qwen3.6-27b"))
         self.assertFalse(valid_model_name("gemini", DEFAULT_GROQ_MODEL))
         self.assertFalse(valid_model_name("groq", "qwen/model?bad"))
+
+        self.assertEqual(len(OPENROUTER_FREE_VISION_REASONING_MODELS), 2)
+        for free_model in OPENROUTER_FREE_VISION_REASONING_MODELS:
+            self.assertTrue(free_model.endswith(":free"))
+            self.assertTrue(valid_model_name("openrouter", free_model))
         self.assertTrue(valid_model_name("openrouter", DEFAULT_OPENROUTER_MODEL))
+        self.assertFalse(valid_model_name("openrouter", "google/gemini-3.8-flash"))
+        self.assertFalse(valid_model_name("openrouter", "openai/gpt-oss-120b:free"))
+        self.assertFalse(valid_model_name("openrouter", "openrouter/free"))
         self.assertFalse(valid_model_name("openrouter", "google/model:online"))
         self.assertEqual(default_provider_for_executable("ScreenAnswer-Groq.exe"), "groq")
         self.assertEqual(default_provider_for_executable("ScreenAnswer.exe"), "gemini")
+
+    def test_groq_blocks_paid_or_nonvision_models_before_network_access(self):
+        with patch("answer_tray.urllib.request.urlopen") as urlopen:
+            for rejected_model in (
+                "openai/gpt-oss-120b",
+                "qwen/qwen3.6-27b",
+                "paid/vision-model",
+            ):
+                with self.assertRaisesRegex(RuntimeError, "free-tier vision/reasoning allowlist"):
+                    ask_groq("key", rejected_model, b"image")
+        urlopen.assert_not_called()
 
 
 class OpenRouterRequestTests(unittest.TestCase):
@@ -1743,7 +1807,7 @@ class OpenRouterRequestTests(unittest.TestCase):
                 "prompt_tokens": 120,
                 "completion_tokens": 70,
                 "total_tokens": 190,
-                "cost": 0.00123,
+                "cost": 0.0,
             },
         }
 
@@ -1790,6 +1854,7 @@ class OpenRouterRequestTests(unittest.TestCase):
         body = request["body"]
         self.assertEqual(body["model"], DEFAULT_OPENROUTER_MODEL)
         self.assertEqual(body["max_tokens"], 4096)
+        self.assertEqual(body["reasoning"], {"effort": "medium", "exclude": True})
         self.assertNotIn("tools", body)
         self.assertNotIn("plugins", body)
         self.assertIn("Do not use live web search", body["messages"][0]["content"])
@@ -1887,15 +1952,23 @@ class OpenRouterRequestTests(unittest.TestCase):
         self.assertTrue(any("[REDACTED API KEY]" in line for line in diagnostics))
         self.assertFalse(any(api_key in line for line in diagnostics))
 
-    def test_rejects_online_model_suffix_before_any_network_request(self):
+    def test_rejects_paid_or_unapproved_model_before_any_network_request(self):
         self.assertTrue(valid_model_name("openrouter", DEFAULT_OPENROUTER_MODEL))
-        self.assertTrue(valid_model_name("openrouter", "~openai/gpt-sol-latest"))
-        self.assertTrue(valid_model_name("openrouter", "qwen/qwen3.8-27b:free"))
-        self.assertFalse(valid_model_name("openrouter", "google/gemini-3.8-flash:online"))
+        self.assertFalse(valid_model_name("openrouter", "google/gemini-3.8-flash"))
+        self.assertFalse(valid_model_name("openrouter", "openai/gpt-oss-120b:free"))
+        self.assertFalse(valid_model_name("openrouter", "openrouter/free"))
+        self.assertFalse(valid_model_name("openrouter", "google/model:online"))
         self.assertFalse(valid_model_name("openrouter", "model?bad"))
         with patch("answer_tray.urllib.request.urlopen") as urlopen:
-            with self.assertRaisesRegex(RuntimeError, "web-search mode"):
-                ask_openrouter("key", "google/gemini-3.8-flash:online", b"image")
+            for rejected_model in (
+                "google/gemini-3.8-flash",
+                "openai/gpt-oss-120b:free",
+                "openrouter/free",
+                "google/model:online",
+                "model?bad",
+            ):
+                with self.assertRaisesRegex(RuntimeError, "free vision allowlist"):
+                    ask_openrouter("key", rejected_model, b"image")
         urlopen.assert_not_called()
 
     def test_packaged_diagnostic_smoke_check_recognizes_openrouter(self):
@@ -1999,6 +2072,42 @@ class PortableConfigTests(unittest.TestCase):
                     "models": {"gemini": "gemini-3.8-flash"},
                     "ocr_backend": "provider",
                 },
+            )
+
+    def test_invalid_saved_groq_and_openrouter_models_are_migrated_to_free_defaults(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "screen_answer_config.json")
+            with open(path, "w", encoding="utf-8") as config_file:
+                json.dump(
+                    {
+                        "provider": "groq",
+                        "api_keys": {"groq": "groq-key", "openrouter": "router-key"},
+                        "models": {
+                            "groq": "openai/gpt-oss-120b",
+                            "openrouter": "google/gemini-3.8-flash",
+                        },
+                    },
+                    config_file,
+                )
+
+            loaded = load_portable_config(path)
+            self.assertEqual(loaded["models"]["groq"], DEFAULT_GROQ_MODEL)
+            self.assertEqual(loaded["models"]["openrouter"], DEFAULT_OPENROUTER_MODEL)
+            self.assertEqual(loaded["api_keys"], {"groq": "groq-key", "openrouter": "router-key"})
+
+            save_portable_config(
+                path=path,
+                provider="gemini",
+                models={
+                    "groq": "openai/gpt-oss-120b",
+                    "openrouter": "google/gemini-3.8-flash",
+                },
+            )
+            with open(path, "r", encoding="utf-8") as config_file:
+                saved = json.load(config_file)
+            self.assertEqual(
+                saved["models"],
+                {"groq": DEFAULT_GROQ_MODEL, "openrouter": DEFAULT_OPENROUTER_MODEL},
             )
 
     def test_missing_or_invalid_config_falls_back_to_empty(self):

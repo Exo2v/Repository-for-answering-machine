@@ -32,13 +32,19 @@ try {
 LassV7 - Windows 7-compatible tray app
 
 Run LassV7.exe. To open settings, right-click its tray icon and choose Open.
-A new config has a blank API-key value and a default OpenRouter model value;
-screenshot upload consent is off. The model is not shown in the Settings GUI.
-Enter your own API key and enable consent only if you agree to upload.
+A new config has a blank API-key value and defaults to
+google/gemma-4-31b-it:free; screenshot upload consent is off. The model is not
+shown in the Settings GUI. Only the two allowlisted Gemma :free vision models
+are accepted; paid model IDs are rejected.
+
+Enter your own API key and enable consent only if you agree to send screenshots
+through OpenRouter to its free-model host. Host data terms apply; do not upload
+sensitive screens.
 
 Config path: %APPDATA%\LassV7\config.json
-To change the model, open this config file and edit models.openrouter, then
-restart LassV7. The app does not read credentials from this download folder.
+To change the model, open this config file and edit models.openrouter to an
+allowlisted Gemma :free ID, then restart LassV7. The app does not read
+credentials from this download folder.
 No servomotor/credential file is bundled.
 Ctrl+Alt+O silently closes LassV7 and schedules deletion of only LassV7.exe and
 its matching config.json. Other files in the config folder are left untouched.
