@@ -225,6 +225,20 @@ class Handler(BaseHTTPRequestHandler):
             diagnostics.log("Settings updated (search=%s, model=%s)."
                             % (settings.web_search, settings.model))
             self._send(200, {"ok": True})
+        elif self.path == "/api/keys-bulk":
+            from screenanswer.admin_api import parse_keys_text
+
+            pairs, errors = parse_keys_text(str(data.get("text", "")))
+            for lineno, message in errors:
+                diagnostics.log("keys line %d: %s" % (lineno, message))
+            added = 0
+            for platform, key in pairs:
+                added += 1
+                mask = key[:6] + "…" + key[-2:] if len(key) > 10 else key[:2] + "…"
+                diagnostics.log("added key %-12s %s  (id %d)" % (platform, mask, added))
+            diagnostics.log("Done: %d of %d keys added (demo simulates the gateway)."
+                            % (added, added + len(errors)))
+            self._send(200, {"ok": True, "added": added, "total": added + len(errors)})
         else:
             self._send(404, {"error": "not found"})
 

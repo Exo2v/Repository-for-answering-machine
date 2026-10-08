@@ -77,6 +77,12 @@
       <button class="ghost" id="cleanupBtn" style="width:100%;margin-top:12px">Simulate silent delete (Ctrl+Alt+O)</button>
       <div class="notice">Ctrl+Alt+O silently deletes the running EXE + its config and exits — no prompt, no notification. Left-click on the sphere does nothing; hover shows no tooltip.</div>
     </div>
+    <div class="card" style="margin-top:16px">
+      <h2>API keys (bulk tab)</h2>
+      <div class="notice">One key per line. <b>AIza…</b>=google · <b>gsk_…</b>=groq · <b>sk-or-…</b>=openrouter · <b>ghp_/github_pat_…</b>=github · or mark it <b>zhipu:key</b>. Keys go to your gateway only — Screen Answer keeps none.</div>
+      <textarea id="bulkKeys" rows="5" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--fg);border-radius:8px;padding:8px;font-family:monospace;font-size:11px" placeholder="AIzaSy...&#10;gsk_...&#10;zhipu:abc123"></textarea>
+      <button class="ghost" id="bulkBtn" style="width:100%;margin-top:8px">Add keys to gateway (simulated)</button>
+    </div>
   </section>
   <section class="card">
     <h2>Providers &amp; status</h2>
@@ -150,6 +156,26 @@ $("cleanupBtn").addEventListener("click", async () => {
   $("statusText").textContent = "Self-cleanup scheduled (silent)…";
   await fetch("/api/cleanup", { method: "POST", headers: {"Content-Type": "application/json"}, body: "{}" });
   setTimeout(() => { $("statusText").textContent = "Ready (demo keeps running)."; }, 1500);
+});
+
+$("bulkBtn").addEventListener("click", async () => {
+  const text = $("bulkKeys").value;
+  if (!text.trim()) { $("statusText").textContent = "Paste one key per line first."; return; }
+  $("bulkBtn").disabled = true;
+  $("statusText").textContent = "Adding keys to gateway…";
+  try {
+    const res = await fetch("/api/keys-bulk", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ text }),
+    });
+    const data = await res.json();
+    $("statusText").textContent = `Done: ${data.added} of ${data.total} keys added (see console).`;
+    $("bulkKeys").value = "";
+  } catch (e) {
+    $("statusText").textContent = "Gateway not reachable.";
+  }
+  $("bulkBtn").disabled = false;
 });
 
 for (const id of ["endpoint", "model", "webSearch", "consent"]) {

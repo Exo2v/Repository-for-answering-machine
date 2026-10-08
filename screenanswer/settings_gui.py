@@ -55,11 +55,15 @@ class SettingsWindow:
 
         self.root = root
         root.title("Screen Answer — Settings")
-        root.geometry("520x470")
+        root.geometry("560x580")
         root.resizable(False, False)
 
-        frame = ttk.Frame(root, padding=12)
-        frame.pack(fill="both", expand=True)
+        notebook = ttk.Notebook(root)
+        notebook.pack(fill="both", expand=True, padx=6, pady=6)
+
+        frame = ttk.Frame(notebook, padding=12)
+        notebook.add(frame, text="General")
+        self._build_keys_tab(notebook)
 
         ttk.Label(frame, text="Gateway endpoint (FreeLLMAPI / OpenAI-compatible):").grid(
             row=0, column=0, sticky="w"
@@ -121,8 +125,8 @@ class SettingsWindow:
             row=11, column=0, columnspan=2, sticky="w", pady=(8, 4)
         )
 
-        buttons = ttk.Frame(frame)
-        buttons.grid(row=12, column=0, columnspan=2, sticky="we")
+        buttons = ttk.Frame(root)
+        buttons.pack(fill="x", padx=12, pady=(0, 10))
         ttk.Button(buttons, text="Save", command=self._save).pack(side="left")
         ttk.Button(buttons, text="Capture & ask now", command=self._on_capture).pack(
             side="left", padx=6
@@ -141,6 +145,152 @@ class SettingsWindow:
             var.trace_add("write", lambda *_: self._route_changed())
 
         self._status = self.status_var.set
+
+    # ------------------------------------------------------- bulk keys tab
+
+    def _build_keys_tab(self, notebook: Any) -> None:
+        import tkinter as tk
+        from tkinter import ttk
+
+        from .admin_api import KNOWN_PLATFORMS
+
+        tab = ttk.Frame(notebook, padding=12)
+        notebook.add(tab, text="API keys (bulk)")
+
+        ttk.Label(
+            tab,
+            text=(
+                "Gateway dashboard login — the email/password of your FreeLLMAPI "
+                "dashboard (localhost:3001). Used once to register the keys below; "
+                "never saved by Screen Answer."
+            ),
+            wraplength=500,
+            foreground="#444",
+        ).pack(anchor="w")
+        login_row = ttk.Frame(tab)
+        login_row.pack(fill="x", pady=(4, 8))
+        self._dash_email = tk.StringVar()
+        self._dash_password = tk.StringVar()
+        ttk.Label(login_row, text="Email:").pack(side="left")
+        ttk.Entry(login_row, textvariable=self._dash_email, width=24).pack(
+            side="left", padx=(2, 10)
+        )
+        ttk.Label(login_row, text="Password:").pack(side="left")
+        ttk.Entry(login_row, textvariable=self._dash_password, width=24, show="•").pack(
+            side="left", padx=2
+        )
+
+        assume_row = ttk.Frame(tab)
+        assume_row.pack(fill="x", pady=(0, 6))
+        ttk.Label(assume_row, text="Provider for unmarked keys:").pack(side="left")
+        self._assume_platform = tk.StringVar(value="auto-detect")
+        ttk.Combobox(
+            assume_row,
+            textvariable=self._assume_platform,
+            values=("auto-detect",) + KNOWN_PLATFORMS,
+            state="readonly",
+            width=14,
+        ).pack(side="left", padx=6)
+
+        ttk.Label(
+            tab,
+            text="One key per line. Auto-detected: AIza…=google, gsk_…=groq, "
+            "sk-or-…=openrouter, ghp_/github_pat_…=github. Or mark it: zhipu:abc123.",
+            wraplength=500,
+            foreground="#444",
+        ).pack(anchor="w")
+        self._keys_text = tk.Text(tab, height=8, width=62, wrap="none")
+        self._keys_text.pack(fill="both", expand=True, pady=(2, 6))
+
+        push_row = ttk.Frame(tab)
+        push_row.pack(fill="x")
+        self._add_keys_btn = ttk.Button(
+            push_row, text="Add keys to gateway", command=self._push_keys
+        )
+        self._add_keys_btn.pack(side="left")
+        ttk.Label(
+            push_row,
+            text="Sent to your gateway only — Screen Answer keeps none of them.",
+            foreground="#444",
+        ).pack(side="left", padx=10)
+
+        self._keys_log = tk.Text(tab, height=7, width=62, state="disabled", wrap="word")
+        self._keys_log.pack(fill="both", expand=True, pady=(6, 0))
+
+    def _push_keys(self) -> None:
+        import threading
+
+        from .admin_api import AdminApiError, AdminClient, parse_keys_text
+
+        def append(line: str) -> None:
+            log = self._keys_log
+            log.configure(state="normal")
+            log.insert("end", line + "\n")
+            log.see("end")
+            log.configure(state="disabled")
+
+        assume = self._assume_platform.get()
+        pairs, errors = parse_keys_text(
+            self._keys_text.get("1.0", "end"), None if assume == "auto-detect" else assume
+        )
+        for lineno, message in errors[:20]:
+            append("line %d: %s" % (lineno, message))
+        if not pairs:
+            if not errors:
+                append("Nothing to add — paste one key per line first.")
+            return
+
+        email = self._dash_email.get().strip()
+        password = self._dash_password.get()
+        if not email or not password:
+            append("Dashboard email and password are required to register keys.")
+            return
+
+        self._add_keys_btn.configure(state="disabled")
+        append("Logging in to the gateway dashboard…")
+
+        def mask(value: str) -> str:
+            if len(value) <= 10:
+                return value[:2] + "…"
+            return value[:6] + "…" + value[-2:]
+
+        def worker() -> None:
+            ok = 0
+            try:
+                client = AdminClient(self.settings.endpoint)
+                client.login(email, password)
+                append("Logged in — adding %d keys…" % len(pairs))
+                for platform, key in pairs:
+                    try:
+                        result = client.add_key(platform, key)
+                        ok += 1
+                        append(
+                            "added %-12s %s  (key id %s)"
+                            % (platform, mask(key), result.get("id", "?"))
+                        )
+                    except AdminApiError as exc:
+                        append("FAILED %-12s %s — %s" % (platform, mask(key), exc.message))
+                append(
+                    "Done: %d of %d keys added. Open Providers & status to see them go green."
+                    % (ok, len(pairs))
+                )
+            except AdminApiError as exc:
+                append("Login failed: %s" % exc.message)
+            except Exception as exc:
+                append("Unexpected error: %s: %s" % (type(exc).__name__, exc))
+            finally:
+                def done() -> None:
+                    self._add_keys_btn.configure(state="normal")
+
+                try:
+                    if self.root is not None:
+                        self.root.after(0, done)
+                    else:
+                        done()
+                except Exception:
+                    pass
+
+        threading.Thread(target=worker, name="KeysPush", daemon=True).start()
 
     # ------------------------------------------------------------------ events
 
