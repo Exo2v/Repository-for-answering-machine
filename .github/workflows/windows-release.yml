@@ -44,9 +44,10 @@ jobs:
 
       - name: Smoke-check the frozen executables
         run: |
-          .\dist\ScreenAnswer-Diagnostic.exe --selftest
-          if ($LASTEXITCODE -ne 0) { Write-Error "selftest failed"; exit 1 }
-          .\dist\ScreenAnswer-Diagnostic.exe --version
+          $proc = Start-Process -FilePath .\dist\ScreenAnswer-Diagnostic.exe -ArgumentList '--selftest' -Wait -PassThru
+          if ($proc.ExitCode -ne 0) { Write-Error "selftest failed with exit code $($proc.ExitCode)"; exit 1 }
+          $proc2 = Start-Process -FilePath .\dist\ScreenAnswer-Diagnostic.exe -ArgumentList '--version' -Wait -PassThru
+          if ($proc2.ExitCode -ne 0) { Write-Error "--version failed with exit code $($proc2.ExitCode)"; exit 1 }
 
       - name: Upload standalone executables
         uses: actions/upload-artifact@v4

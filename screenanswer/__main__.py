@@ -157,6 +157,14 @@ def _run_app(show_diagnostics: bool) -> int:
 
 
 def main(argv=None) -> int:
+    # Frozen `--windowed` builds have no console: sys.stdout/sys.stderr can be
+    # None. Never crash on output (print/argparse) in that mode.
+    import io
+    if sys.stdout is None:
+        sys.stdout = io.StringIO()
+    if sys.stderr is None:
+        sys.stderr = io.StringIO()
+
     parser = argparse.ArgumentParser(
         prog="screenanswer",
         description="Screen Answer v1 — tray + GUI + diagnostics on the FreeLLMAPI gateway.",
