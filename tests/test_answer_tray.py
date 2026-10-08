@@ -35,6 +35,7 @@ from answer_tray import (
     ask_openrouter,
     default_provider_for_executable,
     diagnostics_mode_enabled,
+    diagnostics_page_available,
     ensure_lasso1_config,
     is_lasso1_executable,
     is_lassv7_executable,
@@ -64,10 +65,17 @@ class DiagnosticsModeTests(unittest.TestCase):
         )
         self.assertTrue(diagnostics_mode_enabled(("--diagnostics",), "python.exe"))
         self.assertFalse(diagnostics_mode_enabled((), "ScreenAnswer.exe"))
+        self.assertFalse(diagnostics_mode_enabled(("--diagnostics",), "LassV7.exe"))
+        self.assertTrue(diagnostics_page_available((), "Lasso1.exe"))
+        self.assertTrue(diagnostics_page_available((), "LassV7.exe"))
+        self.assertTrue(
+            diagnostics_page_available((), "ScreenAnswer-Diagnostic.exe")
+        )
+        self.assertFalse(diagnostics_page_available((), "ScreenAnswer.exe"))
 
 
 class Lasso1ModeTests(unittest.TestCase):
-    def test_lasso_executables_are_openrouter_only_and_never_enable_diagnostics(self):
+    def test_lasso_executables_keep_diagnostics_on_demand_not_autostarted(self):
         self.assertTrue(is_lasso1_executable("Lasso1.exe"))
         self.assertTrue(is_lasso1_executable("LassV7.exe"))
         self.assertTrue(is_lassv7_executable("LassV7.exe"))
@@ -128,8 +136,9 @@ class Lasso1ModeTests(unittest.TestCase):
             with open(path, "r", encoding="utf-8") as config_file:
                 self.assertIs(json.load(config_file)["allow_screenshot_uploads"], True)
 
-    def test_lasso_settings_window_has_no_model_control(self):
+    def test_lasso_settings_window_has_diagnostics_button_but_no_model_control(self):
         labels = []
+        diagnostic_commands = []
 
         class FakeWidget:
             def pack(self, *args, **kwargs):
@@ -154,6 +163,8 @@ class Lasso1ModeTests(unittest.TestCase):
         def make_widget(*args, **kwargs):
             if "text" in kwargs:
                 labels.append(str(kwargs["text"]))
+            if kwargs.get("text") == "Diagnostics":
+                diagnostic_commands.append(kwargs.get("command"))
             return FakeWidget()
 
         fake_tkinter = types.ModuleType("tkinter")
@@ -174,6 +185,7 @@ class Lasso1ModeTests(unittest.TestCase):
         app.privacy_acknowledged = False
         app.save_settings = MagicMock()
         app.hide_window = MagicMock()
+        app.show_diagnostics = MagicMock()
         app._privacy_changed = MagicMock()
 
         with patch.dict("sys.modules", {"tkinter": fake_tkinter}):
@@ -181,6 +193,10 @@ class Lasso1ModeTests(unittest.TestCase):
 
         self.assertFalse(hasattr(app, "model_var"))
         self.assertNotIn("model", " ".join(labels).lower())
+        self.assertIn("Diagnostics", labels)
+        self.assertEqual(len(diagnostic_commands), 1)
+        diagnostic_commands[0]()
+        app.show_diagnostics.assert_called_once_with()
 
     def test_missing_or_unapproved_models_migrate_and_valid_free_custom_is_preserved(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -346,7 +362,7 @@ class Lasso1ModeTests(unittest.TestCase):
             ("environment-key", "environment variable"),
         )
 
-    def test_first_run_gui_stays_hidden_until_open_and_disables_diagnostics(self):
+    def test_first_run_gui_stays_hidden_and_diagnostics_remain_on_demand(self):
         class FakeStringVar:
             def __init__(self, value=""):
                 self.value = value
@@ -399,18 +415,20 @@ class Lasso1ModeTests(unittest.TestCase):
         self.assertEqual(app.api_key_source, "not configured")
         self.assertEqual(app.model, DEFAULT_OPENROUTER_MODEL)
         self.assertFalse(app.privacy_acknowledged)
-        self.assertFalse(app.diagnostics_enabled)
+        self.assertTrue(app.diagnostics_enabled)
+        self.assertFalse(app.diagnostics_auto_open)
         lasso_window.assert_called_once_with()
         build_window.assert_not_called()
         tray_class.assert_called_once_with(
             app.events,
-            diagnostics_enabled=False,
+            diagnostics_enabled=True,
             settings_enabled=False,
             lasso1_mode=True,
             lassv7_mode=False,
         )
         tray.show_balloon.assert_called_once()
         root.deiconify.assert_not_called()
+        self.assertEqual([call.args[0] for call in root.after.call_args_list], [100])
 
     def test_gui_save_persists_key_and_consent_then_closes(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -549,7 +567,7 @@ class Lasso1ModeTests(unittest.TestCase):
         tray = object.__new__(WindowsTray)
         tray.settings_enabled = False
         tray.lasso1_mode = True
-        tray.diagnostics_enabled = False
+        tray.diagnostics_enabled = True
         tray.events = MagicMock()
         tray._user32 = MagicMock()
         tray._user32.CreatePopupMenu.return_value = 1
@@ -585,8 +603,13 @@ class Lasso1ModeTests(unittest.TestCase):
         self.assertIn("Open Lasso1 config folder", labels)
         self.assertIn("Self-destruct Lasso1…", labels)
         self.assertNotIn("Open Screen Answer", labels)
-        self.assertNotIn("Show diagnostics", labels)
+        self.assertIn("Show diagnostics", labels)
         tray.events.put.assert_called_once_with(("open_config_folder",))
+
+        tray.events.put.reset_mock()
+        tray._user32.TrackPopupMenu.return_value = 104
+        show_menu()
+        tray.events.put.assert_called_once_with(("show_diagnostics",))
 
         tray.events.put.reset_mock()
         tray._user32.TrackPopupMenu.return_value = 107

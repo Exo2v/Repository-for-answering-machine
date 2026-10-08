@@ -32,6 +32,8 @@ try {
 LassV7 - Windows 7-compatible tray app
 
 Run LassV7.exe. To open settings, right-click its tray icon and choose Open.
+Settings includes a small Diagnostics button for the live log; it opens only when
+clicked and never saves a log unless you choose Save.
 A new config has a blank API-key value and defaults to
 google/gemma-4-31b-it:free; screenshot upload consent is off. The model is not
 shown in the Settings GUI. Only the two allowlisted Gemma :free vision models

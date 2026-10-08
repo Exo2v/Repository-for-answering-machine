@@ -225,6 +225,17 @@ def diagnostics_mode_enabled(
     return "--diagnostics" in arguments or executable_name.endswith("-diagnostic")
 
 
+def diagnostics_page_available(
+    argv: Optional[Tuple[str, ...]] = None,
+    executable: Optional[str] = None,
+) -> bool:
+    """Expose diagnostics on demand in Lasso builds or in diagnostic builds."""
+    executable_path = executable or sys.executable
+    return is_lasso1_executable(executable_path) or diagnostics_mode_enabled(
+        argv, executable_path
+    )
+
+
 def _queue_diagnostic_event(
     events: "queue.Queue[Tuple[Any, ...]]",
     enabled: bool,
@@ -3109,7 +3120,11 @@ class ScreenAnswerApp:
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
 
         self.events: "queue.Queue[Tuple[Any, ...]]" = queue.Queue()
-        self.diagnostics_enabled = diagnostics_mode_enabled() and not self.lasso1_mode
+        # Lasso builds keep diagnostics in memory for the on-demand Diagnostics page,
+        # but never open that page at startup. The standard diagnostic build retains
+        # its existing automatic-open behavior.
+        self.diagnostics_auto_open = diagnostics_mode_enabled() and not self.lasso1_mode
+        self.diagnostics_enabled = self.lasso1_mode or self.diagnostics_auto_open
         self.diagnostic_lines = []
         self.diagnostics_window = None
         self.diagnostics_text = None
@@ -3169,7 +3184,11 @@ class ScreenAnswerApp:
 
         self._log_diagnostic(
             "Starting %s %s%s."
-            % (APP_NAME, APP_VERSION, " diagnostic build" if self.diagnostics_enabled else "")
+            % (
+                APP_NAME,
+                APP_VERSION,
+                " diagnostic build" if self.diagnostics_auto_open else "",
+            )
         )
         self._log_diagnostic(
             "Runtime: Python %s, %d-bit process."
@@ -3224,7 +3243,7 @@ class ScreenAnswerApp:
         self.tray.set_state(NEUTRAL_RGB, tooltip)
         self._log_diagnostic("Application ready; tray icon initialized.")
         self.root.after(100, self._poll_events)
-        if self.diagnostics_enabled:
+        if self.diagnostics_auto_open:
             self.root.after(0, self.show_diagnostics)
 
     def _log_diagnostic(self, message: str) -> None:
@@ -3273,7 +3292,7 @@ class ScreenAnswerApp:
 
         window = tk.Toplevel(self.root)
         self.diagnostics_window = window
-        window.title("Screen Answer — Diagnostics")
+        window.title("%s — Diagnostics" % APP_NAME)
         window.geometry("820x470")
         window.minsize(620, 340)
         window.protocol("WM_DELETE_WINDOW", self._hide_diagnostics)
@@ -3343,8 +3362,8 @@ class ScreenAnswerApp:
 
         path = filedialog.asksaveasfilename(
             parent=self.diagnostics_window,
-            title="Save Screen Answer diagnostic log",
-            initialfile="ScreenAnswer-diagnostics.txt",
+            title="Save %s diagnostic log" % APP_NAME,
+            initialfile="%s-diagnostics.txt" % APP_NAME,
             defaultextension=".txt",
             filetypes=(("Text files", "*.txt"), ("All files", "*.*")),
         )
@@ -3463,6 +3482,14 @@ class ScreenAnswerApp:
         tk.Button(buttons, text="Cancel", command=self.hide_window).pack(
             side="left", padx=(8, 0)
         )
+        tk.Button(
+            buttons,
+            text="Diagnostics",
+            command=self.show_diagnostics,
+            font=("Segoe UI", 8),
+            padx=5,
+            pady=1,
+        ).pack(side="right")
 
         self.root.update_idletasks()
         screen_width = self.root.winfo_screenwidth()
@@ -4275,6 +4302,7 @@ def main() -> int:
             and tuple(DEFAULT_MODELS) == ("openrouter",)
             and DEFAULT_MODELS["openrouter"] == DEFAULT_OPENROUTER_MODEL
             and valid_model_name("openrouter", DEFAULT_OPENROUTER_MODEL)
+            and diagnostics_page_available((), "Lasso1.exe")
             and diagnostics_mode_enabled(("--diagnostics",), "Lasso1.exe") is False
         ) else 1
     if "--check-lassv7-build" in sys.argv[1:]:
@@ -4292,6 +4320,7 @@ def main() -> int:
             == LASSV7_CONFIG_DIRECTORY
             and sys.version_info[:3] == (3, 8, 10)
             and struct.calcsize("P") == 4
+            and diagnostics_page_available((), "LassV7.exe")
             and diagnostics_mode_enabled(("--diagnostics",), "LassV7.exe") is False
         ) else 1
     if os.name != "nt":
