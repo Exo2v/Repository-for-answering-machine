@@ -1404,7 +1404,7 @@ def _log_gemini_response_metadata(
     model = response_data.get("modelVersion", "not provided")
     if not isinstance(model, str):
         model = "not provided"
-    model = model.replace("\\r", " ").replace("\\n", " ")[:100]
+    model = model.replace("\r", " ").replace("\n", " ")[:100]
     report("Google Gemini response metadata: model=%s." % model)
     usage = response_data.get("usageMetadata")
     if isinstance(usage, dict):
@@ -1647,7 +1647,7 @@ def _gemini_post_json(
                 if isinstance(error_value, dict):
                     error_value = error_value.get("message") or error_value.get("status")
                 if isinstance(error_value, str):
-                    error_message = error_value.replace("\\r", " ").replace("\\n", " ")[:400]
+                    error_message = error_value.replace("\r", " ").replace("\n", " ")[:400]
             except (AttributeError, UnicodeDecodeError, ValueError):
                 pass
             finally:
@@ -1747,7 +1747,8 @@ def ask_gemini(
         error_value = response_data.get("error")
         error_message = error_value.get("message") if isinstance(error_value, dict) else ""
         if isinstance(error_message, str) and error_message:
-            report("Google Gemini inference error detail: %s" % error_message[:400])
+            error_message = error_message.replace("\r", " ").replace("\n", " ")[:400]
+            report("Google Gemini inference error detail: %s" % error_message)
         raise RuntimeError("Google Gemini reported an inference error. See Diagnostics.")
     if diagnostic is not None:
         _log_gemini_response_metadata(response_data, report)
