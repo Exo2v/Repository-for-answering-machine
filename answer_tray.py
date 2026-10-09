@@ -167,7 +167,7 @@ OTTERARY_WIN7_MODE = is_otterary_win7_executable()
 OTTERARY_DIAGNOSTIC_CONSOLE_MODE = OTTERARY_MODE
 APP_NAME = "Otterary" if OTTERARY_MODE else (lasso_app_name_for_executable() or "Screen Answer")
 APP_VERSION = (
-    "1.0.0" if OTTERARY_MODE else (APP_NAME.lower() if LASSO1_MODE else "1.7.0-experimental")
+    "1.0.1" if OTTERARY_MODE else (APP_NAME.lower() if LASSO1_MODE else "1.7.0-experimental")
 )
 
 
@@ -1825,13 +1825,15 @@ def _gemini_post_json(
     model: str,
     request_body: Dict[str, Any],
     report: Callable[[str], None],
+    retry_transient_errors: bool = True,
 ) -> Dict[str, Any]:
-    """POST a bounded Gemini generateContent request; do not retry quota HTTP 429s."""
+    """POST a bounded Gemini request, optionally retrying transient server errors."""
     if not isinstance(api_key, str) or not api_key.strip():
         raise RuntimeError("Enter a Google Gemini API key before sending a screenshot.")
     encoded_body = json.dumps(request_body, separators=(",", ":")).encode("utf-8")
     endpoint = "%s/models/%s:generateContent" % (GEMINI_API_BASE_URL, model)
-    for attempt in range(MAX_API_ATTEMPTS):
+    max_attempts = MAX_API_ATTEMPTS if retry_transient_errors else 1
+    for attempt in range(max_attempts):
         request = urllib.request.Request(
             endpoint,
             data=encoded_body,
@@ -1844,7 +1846,7 @@ def _gemini_post_json(
         attempt_started = time.monotonic()
         report(
             "Google Gemini HTTP attempt %d/%d started (request body %d bytes; key omitted)."
-            % (attempt + 1, MAX_API_ATTEMPTS, len(encoded_body))
+            % (attempt + 1, max_attempts, len(encoded_body))
         )
         try:
             with urllib.request.urlopen(request, timeout=60) as response:
@@ -1859,7 +1861,7 @@ def _gemini_post_json(
                 "Google Gemini HTTP attempt %d/%d received status %s and %d response bytes in %.2f seconds."
                 % (
                     attempt + 1,
-                    MAX_API_ATTEMPTS,
+                    max_attempts,
                     status,
                     len(response_bytes),
                     time.monotonic() - attempt_started,
@@ -1893,11 +1895,11 @@ def _gemini_post_json(
             _report_rate_limit_headers(headers, "Google Gemini", report)
             report(
                 "Google Gemini HTTP attempt %d/%d failed with status %d after %.2f seconds."
-                % (attempt + 1, MAX_API_ATTEMPTS, status, time.monotonic() - attempt_started)
+                % (attempt + 1, max_attempts, status, time.monotonic() - attempt_started)
             )
             if error_message:
                 report("Google Gemini error detail: %s" % error_message)
-            if status in RETRYABLE_HTTP_STATUSES and attempt < MAX_API_ATTEMPTS - 1:
+            if status in RETRYABLE_HTTP_STATUSES and attempt < max_attempts - 1:
                 delay = 2 ** attempt
                 report("Temporary Google Gemini server error; retrying in %d second(s)." % delay)
                 time.sleep(delay)
@@ -1917,7 +1919,10 @@ def _gemini_post_json(
                     "Check the model name and image size."
                 )
             if status in RETRYABLE_HTTP_STATUSES:
-                raise RuntimeError("Google Gemini is temporarily unavailable (HTTP %d)." % status)
+                message = "Google Gemini is temporarily unavailable (HTTP %d)." % status
+                if not retry_transient_errors:
+                    message += " Automatic retries are disabled."
+                raise RuntimeError(message)
             raise RuntimeError("Google Gemini returned an HTTP error (%d)." % status)
         except urllib.error.URLError as exc:
             reason = getattr(exc, "reason", None)
@@ -1940,6 +1945,7 @@ def ask_gemini(
     diagnostic: Optional[Callable[[str], None]] = None,
     ocr_markdown: str = "",
     system_instruction: str = SYSTEM_INSTRUCTION,
+    retry_transient_errors: bool = True,
 ) -> Tuple[Optional[int], str]:
     """Send the screenshot directly to Google's Gemini generateContent API."""
     def report(message: str) -> None:
@@ -1981,7 +1987,13 @@ def ask_gemini(
         "Sending screenshot to Google Gemini model %s; direct Google API, no search or tools."
         % model
     )
-    response_data = _gemini_post_json(api_key, model, request_body, report)
+    response_data = _gemini_post_json(
+        api_key,
+        model,
+        request_body,
+        report,
+        retry_transient_errors=retry_transient_errors,
+    )
     if response_data.get("error") is not None:
         error_value = response_data.get("error")
         error_message = error_value.get("message") if isinstance(error_value, dict) else ""
@@ -2839,8 +2851,9 @@ def _openrouter_post_json(
     api_key: str,
     request_body: Dict[str, Any],
     report: Callable[[str], None],
+    retry_transient_errors: bool = True,
 ) -> Dict[str, Any]:
-    """POST a bounded OpenRouter chat-completion request with transient retries."""
+    """POST a bounded OpenRouter chat-completion request with optional retries."""
     encoded_body = json.dumps(request_body, separators=(",", ":")).encode("utf-8")
     request = urllib.request.Request(
         OPENROUTER_ENDPOINT,
@@ -2852,11 +2865,12 @@ def _openrouter_post_json(
         method="POST",
     )
     response_bytes = None
-    for attempt in range(MAX_API_ATTEMPTS):
+    max_attempts = MAX_API_ATTEMPTS if retry_transient_errors else 1
+    for attempt in range(max_attempts):
         attempt_started = time.monotonic()
         report(
             "OpenRouter HTTP attempt %d/%d started (request body %d bytes; key and screenshot omitted)."
-            % (attempt + 1, MAX_API_ATTEMPTS, len(encoded_body))
+            % (attempt + 1, max_attempts, len(encoded_body))
         )
         try:
             with urllib.request.urlopen(request, timeout=60) as response:
@@ -2871,7 +2885,7 @@ def _openrouter_post_json(
                 "OpenRouter HTTP attempt %d/%d received status %s and %d response bytes in %.2f seconds."
                 % (
                     attempt + 1,
-                    MAX_API_ATTEMPTS,
+                    max_attempts,
                     status,
                     len(response_bytes),
                     time.monotonic() - attempt_started,
@@ -2897,7 +2911,7 @@ def _openrouter_post_json(
                 "OpenRouter HTTP attempt %d/%d failed with status %d after %.2f seconds."
                 % (
                     attempt + 1,
-                    MAX_API_ATTEMPTS,
+                    max_attempts,
                     status,
                     time.monotonic() - attempt_started,
                 )
@@ -2906,7 +2920,7 @@ def _openrouter_post_json(
                 report("OpenRouter error code/type: %s." % provider_code)
             if provider_message:
                 report("OpenRouter error detail: %s" % provider_message)
-            if status == 429 and attempt < MAX_API_ATTEMPTS - 1:
+            if status == 429 and attempt < max_attempts - 1:
                 delay = _retry_after_delay(error_headers, attempt)
                 if delay is None:
                     report(
@@ -2921,7 +2935,7 @@ def _openrouter_post_json(
                     )
                     time.sleep(delay)
                     continue
-            if status in RETRYABLE_HTTP_STATUSES and attempt < MAX_API_ATTEMPTS - 1:
+            if status in RETRYABLE_HTTP_STATUSES and attempt < max_attempts - 1:
                 delay = 2 ** attempt
                 report("Temporary OpenRouter server/provider error; retrying in %d second(s)." % delay)
                 time.sleep(delay)
@@ -2950,10 +2964,15 @@ def _openrouter_post_json(
                     "Try reducing the desktop resolution."
                 )
             if status in RETRYABLE_HTTP_STATUSES:
-                raise RuntimeError(
+                message = (
                     "OpenRouter or its selected model provider is temporarily unavailable "
-                    "(HTTP %d); the request was retried." % status
+                    "(HTTP %d)." % status
                 )
+                if retry_transient_errors:
+                    message = message[:-1] + "; the request was retried."
+                else:
+                    message += " Automatic retries are disabled."
+                raise RuntimeError(message)
             raise RuntimeError("OpenRouter returned an HTTP error (%d)." % status)
         except urllib.error.URLError as exc:
             reason = getattr(exc, "reason", None)
@@ -3066,6 +3085,7 @@ def ask_openrouter(
     ocr_markdown: str = "",
     system_instruction: str = SYSTEM_INSTRUCTION,
     omit_ocr_diagnostics: bool = False,
+    retry_transient_errors: bool = True,
 ) -> Tuple[Optional[int], str]:
     """Send a screenshot directly to OpenRouter vision chat without search or hosted OCR."""
     def report(message: str) -> None:
@@ -3118,7 +3138,12 @@ def ask_openrouter(
         "reasoning": {"effort": "medium", "exclude": True},
     }
     report("Preparing OpenRouter vision request for model %s." % model)
-    response_data = _openrouter_post_json(api_key, request_body, report)
+    response_data = _openrouter_post_json(
+        api_key,
+        request_body,
+        report,
+        retry_transient_errors=retry_transient_errors,
+    )
     if response_data.get("error") is not None:
         error_code, error_message = _openrouter_error_details(response_data)
         if error_code:
@@ -5466,6 +5491,7 @@ class ScreenAnswerApp:
                         image,
                         diagnostic=diagnostic_callback,
                         system_instruction=OTTERARY_SYSTEM_INSTRUCTION,
+                        retry_transient_errors=False,
                     )
                 elif otterary_mode:
                     option, response_text = ask_openrouter(
@@ -5475,6 +5501,7 @@ class ScreenAnswerApp:
                         diagnostic=diagnostic_callback,
                         system_instruction=OTTERARY_SYSTEM_INSTRUCTION,
                         omit_ocr_diagnostics=True,
+                        retry_transient_errors=False,
                     )
                 elif provider == "apinex":
                     option, response_text = ask_apinex(
@@ -5819,7 +5846,7 @@ def main() -> int:
             OTTERARY_MODE
             and not OTTERARY_WIN7_MODE
             and APP_NAME == "Otterary"
-            and APP_VERSION == "1.0.0"
+            and APP_VERSION == "1.0.1"
             and APP_DEFAULT_PROVIDER == "openrouter"
             and tuple(PROVIDER_LABELS) == ("openrouter", "gemini")
             and tuple(DEFAULT_MODELS) == ("openrouter", "gemini")
@@ -5849,6 +5876,7 @@ def main() -> int:
             OTTERARY_MODE
             and OTTERARY_WIN7_MODE
             and APP_NAME == "Otterary"
+            and APP_VERSION == "1.0.1"
             and APP_DEFAULT_PROVIDER == "openrouter"
             and tuple(PROVIDER_LABELS) == ("openrouter", "gemini")
             and otterary_config_directory_for_executable("OtteraryWin7.exe")

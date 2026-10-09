@@ -11,6 +11,7 @@ on:
       - "lasso2"
       - "lasso3"
       - "otterary"
+      - "otterary-v*"
 
 permissions:
   contents: write
@@ -18,7 +19,7 @@ permissions:
 jobs:
   build-standard:
     name: Build legacy-compatible Windows executables
-    if: github.ref != 'refs/tags/lasso1' && github.ref != 'refs/tags/lasso2' && github.ref != 'refs/tags/lasso3' && github.ref != 'refs/tags/otterary'
+    if: github.ref != 'refs/tags/lasso1' && github.ref != 'refs/tags/lasso2' && github.ref != 'refs/tags/lasso3' && github.ref != 'refs/tags/otterary' && !startsWith(github.ref, 'refs/tags/otterary-v')
     runs-on: windows-2022
     steps:
       - name: Check out source
@@ -209,7 +210,7 @@ jobs:
 
   build-otterary-win11:
     name: Build Otterary version 1 for Windows 11 (x64)
-    if: github.ref == 'refs/tags/otterary' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && contains(github.event.head_commit.message, '[otterary-build]'))
+    if: github.ref == 'refs/tags/otterary' || startsWith(github.ref, 'refs/tags/otterary-v') || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && contains(github.event.head_commit.message, '[otterary-build]'))
     runs-on: windows-2022
     steps:
       - name: Check out source
@@ -240,7 +241,7 @@ jobs:
 
   build-otterary-win7:
     name: Build Otterary version 1 for Windows 7 (x86)
-    if: github.ref == 'refs/tags/otterary' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && contains(github.event.head_commit.message, '[otterary-build]'))
+    if: github.ref == 'refs/tags/otterary' || startsWith(github.ref, 'refs/tags/otterary-v') || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && contains(github.event.head_commit.message, '[otterary-build]'))
     runs-on: windows-2022
     steps:
       - name: Check out source
@@ -423,7 +424,7 @@ jobs:
 
   release-otterary:
     name: Publish Otterary version 1 Windows release
-    if: github.ref == 'refs/tags/otterary'
+    if: github.ref == 'refs/tags/otterary' || startsWith(github.ref, 'refs/tags/otterary-v')
     needs:
       - build-otterary-win11
       - build-otterary-win7
@@ -441,14 +442,28 @@ jobs:
           name: Otterary-Windows-7-x86
           path: release-assets
 
+      - name: Resolve Otterary release version
+        id: release-metadata
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF_NAME" == "otterary" ]]; then
+            echo "version=1.0.0" >> "$GITHUB_OUTPUT"
+            echo "retry_note=The original version 1.0.0 build may retry transient API errors." >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF_NAME#otterary-v}" >> "$GITHUB_OUTPUT"
+            echo "retry_note=Automatic retries are disabled: each accepted capture makes one provider API attempt." >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Publish Otterary version 1 assets
         uses: softprops/action-gh-release@v2
         with:
-          name: Otterary version 1.0.0
+          name: Otterary version ${{ steps.release-metadata.outputs.version }}
           generate_release_notes: false
           overwrite_files: true
           body: |
-            Otterary version 1.0.0 includes two standalone Windows builds: `Otterary.exe` for 64-bit Windows 11 (Python 3.11) and `OtteraryWin7.exe` for 32-bit Windows 7 (Python 3.8.10). This is a separate family from all Lasso and Screen Answer builds.
+            Otterary version ${{ steps.release-metadata.outputs.version }} includes two standalone Windows builds: `Otterary.exe` for 64-bit Windows 11 (Python 3.11) and `OtteraryWin7.exe` for 32-bit Windows 7 (Python 3.8.10). This is a separate family from all Lasso and Screen Answer builds.
+
+            ${{ steps.release-metadata.outputs.retry_note }}
 
             First launch opens Settings. Choose Google Gemini or OpenRouter, enter your own API key, review the upload notice, and Save. API-key fields start blank and provider model defaults are prefilled; no credentials are bundled and no environment variables are required. Settings are stored at `%APPDATA%\Otterary\config.json` or `%APPDATA%\OtteraryWin7\config.json`. API keys are stored as plain text in that private per-user file.
 

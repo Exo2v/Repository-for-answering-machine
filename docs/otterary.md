@@ -1,6 +1,6 @@
 # Otterary version 1
 
-Otterary is a standalone Windows tray app family, separate from Screen Answer and every Lasso release. The `otterary` release publishes two builds:
+Otterary is a standalone Windows tray app family, separate from Screen Answer and every Lasso release. The current no-retry release is `otterary-v1.0.1`; the original `otterary` tag remains version 1.0.0. Each release publishes two builds:
 
 - `Otterary.exe` — Windows 11 x64, packaged with Python 3.11.
 - `OtteraryWin7.exe` — Windows 7 x86, packaged with Python 3.8.10.
@@ -23,6 +23,10 @@ The app sends a full-desktop image only after you trigger a capture and save con
 - **Ctrl+Alt+O** silently closes Otterary and schedules deletion of only the running executable and its matching `config.json`. The per-user folder is removed only if empty. The right-click **Self-destruct Otterary…** action asks for confirmation instead.
 - **Ctrl+Alt+Q** exits without deleting files.
 
+## Request behavior
+
+Each accepted capture makes exactly one provider HTTP attempt. Otterary does not automatically retry rate limits, temporary server errors, or other failed requests; pressing Ctrl+Alt+S again starts a separate request. Existing app families keep their own retry behavior.
+
 ## Release workflow
 
-The `otterary` Git tag builds and publishes both Windows executables together. Windows 11 and Windows 7 jobs each run the unit tests and a packaged-app smoke check before the release job attaches the assets.
+The `otterary` tag publishes version 1.0.0; versioned tags such as `otterary-v1.0.1` publish later Otterary releases. Windows 11 and Windows 7 jobs each run the unit tests and a packaged-app smoke check before the release job attaches the assets.

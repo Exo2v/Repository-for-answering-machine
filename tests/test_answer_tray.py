@@ -2051,7 +2051,7 @@ class OtteraryVariantTests(unittest.TestCase):
                 "LASSO_OPENROUTER_ONLY_MODE": False,
                 "LASSOV7_MODE": False,
                 "APP_NAME": "Otterary",
-                "APP_VERSION": "1.0.0",
+                "APP_VERSION": "1.0.1",
                 "APP_DEFAULT_PROVIDER": "openrouter",
                 "PROVIDER_LABELS": {"openrouter": "OpenRouter", "gemini": "Google Gemini"},
                 "API_KEY_ENV_VARS": {
@@ -2092,6 +2092,49 @@ class OtteraryVariantTests(unittest.TestCase):
         self.assertTrue(tray_class.call_args.kwargs["diagnostic_console_enabled"])
         self.assertEqual([call.args[0] for call in root.after.call_args_list], [100, 0])
 
+    def test_otterary_capture_calls_selected_provider_once_without_retry(self):
+        image = bytearray(24)
+        struct.pack_into(">II", image, 16, 1, 1)
+        for provider in ("gemini", "openrouter"):
+            with self.subTest(provider=provider):
+                app = object.__new__(ScreenAnswerApp)
+                app.busy = False
+                app.lasso1_mode = False
+                app.otterary_mode = True
+                app.lassv7_mode = False
+                app.provider = provider
+                app.api_key = "saved-test-key"
+                app.model = (
+                    DEFAULT_GEMINI_MODEL
+                    if provider == "gemini"
+                    else DEFAULT_OPENROUTER_MODEL
+                )
+                app.privacy_acknowledged = True
+                app.privacy_var = MagicMock()
+                app.privacy_var.get.return_value = True
+                app.root = MagicMock()
+                app.tray = MagicMock()
+                app.events = queue.Queue()
+                app.status_var = MagicMock()
+                app._result_generation = 0
+                app._fade_job = None
+                app.diagnostics_enabled = False
+                app._log_diagnostic = MagicMock()
+
+                def run_thread_immediately(*args, **kwargs):
+                    return types.SimpleNamespace(start=kwargs["target"])
+
+                provider_call = "answer_tray.ask_gemini" if provider == "gemini" else "answer_tray.ask_openrouter"
+                with patch("answer_tray.capture_virtual_desktop_png", return_value=bytes(image)):
+                    with patch("answer_tray.threading.Thread", side_effect=run_thread_immediately):
+                        with patch(provider_call, return_value=(1, "ANSWER: 1")) as request:
+                            ScreenAnswerApp._start_capture(app)
+
+                request.assert_called_once()
+                self.assertFalse(request.call_args.kwargs["retry_transient_errors"])
+                self.assertEqual(app.events.get_nowait(), ("captured", provider))
+                self.assertEqual(app.events.get_nowait(), ("answer", 1, "ANSWER: 1"))
+
     def test_otterary_ui_console_and_prompts_avoid_backend_wording(self):
         ui_source = inspect.getsource(ScreenAnswerApp._build_otterary_window)
         consent_source = inspect.getsource(ScreenAnswerApp._otterary_consent_text)
@@ -2114,13 +2157,15 @@ class OtteraryVariantTests(unittest.TestCase):
         )[0]
         self.assertNotIn("OCR", guide_text.upper())
         self.assertNotIn("OCR", otterary_release.upper())
+        self.assertIn("does not automatically retry", guide_text)
+        self.assertIn("Automatic retries are disabled", otterary_release)
 
     def test_packaged_windows11_and_windows7_smoke_checks(self):
         overrides = {
             "OTTERARY_MODE": True,
             "OTTERARY_WIN7_MODE": False,
             "APP_NAME": "Otterary",
-            "APP_VERSION": "1.0.0",
+            "APP_VERSION": "1.0.1",
             "APP_DEFAULT_PROVIDER": "openrouter",
             "PROVIDER_LABELS": {"openrouter": "OpenRouter", "gemini": "Google Gemini"},
             "API_KEY_ENV_VARS": {
@@ -2279,8 +2324,10 @@ class OtteraryVariantTests(unittest.TestCase):
                 DEFAULT_GEMINI_MODEL,
                 b"image",
                 system_instruction=OTTERARY_SYSTEM_INSTRUCTION,
+                retry_transient_errors=False,
             )
         self.assertEqual(option, 2)
+        self.assertFalse(post.call_args.kwargs["retry_transient_errors"])
         gemini_body = post.call_args.args[2]
         self.assertNotIn("OCR", json.dumps(gemini_body))
         self.assertNotIn("tools", gemini_body)
@@ -2298,8 +2345,10 @@ class OtteraryVariantTests(unittest.TestCase):
                 diagnostic=diagnostics.append,
                 system_instruction=OTTERARY_SYSTEM_INSTRUCTION,
                 omit_ocr_diagnostics=True,
+                retry_transient_errors=False,
             )
         self.assertEqual(option, 1)
+        self.assertFalse(post.call_args.kwargs["retry_transient_errors"])
         openrouter_body = post.call_args.args[1]
         self.assertNotIn("OCR", json.dumps(openrouter_body))
         self.assertNotIn("tools", openrouter_body)
@@ -2455,6 +2504,28 @@ class GeminiRequestTests(unittest.TestCase):
         self.assertEqual(option, 1)
         self.assertEqual(len(calls), 2)
         sleep.assert_called_once_with(1)
+
+    def test_otterary_does_not_retry_transient_gemini_server_errors(self):
+        def fail_with_server_error(request, timeout):
+            raise urllib.error.HTTPError(
+                request.full_url,
+                503,
+                "Unavailable",
+                {},
+                io.BytesIO(b""),
+            )
+
+        with patch("answer_tray.urllib.request.urlopen", side_effect=fail_with_server_error) as urlopen:
+            with patch("answer_tray.time.sleep") as sleep:
+                with self.assertRaisesRegex(RuntimeError, "Automatic retries are disabled"):
+                    ask_gemini(
+                        "key",
+                        DEFAULT_GEMINI_MODEL,
+                        b"image",
+                        retry_transient_errors=False,
+                    )
+        urlopen.assert_called_once()
+        sleep.assert_not_called()
 
 
 class MistralRequestTests(unittest.TestCase):
@@ -3041,6 +3112,34 @@ class OpenRouterRequestTests(unittest.TestCase):
         self.assertTrue(any("retrying in 2.0 second(s)" in line for line in diagnostics))
         self.assertTrue(any("[REDACTED API KEY]" in line for line in diagnostics))
         self.assertFalse(any(api_key in line for line in diagnostics))
+
+    def test_otterary_does_not_retry_openrouter_rate_limits_or_server_errors(self):
+        for status in (429, 503):
+            with self.subTest(status=status):
+                def fail_request(request, timeout):
+                    headers = {"Retry-After": "0"} if status == 429 else {}
+                    raise urllib.error.HTTPError(
+                        request.full_url,
+                        status,
+                        "Temporary failure",
+                        headers,
+                        io.BytesIO(b'{"error":{"message":"temporary failure"}}'),
+                    )
+
+                with patch(
+                    "answer_tray.urllib.request.urlopen",
+                    side_effect=fail_request,
+                ) as urlopen:
+                    with patch("answer_tray.time.sleep") as sleep:
+                        with self.assertRaises(RuntimeError):
+                            ask_openrouter(
+                                "key",
+                                DEFAULT_OPENROUTER_MODEL,
+                                b"image",
+                                retry_transient_errors=False,
+                            )
+                urlopen.assert_called_once()
+                sleep.assert_not_called()
 
     def test_rejects_paid_or_unapproved_model_before_any_network_request(self):
         self.assertTrue(valid_model_name("openrouter", DEFAULT_OPENROUTER_MODEL))
